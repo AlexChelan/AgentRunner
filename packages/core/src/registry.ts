@@ -60,10 +60,26 @@ export function buildAgentRuntimeRegistry(deps: AgentRuntimeRegistryDeps): Agent
     runTool: deps.runTool
   }
   const adapters: RuntimeToolAdapter[] = [
-    createClaudeCodeAdapter({ ...common, driver: drivers.claudeDriver }),
-    createCodexAdapter({ ...common, driver: drivers.codexDriver }),
-    createOpenCodeAdapter({ ...common, driver: drivers.openCodeDriver }),
-    createHermesAdapter({ ...common, driver: drivers.hermesDriver })
+    createClaudeCodeAdapter({
+      ...common,
+      driver: drivers.claudeDriver,
+      listAdvertisedModels: drivers.claudeModelLister
+    }),
+    createCodexAdapter({
+      ...common,
+      driver: drivers.codexDriver,
+      listAdvertisedModels: drivers.codexModelLister
+    }),
+    createOpenCodeAdapter({
+      ...common,
+      driver: drivers.openCodeDriver,
+      listSession: drivers.openCodeSessionLister
+    }),
+    createHermesAdapter({
+      ...common,
+      driver: drivers.hermesDriver,
+      listSession: drivers.hermesSessionLister
+    })
   ]
 
   const getAdapter = (id: string): RuntimeToolAdapter | undefined =>

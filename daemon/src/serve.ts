@@ -1,18 +1,24 @@
 import type { AgentRuntimeRegistry } from '@opencompanion/core'
 import { mkdirSync } from 'node:fs'
-import { createAuditLog } from './audit-log'
-import type { AuthHealthMonitor, AuthHealthMonitorDeps } from './auth-health'
-import { createBackendSession, type BackendSession } from './backend-session'
+import { hostname } from 'node:os'
+import { migrateAccountScopes } from './account-migration'
+import { parseAccountScope, scopeBackendUrl } from '@opencompanion/core/runtime/account-scope'
+import { createAuditLog } from '@opencompanion/core/runtime/audit-log'
+import type { AuthHealthMonitor, AuthHealthMonitorDeps } from '@opencompanion/core/runtime/auth-health'
+import { createBackendSession, type BackendSession } from '@opencompanion/core/runtime/backend-session'
 import { BRAND } from './brand'
-import { buildCompanionRegistry } from './connect'
+import { buildCompanionRegistry } from '@opencompanion/core/runtime/connect'
 import { acquireSingleInstanceLock, drainThenExit, installShutdownHandlers } from './lifecycle'
-import { auditDir, managedCliDir } from './paths'
-import type { HttpClient, UpdateState } from './poll-client'
-import type { SecretStore } from './storage/secret-store'
+import { defaultFetch } from '@opencompanion/core/runtime/pair'
+import { migratePairingKeys } from './pairing-migration'
+import { auditDir, managedCliDir } from '@opencompanion/core/runtime/paths'
+import type { HttpClient, UpdateState } from '@opencompanion/core/runtime/poll-client'
+import type { SecretStore } from '@opencompanion/core/runtime/storage/secret-store'
 import { createSessionSupervisor, type SessionSupervisor } from './supervisor'
-import { createStateStore, type StateStore } from './storage/state-store'
+import { createStateStore, type StateStore } from '@opencompanion/core/runtime/storage/state-store'
 import { startAutoUpdate, type AutoUpdateHandle } from './update/auto-update'
-import type { UpdaterDeps } from './update/updater'
+import { isSourceBuild, type UpdaterDeps } from './update/updater'
+import { daemonVersion } from './version'
 
 /** A running daemon: drains its sessions and lock on stop. */
 export interface Daemon {
@@ -44,7 +50,13 @@ export interface ServeDeps {
    * presence; when omitted (tests, or a build with no versioned install) the daemon does not self-update.
    */
   updater?: UpdaterDeps
-  /** Builds an auth-health monitor (injectable for tests; defaults to {@link import('./auth-health').createAuthHealthMonitor}). */
+  /**
+   * Whether this daemon is a source run (injectable for tests; defaults to {@link isSourceBuild}).
+   * A source run (tsx, version 0.0.0-dev) never starts the self-update loop: every published release
+   * compares newer than the dev fallback, so the loop would download the release and exit the process.
+   */
+  isSourceRun?: () => boolean
+  /** Builds an auth-health monitor (injectable for tests; defaults to {@link import('@opencompanion/core/runtime/auth-health').createAuthHealthMonitor}). */
   makeAuthMonitor?: (deps: AuthHealthMonitorDeps) => AuthHealthMonitor
   /** The agent-runtime registry (injectable for tests; defaults to {@link buildCompanionRegistry}). */
   registry?: AgentRuntimeRegistry
@@ -52,6 +64,11 @@ export interface ServeDeps {
   write?: (line: string) => void
   /** When set, serve ONLY this backend (the `serve --url` filter); otherwise serve EVERY paired backend. */
   filterUrl?: string
+  /**
+   * Builds a {@link BackendSession} (injectable for tests). It takes BOTH values the session needs and must
+   * not confuse them: `scope` keys every store and the work tree, `backendUrl` is the HTTP base.
+   */
+  makeBackendSession?: (scope: string, backendUrl: string) => BackendSession | null
 }
 
 /** The URL's host for a legible multi-backend log prefix, falling back to the raw URL if unparseable. */
@@ -64,36 +81,58 @@ function hostOf(backendUrl: string): string {
 }
 
 /**
- * Boots the companion daemon: acquires the single-instance lock (returns `null` if another live
- * instance holds it), builds the SHARED runtime registry + local audit log ONCE, then starts a
- * {@link SessionSupervisor} that runs one {@link BackendSession} per paired backend concurrently. Each
- * session PULLS its backend's dispatched runs (the poll doubles as its presence heartbeat) and PUSHES
- * their output over its own HTTP poll client; a UI-issued connect instruction is executed off that
- * session's poll loop. The supervisor reconciles the running set against `listPairedBackends()` on a
- * relaxed interval, so a backend paired or unpaired by a SEPARATE process is picked up (or dropped)
- * without restarting `serve`. `filterUrl` pins the daemon to one backend (the `serve --url` path).
- * Graceful shutdown drains every session (cancel runs -> flush poll client) then releases the lock.
- * State lives in `conf`; secrets in the encrypted file store; binaries resolve from validated dirs plus
- * the managed-CLI dirs; web tools are served over loopback MCP.
+ * The short label a co-hosted session's log lines are prefixed with: the backend's host, plus the owning
+ * user id when the scope names one. Two SaaS logins on one backend would otherwise produce two identically
+ * prefixed streams, so the account is what makes the prefix worth printing.
  *
- * @param deps - The app-data root, stores, optional http/version/registry overrides, and optional filter.
- * @returns The running daemon, or `null` when nothing is paired to serve or another instance holds the lock.
+ * @param scope - The account scope (or a legacy bare backend URL).
+ * @returns The log prefix, without brackets.
  */
-export function startDaemon(deps: ServeDeps): Daemon | null {
+function scopeLogLabel(scope: string): string {
+  const parsed = parseAccountScope(scope)
+  const host = hostOf(scopeBackendUrl(scope))
+  return parsed ? `${host}/${parsed.userId}` : host
+}
+
+/**
+ * Boots the companion daemon: the ONE builder every entry shares. It acquires the single-instance
+ * lock (returns `null` if another live instance holds it), builds the SHARED runtime registry + local
+ * audit log ONCE, then starts a {@link SessionSupervisor} that runs one {@link BackendSession} per paired
+ * ACCOUNT concurrently (so two SaaS logins on one backend get two independent sessions). Each session
+ * PULLS its backend's dispatched runs (the poll doubles as its presence heartbeat) and PUSHES their output
+ * over its own HTTP poll client; a UI-issued connect instruction is executed off that session's poll loop.
+ * The supervisor reconciles the running set against `listPairedScopes()` on a relaxed interval, so a
+ * pairing added or dropped by a SEPARATE process is picked up (or dropped) without restarting `serve`.
+ * `filterUrl` pins the daemon to one backend (the `serve --url` path), serving EVERY account paired to it.
+ *
+ * This is the PAIRED shell only: the local scope (drive server + schedule runner) belongs to a desktop
+ * app's own forked runtime, which owns its own app-data root and socket, so no daemon co-hosts it.
+ *
+ * Graceful shutdown drains every session (cancel runs -> flush poll client) and releases the lock. State
+ * lives in `conf`; secrets in the encrypted file store; binaries resolve from validated dirs plus the
+ * managed-CLI dirs; web tools are served over loopback MCP.
+ *
+ * @param deps - The app-data root, stores, optional http/version/registry overrides, filter, and the
+ *   optional backend-session factory.
+ * @returns The running daemon, or `null` when nothing is paired, or another instance holds the lock.
+ */
+export async function startDaemon(deps: ServeDeps): Promise<Daemon | null> {
   const write = deps.write ?? ((line): void => void process.stdout.write(line))
   // Read paired backends through a FRESH store each call: the supervisor re-reads to pick up a pairing
   // written by a separate `companion pair` process, and the sessions read connections/ceilings live.
   const readState = (): StateStore => createStateStore({ cwd: deps.appDataRoot })
-  const listBackendUrls = (): string[] => readState().listPairedBackends().map((backend) => backend.backendUrl)
+  const rawPairedUrls = (): string[] => readState().listPairedBackends().map((backend) => backend.backendUrl)
+  // The RUNTIME key set: one entry per PAIRED ACCOUNT, which is what a session is built per.
+  const rawPairedScopes = (): string[] => readState().listPairedScopes().map((paired) => paired.scope)
 
-  // Pre-flight (before the lock): refuse to boot when there is nothing to serve - an unpaired filter,
-  // or no paired backend at all - matching the single-backend refusal so cli.ts still gets a null.
+  // Pre-flight (before the lock): refuse to boot when there is nothing to serve - an unpaired filter, or
+  // no paired backend at all.
   const initial =
     deps.filterUrl !== undefined
-      ? listBackendUrls().includes(deps.filterUrl)
+      ? rawPairedUrls().includes(deps.filterUrl)
         ? [deps.filterUrl]
         : []
-      : listBackendUrls()
+      : rawPairedUrls()
   if (initial.length === 0) {
     write(
       deps.filterUrl !== undefined
@@ -112,53 +151,94 @@ export function startDaemon(deps: ServeDeps): Daemon | null {
     return null
   }
 
+  // Boot-time pairing-key canonicalization, INSIDE the single-instance lock so two daemons racing a
+  // first boot can never run the migration concurrently. Failures are swallowed (the migration simply
+  // retries on the next boot) - a migration error must never stop the daemon from serving.
+  try {
+    await migratePairingKeys(deps.state, deps.secrets)
+  } catch (err) {
+    write(`Skipped pairing canonicalization: ${err instanceof Error ? err.message : 'unknown error'}\n`)
+  }
+
+  // Canonicalize first, THEN account-scope: this migration builds scopes from canonical URLs, so running
+  // it against raw keys would mint scopes the canonicalizer would immediately orphan. Guarded separately
+  // (and swallowed the same way) because it reaches the NETWORK to resolve each legacy bearer's owner: an
+  // unreachable backend must leave the daemon serving its other pairings, not refuse to boot.
+  try {
+    await migrateAccountScopes(deps.state, deps.secrets, defaultFetch, {
+      appDataRoot: deps.appDataRoot,
+      write
+    })
+  } catch (err) {
+    write(`Skipped account-scope migration: ${err instanceof Error ? err.message : 'unknown error'}\n`)
+  }
+
   const managedDir = managedCliDir(deps.appDataRoot)
   const registry = deps.registry ?? buildCompanionRegistry(managedDir)
 
-  // Establish the audit substrate ONCE at boot (shared by every session) so the first dispatched run of
-  // any backend can be logged fail-closed. The log only mkdirs on append; creating the dir here makes
-  // the substrate observable and surfaces an unwritable audit root at startup rather than on first run.
+  // Establish the audit substrate ONCE at boot (shared by every session) so the first dispatched run of any
+  // scope can be logged fail-closed. The log only mkdirs on append; creating the dir here makes the
+  // substrate observable and surfaces an unwritable audit root at startup, not on first run.
   const auditRoot = auditDir(deps.appDataRoot)
   mkdirSync(auditRoot, { recursive: true })
   const audit = createAuditLog({ dir: auditRoot })
 
-  // Forward reference so a session's `write` can consult the LIVE session count: prefix each session's
-  // lines with its backend host only while more than one backend is served (multi-backend legibility).
-  // The supervisor is assigned before any session is made (reconcile runs after construction), so the
-  // closure never sees an unassigned `supervisor`.
+  // Forward reference so a session's `write` can consult the LIVE session count and the shared run budget.
+  // The supervisor is assigned before any session is made (reconcile runs after construction), so neither
+  // closure sees it unassigned.
   let supervisor: SessionSupervisor
   // The daemon's self-update loop, when `deps.updater` is supplied. Assigned after the shutdown drain
   // exists (it needs it for `requestShutdown`); the closures below read it lazily, and any poll that
   // reads `updateState` runs asynchronously after `auto` is set, so it is never observed unassigned.
   let auto: AutoUpdateHandle | null = null
+  // The machine-global in-flight run count every served scope gates against, so two sessions share one
+  // concurrent-run budget instead of each enforcing the cap against only its own count. It also spans the
+  // self-update idle probe, so no in-flight run is interrupted by an update flip.
+  const totalActiveRuns = (): number => supervisor.activeRunCount()
   const sessionWrite =
-    (backendUrl: string) =>
+    (scope: string) =>
     (line: string): void => {
-      write(supervisor.running().length > 1 ? `[${hostOf(backendUrl)}] ${line}` : line)
+      write(supervisor.running().length > 1 ? `[${scopeLogLabel(scope)}] ${line}` : line)
     }
 
   // Each poll reports the CURRENT self-update state: an injected `updateState` (tests) wins, otherwise
   // the live loop supplies it (empty until the loop exists / has completed its first check).
   const updateState = (): UpdateState => (deps.updateState ? deps.updateState() : (auto?.state() ?? {}))
 
-  const makeSession = (backendUrl: string): BackendSession | null =>
-    createBackendSession({
-      appDataRoot: deps.appDataRoot,
-      backendUrl,
-      registry,
-      readState,
-      secrets: deps.secrets,
-      audit,
-      ...(deps.http ? { http: deps.http } : {}),
-      ...(deps.version !== undefined ? { version: deps.version } : {}),
-      ...(deps.hostname !== undefined ? { hostname: deps.hostname } : {}),
-      updateState,
-      write: sessionWrite(backendUrl),
-      ...(deps.makeAuthMonitor ? { makeAuthMonitor: deps.makeAuthMonitor } : {})
-    })
+  // Presence defaults: the reported version + machine name flow into EVERY backend session uniformly,
+  // so every session reports this build's real version rather than a placeholder default.
+  const version = deps.version ?? daemonVersion()
+  const machineName = deps.hostname ?? hostname().trim().slice(0, 253)
+
+  const makeSession = (scope: string): BackendSession | null => {
+    // THE SPLIT, in the one place it is derived: the scope keys the bearer, the work tree and every
+    // per-pairing store; the URL is only what the transport dials. Both are strings, so nothing but this
+    // line keeps them apart.
+    const backendUrl = scopeBackendUrl(scope)
+    return deps.makeBackendSession
+      ? deps.makeBackendSession(scope, backendUrl)
+      : createBackendSession({
+          appDataRoot: deps.appDataRoot,
+          scope,
+          backendUrl,
+          registry,
+          readState,
+          secrets: deps.secrets,
+          audit,
+          ...(deps.http ? { http: deps.http } : {}),
+          version,
+          hostname: machineName,
+          updateState,
+          // Every session's slots see every OTHER served scope's load too: one machine-global
+          // concurrent-run budget across all served scopes, not a per-scope cap.
+          totalActiveRuns,
+          write: sessionWrite(scope),
+          ...(deps.makeAuthMonitor ? { makeAuthMonitor: deps.makeAuthMonitor } : {})
+        })
+  }
 
   supervisor = createSessionSupervisor({
-    listBackendUrls,
+    listScopes: rawPairedScopes,
     makeSession,
     ...(deps.filterUrl !== undefined ? { filter: deps.filterUrl } : {}),
     write
@@ -177,25 +257,34 @@ export function startDaemon(deps: ServeDeps): Daemon | null {
   }
 
   const drain = installShutdownHandlers({
-    // Each session cancels its OWN runs inside `session.stop()` (invoked by `supervisor.stop()`), in the
-    // correct order (cancel -> flush), so the daemon-level cancel seam is a no-op here.
+    // Each session cancels its OWN runs inside `session.stop()` (invoked by `supervisor.stop()`), so the
+    // daemon-level cancel is a no-op.
     cancelAll: () => undefined,
     closeRelay: async () => {
-      // Stop the self-update loop first so no staged-apply fires mid-teardown, then drain the sessions.
+      // Stop accepting new work first: stop the self-update loop (no staged-apply mid-teardown), then drain
+      // the backend sessions.
       auto?.stop()
       await supervisor.stop()
     },
-    releaseLock: () => lock.release()
+    // Runs in a `finally`, so a rejecting session drain still releases the lock: no stale PID lock survives
+    // a failed teardown.
+    releaseLock: () => {
+      lock.release()
+    }
   })
 
   // Start the self-update loop once the drain exists: it checks on boot and every ~6h, stages a newer
-  // release in the background, and applies it (flip + restart) ONLY when no run is in flight - summing
-  // the live per-session run count for idleness. Applying it exits the process cleanly; the boot
-  // service (Restart=always / KeepAlive) relaunches the daemon, which then runs the flipped `current`.
-  if (deps.updater) {
+  // release in the background, and applies it (flip + restart) ONLY when no run is in flight on any served
+  // scope - summing the shared budget for idleness. Applying it exits the process cleanly; the
+  // boot service (Restart=always / KeepAlive) relaunches the daemon, which then runs the flipped `current`.
+  // Source runs (tsx, version 0.0.0-dev) never self-update: every published release compares newer than the
+  // dev fallback, so the loop would download the release and exit the dev process on start.
+  if (deps.updater && (deps.isSourceRun ?? isSourceBuild)()) {
+    write('source run (0.0.0-dev) - auto-update disabled\n')
+  } else if (deps.updater) {
     auto = startAutoUpdate({
       updater: deps.updater,
-      isIdle: () => supervisor.activeRunCount() === 0,
+      isIdle: () => totalActiveRuns() === 0,
       autoUpdateEnabled: () => readState().getAutoUpdate(),
       // Same timeout-guarded drain-then-exit the SIGTERM path uses, so a black-holed final flush can
       // never wedge the daemon stopped-but-alive after an update flip (the boot service relaunches it).
@@ -204,6 +293,8 @@ export function startDaemon(deps: ServeDeps): Daemon | null {
     })
   }
 
+  // The startup line, printed on every boot that got this far - even with an empty served set, which a
+  // supervisor reads as "the daemon is up, its pairings are not serving yet".
   const served = supervisor.running()
   write(`${BRAND.binary} daemon running (backends: ${served.join(', ')}; device ${deps.state.getDeviceId()}).\n`)
   return { stop: drain }

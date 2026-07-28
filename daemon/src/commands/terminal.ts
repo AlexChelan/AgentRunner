@@ -1,0 +1,206 @@
+import { hostname } from 'node:os'
+import { isTerminalCliId, TERMINAL_CLI_IDS, type TerminalCliId } from '@opencompanion/core'
+import { BRAND } from '../brand'
+import { loadLocalAppConfig, type LocalAppConfig } from '@opencompanion/core/runtime/local/app-config'
+import { scopeBackendUrl } from '@opencompanion/core/runtime/account-scope'
+import { LOCAL_SCOPE, scopeFlag } from '@opencompanion/core/runtime/local/scope'
+import { collectMcpEnv } from '@opencompanion/core/runtime/mcp-secrets'
+import { readBearer } from '@opencompanion/core/runtime/pair'
+import type { StateStore } from '@opencompanion/core/runtime/storage/state-store'
+import { runLocalTerminalSession, runTerminalSession } from '@opencompanion/core/runtime/terminal'
+import { messageOf } from '@opencompanion/core/runtime/error-message'
+import * as ui from '../ui'
+import { daemonVersion } from '../version'
+import { flagValue, openAuditLog, openStores, positionalArg, resolveCommandScope } from './shared'
+
+/**
+ * The product a session is attributed to when the user names none. It matches the backend's OWN
+ * fallback (`config.companion.clientId ?? "companion"`), so a default terminal session and a default
+ * dispatched run share one confined work folder instead of splitting the workspace in two. LOCAL
+ * sessions never fall back to it: their product is named by the on-device app config.
+ */
+const DEFAULT_PRODUCT_ID = 'companion'
+
+/**
+ * Resolves which CLI the session drives: an explicit `--cli` (validated against the terminal-capable
+ * allowlist AND the scope's connected CLIs), or - when the flag is absent - the sole connected one.
+ * Anything ambiguous or unconnected exits with the command that fixes it, rather than guessing. A CLI is
+ * connected PER SCOPE, so the local session sees exactly what `connect --local` recorded, and every
+ * remediation line it prints carries the scope's own flag.
+ *
+ * @param argv - The process arguments.
+ * @param state - The state store (read for the scope's connected CLIs).
+ * @param scope - The scope the session runs under (an account scope, or {@link LOCAL_SCOPE}).
+ * @returns The chosen CLI, or `undefined` once the process is exiting.
+ */
+function resolveTerminalCli(argv: string[], state: StateStore, scope: string): TerminalCliId | undefined {
+  const flag = scopeFlag(scope)
+  const connected = state
+    .listConnections(scope)
+    .map((conn) => conn.toolId)
+    .filter(isTerminalCliId)
+  const requested = flagValue(argv, '--cli')
+
+  if (requested !== undefined) {
+    if (!isTerminalCliId(requested)) {
+      ui.p.cancel(`--cli must be one of ${TERMINAL_CLI_IDS.join(', ')}.`)
+      process.exit(1)
+      return undefined
+    }
+    if (!connected.includes(requested)) {
+      ui.p.cancel(`${requested} is not connected. Run '${BRAND.binary} connect ${flag} ${requested}' first.`)
+      process.exit(1)
+      return undefined
+    }
+    return requested
+  }
+  const [only] = connected
+  if (only === undefined) {
+    // One copy-pasteable command per CLI: connect takes exactly one positional id, so a single
+    // quoted command listing every id would fail verbatim.
+    const commands = TERMINAL_CLI_IDS.map((id) => `'${BRAND.binary} connect ${flag} ${id}'`).join(' or ')
+    ui.p.cancel(`No terminal-capable CLI connected. Run ${commands} first.`)
+    process.exit(1)
+    return undefined
+  }
+  if (connected.length > 1) {
+    ui.p.cancel(`Several CLIs are connected. Pass --cli <${connected.join('|')}>.`)
+    process.exit(1)
+    return undefined
+  }
+  return only
+}
+
+/**
+ * Runs `terminal --local --app-config <path> [--cli claude-code|codex] [--model <id>] [--cwd <path>]`:
+ * the PURELY-LOCAL session. It pairs with nothing, calls nothing, and composes the CLI's instructions
+ * from the on-device app config the app staged (the same document a local runtime boots from). The
+ * product is the config's, so the session shares one confined work folder with the local chat runs; the
+ * CLI, the local MCP servers, the ceiling and the folder grants all come from the LOCAL scope's own
+ * records. A missing or invalid `--app-config` refuses before anything is opened.
+ *
+ * @param argv - The process arguments (`terminal` is `argv[0]`).
+ * @param stores - The already-opened app-data root + state/secret stores.
+ */
+async function cmdLocalTerminal(argv: string[], stores: ReturnType<typeof openStores>): Promise<void> {
+  const { appDataRoot, state, secrets } = stores
+  // The paired form takes `terminal <productId>`; the local form does not - its product is named by the
+  // on-device app config, not a positional. Refuse a stray one loudly rather than silently ignoring it and
+  // opening a session for a different product than the user typed.
+  const productArg = positionalArg(argv)
+  if (productArg !== undefined) {
+    ui.p.cancel(`terminal --local takes no product argument ("${productArg}"): the product comes from --app-config.`)
+    process.exit(1)
+    return
+  }
+  const appConfigPath = flagValue(argv, '--app-config')
+  if (appConfigPath === undefined) {
+    ui.p.cancel(`terminal --local requires --app-config <path>.`)
+    process.exit(1)
+    return
+  }
+  let config: LocalAppConfig
+  try {
+    config = loadLocalAppConfig(appConfigPath)
+  } catch (err) {
+    ui.p.cancel(messageOf(err))
+    process.exit(1)
+    return
+  }
+
+  const cli = resolveTerminalCli(argv, state, LOCAL_SCOPE)
+  if (cli === undefined) return
+
+  const modelId = flagValue(argv, '--model')
+  const requestedCwd = flagValue(argv, '--cwd')
+  // The user's OWN local MCP servers, read fresh from the store: an `mcp add --local` between sessions is
+  // picked up with no restart. Their stdio specs name only their environment KEYS; the VALUES come back
+  // out of the encrypted secret store here and are spawned into the CLI's environment, never its argv.
+  const localMcpServers = state.listMcpServers(LOCAL_SCOPE)
+  await runLocalTerminalSession({
+    appDataRoot,
+    config,
+    cli,
+    ceiling: state.getPolicyCeiling(LOCAL_SCOPE),
+    audit: openAuditLog(appDataRoot),
+    localMcpServers,
+    mcpEnv: collectMcpEnv(secrets, LOCAL_SCOPE, localMcpServers),
+    grantedRoots: state.listGrantedFolders(LOCAL_SCOPE),
+    write: ui.line,
+    ...(requestedCwd ? { requestedCwd } : {}),
+    ...(modelId ? { modelId } : {})
+  })
+}
+
+/**
+ * Runs `terminal [<productId>] [--url <backend>] [--user <id>] [--cli claude-code|codex] [--model <id>]
+ * [--cwd <path>]`, or - with `--local` - the on-device session ({@link cmdLocalTerminal}).
+ *
+ * The PAIRED form opens the user's own coding CLI as an interactive session wired to their product: the
+ * product's tools on the CLI's MCP surface, the user's OWN local MCP servers (`mcp add`) beside them, the
+ * backend's composed instructions as its system prompt, and the product's confined work folder as its cwd.
+ * `<productId>` names the workspace the session runs in (defaulting to the backend's own `companion`
+ * product); `--url` picks the backend when several are paired and `--user` picks the account when one
+ * backend carries two SaaS logins; `--cli` picks the CLI when several are
+ * connected; `--model` pins the model; `--cwd` runs the session in one of the user's OWN folders instead,
+ * which is honored only inside a root they granted with `policy grant-folder add` (see
+ * `runTerminalSession`).
+ *
+ * @param argv - The process arguments (`terminal` is `argv[0]`).
+ */
+export async function cmdTerminal(argv: string[]): Promise<void> {
+  const stores = openStores()
+  if (argv.includes('--local')) {
+    await cmdLocalTerminal(argv, stores)
+    return
+  }
+  const { appDataRoot, state, secrets } = stores
+  // The SCOPE keys the credentials, the ceiling, the grants and the MCP servers; the URL it addresses is
+  // only what the session dials and names. Both are strings, so this is the line that keeps them apart.
+  const scope = await resolveCommandScope(argv, state)
+  if (scope === undefined) return
+  const backendUrl = scopeBackendUrl(scope)
+
+  const bearer = readBearer(scope, secrets)
+  if (!bearer) {
+    ui.p.cancel(`Missing credentials for ${backendUrl}. Run '${BRAND.binary} pair' again.`)
+    process.exit(1)
+    return
+  }
+  const cli = resolveTerminalCli(argv, state, scope)
+  if (cli === undefined) return
+
+  const machineName = hostname().trim().slice(0, 253)
+  const modelId = flagValue(argv, '--model')
+  const requestedCwd = flagValue(argv, '--cwd')
+  // The user's OWN local MCP servers for this backend, read fresh from the store: an `mcp add` between
+  // sessions is picked up with no restart. This map is write-only-by-the-local-user, which is what makes
+  // an MCP server on the CLI's surface something the user typed, never something a backend sent. Its
+  // stdio specs name only their environment KEYS; the VALUES come back out of the encrypted secret store
+  // here and are spawned into the CLI's environment, so they never touch the CLI's argv.
+  const localMcpServers = state.listMcpServers(scope)
+  await runTerminalSession({
+    appDataRoot,
+    scope,
+    backendUrl,
+    bearer,
+    deviceId: state.getDeviceId(),
+    version: daemonVersion(),
+    productId: positionalArg(argv) ?? DEFAULT_PRODUCT_ID,
+    cli,
+    ceiling: state.getPolicyCeiling(scope),
+    audit: openAuditLog(appDataRoot),
+    localMcpServers,
+    mcpEnv: collectMcpEnv(secrets, scope, localMcpServers),
+    // The folders the USER granted this backend, read fresh from the local store (a grant added between
+    // sessions applies with no restart) - the only list a `--cwd` is ever checked against.
+    grantedRoots: state.listGrantedFolders(scope),
+    write: ui.line,
+    ...(requestedCwd ? { requestedCwd } : {}),
+    connections: state
+      .listConnections(scope)
+      .map((conn) => ({ toolId: conn.toolId, authHealth: conn.authHealth })),
+    ...(machineName ? { hostname: machineName } : {}),
+    ...(modelId ? { modelId } : {})
+  })
+}

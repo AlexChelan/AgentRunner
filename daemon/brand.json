@@ -1,0 +1,11 @@
+{
+  "name": "OpenCompanion",
+  "binary": "opencompanion",
+  "scope": "@opencompanion",
+  "serviceLabel": "com.generatesaas.opencompanion",
+  "appDirName": "opencompanion",
+  "envPrefix": "OPENCOMPANION",
+  "docsUrl": "https://generatesaas.com/docs/opencompanion",
+  "repoUrl": "https://github.com/AlexChelan/OpenCompanion",
+  "installBase": "https://github.com/AlexChelan/OpenCompanion/releases/latest/download"
+}

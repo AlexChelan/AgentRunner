@@ -24,7 +24,7 @@ import { compareSemver } from './semver'
 export interface UpdaterDeps {
   /** The install root that holds `versions/` and the `current` pointer. */
   installDir: string
-  /** The release download base (`OPENCOMPANION_RELEASE_BASE` or the GitHub latest-download URL), trailing slash trimmed. */
+  /** The release download base (the brand's `RELEASE_BASE` env override or its latest-download URL), trailing slash trimmed. */
   releaseBase: string
   /** The running OS platform (selects the artifact + per-version launcher name). */
   platform: NodeJS.Platform
@@ -46,6 +46,31 @@ export interface UpdateCheck {
   latest: string | null
   /** True only when a newer version is available (never a downgrade). */
   updateAvailable: boolean
+}
+
+/**
+ * Whether a release channel is configured. An empty (or whitespace-only) release base means no releases
+ * repository has been set up yet - a freshly-exported companion that has not published - so update checks
+ * are a friendly no-op rather than a failed fetch against a malformed URL.
+ *
+ * @param releaseBase - The resolved release download base.
+ * @returns True when a non-empty release base is configured.
+ */
+export function hasReleaseBase(releaseBase: string): boolean {
+  return releaseBase.trim().length > 0
+}
+
+/**
+ * Whether this daemon is a source run (tsx/vitest) rather than a versioned install. Source runs report
+ * the `0.0.0-dev` build fallback, which compares older than EVERY published release - so a self-update
+ * would download the release and exit the dev process on every start, hijacking `pnpm dev`. Both the
+ * auto-update loop and `update` apply are gated on this: updates are for installed daemons only.
+ *
+ * @param version - The build version to classify (defaults to this process's {@link daemonVersion}).
+ * @returns True when the daemon runs from source.
+ */
+export function isSourceBuild(version: string = daemonVersion()): boolean {
+  return version === '0.0.0-dev'
 }
 
 /** Matches a directory name that is a plain `major.minor.patch` version (ignores staging dirs etc.). */
@@ -106,7 +131,7 @@ export function readCurrent(installDir: string): string | null {
  * @returns The latest released version, or `null`.
  */
 async function fetchLatest(deps: UpdaterDeps): Promise<string | null> {
-  const scratch = mkdtempSync(join(tmpdir(), 'opencompanion-check-'))
+  const scratch = mkdtempSync(join(tmpdir(), `${BRAND.binary}-check-`))
   try {
     const dest = join(scratch, 'VERSION')
     await deps.download(assetUrl(deps.releaseBase, 'VERSION'), dest)

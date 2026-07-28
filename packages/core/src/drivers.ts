@@ -4,22 +4,32 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { createInterface } from 'node:readline'
 import { query as realQuery } from '@anthropic-ai/claude-agent-sdk'
-import type { Options } from '@anthropic-ai/claude-agent-sdk'
-import { HERMES_ACP_CONFIG, makeAcpDriver } from './acp-driver'
+import type { Options, SDKUserMessage } from '@anthropic-ai/claude-agent-sdk'
+import type { RunImage } from '@opencompanion/core-types'
+import {
+  HERMES_ACP_CONFIG,
+  OPENCODE_ACP_CONFIG,
+  makeAcpDriver,
+  probeAcpSession,
+  type AcpSessionLister
+} from './acp-driver'
 import { buildCliEnv } from './env-scrub'
 import { isWindowsShimPath } from './binaries'
 import { nodeDirOnPath, stripInspectorEnv } from './shell-path'
 import {
   CODEX_APP_SERVER_CLIENT_INFO,
   buildCodexAppServerArgs,
+  buildCodexPermissionProfileOverrides,
   buildCodexThreadResumeParams,
   buildCodexThreadStartParams,
   buildCodexTurnStartParams,
+  claudeConfinementSettings,
   claudePermissionOptions,
   claudeReasoningOptions,
   codexAppServerNotificationToMessages,
   codexPosture,
   codexReasoningEffort,
+  extractCodexAdvertisedModels,
   extractCodexThreadId,
   extractCodexTurnId,
   extractTextDelta,
@@ -31,9 +41,9 @@ import {
   parseCodexAppServerLine
 } from './adapters/mapping'
 import type {
+  AdvertisedModel,
+  AdvertisedModelLister,
   AgenticCliDriver,
-  AgenticCliDriverParams,
-  AgenticDriverMessage,
   ClaudeDriver
 } from './adapters/types'
 
@@ -70,16 +80,31 @@ export interface DriverDeps {
   spawnFn?: SpawnFn
 }
 
-/** The four agentic drivers a registry wires into its adapters. */
+/** The four agentic drivers a registry wires into its adapters, plus their model-advertisement probes. */
 export interface AgentDrivers {
   /** Drives the user's installed Claude Code via the Agent SDK. */
   claudeDriver: ClaudeDriver
   /** Drives the user's installed Codex via `codex app-server` (JSON-RPC over stdio). */
   codexDriver: AgenticCliDriver
-  /** Drives the user's installed OpenCode via `opencode run`. */
+  /** Drives the user's installed OpenCode via `opencode acp` (ACP JSON-RPC over stdio). */
   openCodeDriver: AgenticCliDriver
   /** Drives the user's installed Hermes via `hermes acp` (ACP JSON-RPC over stdio). */
   hermesDriver: AgenticCliDriver
+  /** Asks the user's installed Codex app-server which models (and efforts) it advertises. */
+  codexModelLister: AdvertisedModelLister
+  /** Asks the user's installed Claude Code which models (and effort levels) it advertises. */
+  claudeModelLister: AdvertisedModelLister
+  /**
+   * Asks ONE short-lived `hermes acp` session what it advertises: its selectable models and its
+   * reserved config options (a `thought_level` ladder, when the agent declares one).
+   */
+  hermesSessionLister: AcpSessionLister
+  /**
+   * Asks ONE short-lived `opencode acp` session what it advertises. OpenCode's catalog is only
+   * readable inside a session: `opencode models` prints bare ids with no label and no current-model
+   * marker, so this is the only source with the metadata the picker renders.
+   */
+  openCodeSessionLister: AcpSessionLister
 }
 
 /**
@@ -170,12 +195,75 @@ function isAbortError(error: unknown): boolean {
  * (the SDK `session_id`) before `done` on a successful result, and sets
  * `options.resume` only when `p.resume` is supplied (spike-D resume). The child env
  * is an allowlist with the node dir on PATH, plus the BYOK key when present.
+ *
+ * Every run this driver starts is a headless chat/schedule run, so it is ISOLATED from the user's
+ * personal Claude Code config: `strictMcpConfig` limits MCP to the app-provided servers and
+ * `settingSources: []` loads no filesystem settings/CLAUDE.md, so a run sees only the app tools plus
+ * Claude Code's built-ins - never the user's personal MCP servers or custom permission grants. The
+ * interactive terminal is a SEPARATE path (`claudeTerminalArgs` + a direct spawn) that keeps the
+ * user's full config. Auth is untouched: credentials resolve from CLAUDE_CONFIG_DIR (default
+ * `~/.claude`), which this driver never repoints.
  */
+/** The base64 image media types the Claude Agent SDK's image content block accepts. */
+const CLAUDE_IMAGE_MEDIA_TYPES = ['image/jpeg', 'image/png', 'image/gif', 'image/webp'] as const
+
+/** Narrows an arbitrary media type onto the SDK's image union, defaulting to JPEG for anything else. */
+function toClaudeImageMediaType(
+  mediaType: string
+): (typeof CLAUDE_IMAGE_MEDIA_TYPES)[number] {
+  return CLAUDE_IMAGE_MEDIA_TYPES.find((type) => type === mediaType) ?? 'image/jpeg'
+}
+
+/** The base64 payload of a `data:` URL (everything after the comma), or the input when it has none. */
+function base64FromDataUrl(dataUrl: string): string {
+  const comma = dataUrl.indexOf(',')
+  return comma === -1 ? dataUrl : dataUrl.slice(comma + 1)
+}
+
+/**
+ * Builds the Claude Agent SDK `query` prompt input for a turn. A text-only turn passes the prompt string
+ * (the SDK's simple form); a turn WITH images passes a one-message async stream whose user message carries
+ * the prompt text plus one base64 image content block per attachment, which is how the Agent SDK accepts
+ * images. The stream yields exactly one message and completes, so the SDK runs a single turn.
+ *
+ * @param prompt - The composed prompt text (may be empty for an image-only turn).
+ * @param images - The attached images, or undefined/empty for a text-only turn.
+ * @returns The prompt string, or an async iterable of one user message with image blocks.
+ */
+function claudePromptInput(
+  prompt: string,
+  images: RunImage[] | undefined
+): string | AsyncIterable<SDKUserMessage> {
+  if (!images || images.length === 0) return prompt
+  async function* one(): AsyncGenerator<SDKUserMessage> {
+    yield {
+      type: 'user',
+      parent_tool_use_id: null,
+      message: {
+        role: 'user',
+        content: [
+          ...(prompt ? [{ type: 'text' as const, text: prompt }] : []),
+          ...images!.map((image) => ({
+            type: 'image' as const,
+            source: {
+              type: 'base64' as const,
+              media_type: toClaudeImageMediaType(image.mediaType),
+              data: base64FromDataUrl(image.dataUrl)
+            }
+          }))
+        ]
+      }
+    }
+  }
+  return one()
+}
+
 function makeClaudeDriver(query: ClaudeQuery): ClaudeDriver {
   return async function* (p) {
     const opts = claudePermissionOptions(p.permissionMode)
     const allowedTools = [...(opts.allowedTools ?? []), ...(p.allowedTools ?? [])]
     const disallowedTools = [...(opts.disallowedTools ?? []), ...(p.disallowedTools ?? [])]
+    const confinement = claudeConfinementSettings(p.denyReadPaths ?? [], p.network !== 'off')
     let stderrDetail = ''
     const claudeExecutable = sdkExecutableOverride(p.binaryPath)
     // Inherit an ALLOWLISTED environment (the user's own trusted CLI keeps PATH,
@@ -187,6 +275,15 @@ function makeClaudeDriver(query: ClaudeQuery): ClaudeDriver {
       ...(claudeExecutable ? { pathToClaudeCodeExecutable: claudeExecutable } : {}),
       includePartialMessages: true,
       abortController: controllerFromSignal(p.signal),
+      // Isolate this headless chat/schedule run from the user's PERSONAL Claude Code config: use ONLY
+      // the app-provided MCP servers (drop the user's own servers from `~/.claude` and any project
+      // `.mcp.json` - e.g. their personal infra MCP) and load NO filesystem settings (no user/project
+      // settings.json, no CLAUDE.md), so the run sees only the app tools plus Claude Code's built-ins.
+      // The interactive TERMINAL keeps the user's full config - it spawns `claude` directly (see
+      // `claudeTerminalArgs`), never through this driver. Auth is UNAFFECTED: the subscription/API
+      // credentials live under CLAUDE_CONFIG_DIR (default `~/.claude`), which this never repoints.
+      strictMcpConfig: true,
+      settingSources: [],
       permissionMode: opts.permissionMode,
       stderr: (data) => {
         stderrDetail += data
@@ -199,6 +296,10 @@ function makeClaudeDriver(query: ClaudeQuery): ClaudeDriver {
         : {}),
       ...(allowedTools.length > 0 ? { allowedTools } : {}),
       ...(disallowedTools.length > 0 ? { disallowedTools } : {}),
+      // A confined run (the unattended daemon) denies reads of the paths it passes - its own
+      // `secrets/`. Claude needs BOTH halves and neither covers the other: the OS sandbox stops the
+      // Bash tool, the permission rules stop Read/Grep/Glob. Absent for the interactive terminal.
+      ...(confinement ? { settings: confinement } : {}),
       ...(p.model ? { model: p.model } : {}),
       ...(p.systemPrompt ? { systemPrompt: p.systemPrompt } : {}),
       ...claudeReasoningOptions(p.effort),
@@ -213,7 +314,7 @@ function makeClaudeDriver(query: ClaudeQuery): ClaudeDriver {
       }
     }
     try {
-      for await (const message of query({ prompt: p.prompt, options })) {
+      for await (const message of query({ prompt: claudePromptInput(p.prompt, p.images), options })) {
         if (message.type === 'stream_event') {
           const text = extractTextDelta(message.event)
           if (text) yield { kind: 'text', text }
@@ -314,12 +415,23 @@ function makeCodexDriver(spawnFn: SpawnFn): AgenticCliDriver {
     // A chat with no connected workspace has an empty `p.cwd`; the app-server needs a real cwd, so
     // fall back to the OS temp dir (a valid, writable, throwaway directory) - the run is chat-only.
     const runCwd = p.cwd && p.cwd.length > 0 ? p.cwd : tmpdir()
-    const args = buildCodexAppServerArgs(
-      mcpServers && Object.keys(mcpServers).length > 0 ? { mcpServers } : {}
-    )
+    // A confined run (the unattended daemon) denies reads of the paths it passes - its own `secrets/`.
+    // This MUST ride the spawn: codex's read-deny is a config-layer permissions PROFILE, not part of
+    // the per-request sandbox policy (whose tiers all grant full-filesystem read). While it is active
+    // the legacy thread-level `sandbox` tier must be omitted, or codex ignores the profile entirely.
+    const permissionProfile = buildCodexPermissionProfileOverrides({
+      sandboxMode: posture.sandboxMode,
+      networkAccessEnabled: networkEnabled,
+      denyReadPaths: p.denyReadPaths ?? []
+    })
+    const confined = permissionProfile.length > 0
+    const args = buildCodexAppServerArgs({
+      ...(mcpServers && Object.keys(mcpServers).length > 0 ? { mcpServers } : {}),
+      ...(confined ? { permissionProfile } : {})
+    })
     codexTrace(
       'spawn',
-      `bin=${p.binaryPath} cwd=${runCwd} sandbox=${posture.sandboxMode} net=${networkEnabled} mcp=${mcpServers ? Object.keys(mcpServers).length : 0}`
+      `bin=${p.binaryPath} cwd=${runCwd} sandbox=${posture.sandboxMode} net=${networkEnabled} confined=${confined} mcp=${mcpServers ? Object.keys(mcpServers).length : 0}`
     )
     const child = spawnFn(p.binaryPath, args, {
       stdio: ['pipe', 'pipe', 'pipe'],
@@ -327,7 +439,13 @@ function makeCodexDriver(spawnFn: SpawnFn): AgenticCliDriver {
       cwd: runCwd,
       // Inherit an allowlisted env (PATH, proxy, CA, locale, ...) with the node dir on PATH, then add
       // the BYOK key as `CODEX_API_KEY`; subscription mode reads the user's `~/.codex` login instead.
-      env: childEnvFor(p.apiKey ? { CODEX_API_KEY: p.apiKey } : {})
+      // When an isolated `codexHome` is supplied (a headless chat/schedule run), point `CODEX_HOME` at
+      // it so codex loads that home's config.toml (NO personal MCP servers) and its seeded auth.json
+      // instead of the user's `~/.codex` - the terminal path passes no `codexHome` and keeps the user's.
+      env: childEnvFor({
+        ...(p.apiKey ? { CODEX_API_KEY: p.apiKey } : {}),
+        ...(p.codexHome ? { CODEX_HOME: p.codexHome } : {})
+      })
     })
     child.stdin?.on('error', () => {})
     let stderr = ''
@@ -433,6 +551,7 @@ function makeCodexDriver(spawnFn: SpawnFn): AgenticCliDriver {
                       cwd: runCwd,
                       sandboxMode: posture.sandboxMode,
                       approvalPolicy: posture.approvalPolicy,
+                      permissionProfileActive: confined,
                       ...(p.model ? { model: p.model } : {})
                     })
                   )
@@ -510,105 +629,161 @@ function makeCodexDriver(spawnFn: SpawnFn): AgenticCliDriver {
 }
 
 /**
- * Shared CLI-driver loop for the headless agentic CLIs (OpenCode): spawns the binary
- * with an allowlisted, node-on-PATH env, streams stdout as `text` messages, captures
- * stderr, honors abort silently (swallowing the `ABORT_ERR` `error` event - spike-A
- * carry-in 1), and maps the exit code onto a `done` / `error` message.
- *
- * @param spawnFn - The injected process spawner.
- * @param p - The run params (binary path, prompt, cwd, model, permission mode, signal).
- * @param config - The tool name and the per-tool argument-array builder.
- * @returns The normalized message stream.
+ * Ceiling for a model-advertisement probe. Both probes only wait on a local handshake (no model
+ * turn, no tokens), so anything past this is a CLI that failed to come up - and the caller has a
+ * declared floor to fall back on, so waiting longer buys nothing but a stalled picker.
  */
-async function* streamCliTool(
-  spawnFn: SpawnFn,
-  p: AgenticCliDriverParams,
-  config: {
-    toolName: string
-    buildArgs: (p: AgenticCliDriverParams) => string[]
-    /** Per-tool env additions (e.g. a BYOK key) merged over the scrubbed env. */
-    extraEnv?: (p: AgenticCliDriverParams) => Record<string, string>
-  }
-): AsyncGenerator<AgenticDriverMessage> {
-  const child = spawnFn(p.binaryPath, config.buildArgs(p), {
-    signal: p.signal,
-    stdio: ['ignore', 'pipe', 'pipe'],
-    // Run inside the per-product work folder so process-relative file operations stay
-    // confined; `--dir` is only a hint, the real confinement is the child's cwd.
-    cwd: p.cwd,
-    // Inherit an allowlisted env (the user's own trusted CLI keeps PATH, proxy, CA,
-    // locale, ...; non-operational vars are dropped) with the node dir on PATH, then
-    // add back the single credential the run needs - the same convention as Claude/Codex.
-    env: childEnvFor(config.extraEnv?.(p) ?? {})
-  })
-  // Attach an `error` handler so a cancelled `spawn({ signal })` does not re-throw
-  // `ABORT_ERR` as an uncaught exception. A non-abort error is captured and surfaced
-  // after the exit-code resolution.
-  let spawnError: Error | undefined
-  child.on('error', (err: Error) => {
-    spawnError = isAbortError(err) ? undefined : err
-  })
-  let stderr = ''
-  child.stderr?.on('data', (chunk: Buffer) => {
-    stderr += chunk.toString()
-  })
-  const exitCode = new Promise<number | null>((resolve) =>
-    child.on('close', (code) => resolve(code))
-  )
+const MODEL_LIST_TIMEOUT_MS = 15_000
 
-  try {
-    if (child.stdout) {
-      for await (const chunk of child.stdout) {
-        const text = chunk.toString()
-        if (text) yield { kind: 'text', text }
-      }
-    }
-  } catch (error) {
-    if (p.signal.aborted) return
-    yield { kind: 'error', message: error instanceof Error ? error.message : String(error) }
-    return
-  }
-
-  if (p.signal.aborted) return
-  const code = await exitCode
-  // The abort may land while the exit code is resolving; an aborted run is silent.
-  if (p.signal.aborted) return
-  if (spawnError) {
-    yield { kind: 'error', message: stderr.trim() || spawnError.message }
-    return
-  }
-  if (code === 0) yield { kind: 'done' }
-  else
-    yield {
-      kind: 'error',
-      message: stderr.trim() || `${config.toolName} exited with code ${code ?? 'unknown'}`
-    }
+/**
+ * Races a pending promise against a deadline, resolving to the `'timeout'` sentinel when the
+ * deadline wins. The timer is always cleared so a settled race never leaks a pending timeout.
+ *
+ * @param pending - The promise to bound.
+ * @param ms - The ceiling in milliseconds.
+ * @returns The resolved value, or `'timeout'`.
+ */
+function withTimeout<T>(pending: Promise<T>, ms: number): Promise<T | 'timeout'> {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  const expiry = new Promise<'timeout'>((resolve) => {
+    timer = setTimeout(() => resolve('timeout'), ms)
+  })
+  return Promise.race([pending, expiry]).finally(() => {
+    if (timer) clearTimeout(timer)
+  })
 }
 
 /**
- * Builds the OpenCode driver bound to the injected spawner. Drives `opencode run`,
- * streaming stdout; OpenCode has no resume primitive on this path, so `p.resume` is
- * ignored.
+ * Builds the Codex model-advertisement probe: a short-lived `codex app-server` that does the
+ * `initialize` handshake and then asks `model/list`, which answers with each model's
+ * `supportedReasoningEfforts` and `defaultReasoningEffort`. This is the ONLY source that reports
+ * effort per model from the tool itself, and the set genuinely varies - so it outranks the
+ * community registry, which for one live model claims a `none` level Codex does not offer.
+ *
+ * A NEW call site, deliberately separate from the run driver's handshake: no turn is started, no
+ * thread is opened, and no credential is threaded, so the probe stays a metadata read on the user's
+ * own login. Every failure path (missing stdout, foreign CLI version, JSON-RPC error, silent child,
+ * spawn error) resolves to `[]`, which leaves the adapter on its registry catalog.
  */
-function makeOpenCodeDriver(spawnFn: SpawnFn): AgenticCliDriver {
-  return (p) =>
-    streamCliTool(spawnFn, p, {
-      toolName: 'opencode',
-      buildArgs: (params) => {
-        // Pass option values with `=` (attached, so a leading "-" can't be re-parsed as
-        // a flag) and put the prompt after `--` so an untrusted prompt starting with "-"
-        // can never smuggle CLI flags (e.g. --dangerously-skip-permissions). The prompt
-        // is the only attacker-influenced value when a product forwards end-user input.
-        const args = ['run', `--dir=${params.cwd}`]
-        if (params.model) args.push(`--model=${params.model}`)
-        // Read-only / auto-edit defer to OpenCode's own permission config; only the
-        // explicit "full" posture (a deliberate UI opt-in, like Claude bypassPermissions
-        // and Codex danger-full-access) auto-approves everything.
-        if (params.permissionMode === 'full') args.push('--dangerously-skip-permissions')
-        args.push('--', params.prompt)
-        return args
-      }
+function makeCodexModelLister(spawnFn: SpawnFn): AdvertisedModelLister {
+  return async ({ binaryPath }): Promise<AdvertisedModel[]> => {
+    const child = spawnFn(binaryPath, buildCodexAppServerArgs({}), {
+      stdio: ['pipe', 'pipe', 'pipe'],
+      cwd: tmpdir(),
+      env: childEnvFor()
     })
+    child.stdin?.on('error', () => {})
+    child.on('error', () => {})
+    const rl = child.stdout
+      ? createInterface({ input: child.stdout, crlfDelay: Infinity })
+      : undefined
+    if (!rl) {
+      child.kill()
+      return []
+    }
+    // Take the async iterator BEFORE writing anything: `createInterface` starts the stream flowing,
+    // and a `line` emitted before the iterator exists is dropped, which would hang the probe on a
+    // server that answers instantly.
+    const iterator = rl[Symbol.asyncIterator]()
+    let nextId = 1
+    const write = (message: Record<string, unknown>): void => {
+      try {
+        child.stdin?.write(`${JSON.stringify(message)}\n`)
+      } catch {
+        // stdin can be torn down mid-probe; a lost write just ends the probe empty.
+      }
+    }
+    const initId = nextId++
+    write({
+      jsonrpc: '2.0',
+      id: initId,
+      method: 'initialize',
+      params: { clientInfo: { ...CODEX_APP_SERVER_CLIENT_INFO } }
+    })
+    let listId: number | undefined
+    const deadline = Date.now() + MODEL_LIST_TIMEOUT_MS
+    try {
+      while (true) {
+        const remaining = deadline - Date.now()
+        if (remaining <= 0) return []
+        const read = iterator.next()
+        const result = await withTimeout(read, remaining)
+        if (result === 'timeout') {
+          void read.catch(() => {})
+          return []
+        }
+        if (result.done) return []
+        const incoming = parseCodexAppServerLine(result.value)
+        if (!incoming || incoming.kind !== 'response') continue
+        if (incoming.error) return []
+        if (incoming.id === initId) {
+          write({ jsonrpc: '2.0', method: 'initialized', params: {} })
+          listId = nextId++
+          write({ jsonrpc: '2.0', id: listId, method: 'model/list', params: {} })
+        } else if (incoming.id === listId) {
+          return extractCodexAdvertisedModels(incoming.result)
+        }
+      }
+    } catch {
+      return []
+    } finally {
+      rl.close()
+      child.kill()
+    }
+  }
+}
+
+/**
+ * Builds the Claude Code model-advertisement probe. The Agent SDK's `supportedModels()` is literally
+ * `(await this.initialization).models` in 0.3.170 - i.e. it reads the models array the CLI already
+ * sent in its initialize response, carrying each model's `supportedEffortLevels`. So the levels are
+ * FREE: the probe opens a session, reads the handshake it had to do anyway, and aborts without ever
+ * sending a turn. No prompt is written, no tokens are spent.
+ *
+ * The prompt is a streamed input that yields nothing until the abort fires, which is what keeps the
+ * session open long enough for the handshake to land instead of the CLI seeing stdin EOF first.
+ * Every failure path resolves to `[]`, leaving the adapter on its registry catalog.
+ */
+function makeClaudeModelLister(query: ClaudeQuery): AdvertisedModelLister {
+  return async ({ binaryPath }): Promise<AdvertisedModel[]> => {
+    const controller = new AbortController()
+    // Holds the session open for the handshake without sending a turn: it resolves only on abort.
+    async function* idleInput(): AsyncGenerator<SDKUserMessage> {
+      await new Promise<void>((resolve) => {
+        if (controller.signal.aborted) resolve()
+        else controller.signal.addEventListener('abort', () => resolve(), { once: true })
+      })
+    }
+    const claudeExecutable = sdkExecutableOverride(binaryPath)
+    let session: ReturnType<ClaudeQuery> | undefined
+    try {
+      session = query({
+        prompt: idleInput(),
+        options: {
+          cwd: tmpdir(),
+          ...(claudeExecutable ? { pathToClaudeCodeExecutable: claudeExecutable } : {}),
+          abortController: controller,
+          // Same isolation the run driver uses: no personal MCP servers, no filesystem settings.
+          strictMcpConfig: true,
+          settingSources: [],
+          env: childEnvFor()
+        }
+      })
+      const models = await withTimeout(session.supportedModels(), MODEL_LIST_TIMEOUT_MS)
+      if (models === 'timeout' || !Array.isArray(models)) return []
+      return models.flatMap((model) =>
+        typeof model.value === 'string' && model.value.length > 0
+          ? [{ id: model.value, effortLevels: [...(model.supportedEffortLevels ?? [])] }]
+          : []
+      )
+    } catch {
+      return []
+    } finally {
+      controller.abort()
+      // Close the generator we never iterate, so its internal input pump cannot outlive the probe.
+      void Promise.resolve(session?.return(undefined)).catch(() => {})
+    }
+  }
 }
 
 /**
@@ -617,7 +792,7 @@ function makeOpenCodeDriver(spawnFn: SpawnFn): AgenticCliDriver {
  * resume/conversation/abort behaviour is verified without spawning.
  *
  * @param deps - The injected SDK/CLI seams (each defaults to the real import).
- * @returns The Claude, Codex, OpenCode, and Hermes drivers.
+ * @returns The Claude, Codex, OpenCode, and Hermes drivers, plus the model/session probes.
  */
 export function makeDrivers(deps: DriverDeps = {}): AgentDrivers {
   const query = deps.query ?? realQuery
@@ -625,7 +800,25 @@ export function makeDrivers(deps: DriverDeps = {}): AgentDrivers {
   return {
     claudeDriver: makeClaudeDriver(query),
     codexDriver: makeCodexDriver(spawnFn),
-    openCodeDriver: makeOpenCodeDriver(spawnFn),
-    hermesDriver: makeAcpDriver(spawnFn, HERMES_ACP_CONFIG)
+    openCodeDriver: makeAcpDriver(spawnFn, OPENCODE_ACP_CONFIG),
+    hermesDriver: makeAcpDriver(spawnFn, HERMES_ACP_CONFIG),
+    codexModelLister: makeCodexModelLister(spawnFn),
+    claudeModelLister: makeClaudeModelLister(query),
+    hermesSessionLister: makeAcpSessionLister(spawnFn, HERMES_ACP_CONFIG.probeArgs),
+    openCodeSessionLister: makeAcpSessionLister(spawnFn, OPENCODE_ACP_CONFIG.probeArgs)
   }
+}
+
+/**
+ * Builds an ACP session-catalog probe bound to the injected spawner: one short-lived agent process
+ * that handshakes, opens a session, reads what it advertises, and dies. A NEW call site, separate
+ * from the run driver and from the auth probe - no turn is started and no credential is threaded, so
+ * it stays a metadata read on the user's own login. Every failure path resolves to an empty offer.
+ *
+ * @param spawnFn - The injected process spawner.
+ * @param args - The agent's read-only probe arguments (`AcpDriverConfig.probeArgs`).
+ * @returns The session lister the adapter memoizes.
+ */
+function makeAcpSessionLister(spawnFn: SpawnFn, args: string[]): AcpSessionLister {
+  return ({ binaryPath }) => probeAcpSession(spawnFn, binaryPath, args)
 }

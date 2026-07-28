@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from 'vitest'
 import type { ModelInfo } from '@opencompanion/core'
+import type { AgentDrivers } from '../src/drivers'
 import {
   buildAgentRuntimeRegistry,
   detectInstalled,
@@ -34,6 +35,35 @@ describe('buildAgentRuntimeRegistry', () => {
     expect(registry.getAdapter('claude-code')?.displayName).toBe('Claude Code')
     expect(registry.getAdapter('opencode')?.displayName).toBe('OpenCode')
     expect(registry.getAdapter('hermes')?.displayName).toBe('Hermes Agent')
+  })
+
+  it('wires each ACP adapter to its OWN session lister (not the other agent’s)', async () => {
+    const openCodeSessionLister = vi.fn(async () => ({
+      models: [{ id: 'github-copilot/claude-sonnet-4.6', name: 'GitHub Copilot/Claude Sonnet 4.6' }]
+    }))
+    const hermesSessionLister = vi.fn(async () => ({ models: [{ id: 'openrouter:x', name: 'X' }] }))
+    const registry = buildAgentRuntimeRegistry(
+      deps({
+        resolveBinary: (name) => `/bin/${name}`,
+        drivers: {
+          ...({} as AgentDrivers),
+          openCodeSessionLister,
+          hermesSessionLister
+        }
+      })
+    )
+    const conn = { id: 'c1', toolId: 'opencode', authMode: 'subscription' } as const
+    // A registry that forgets `listSession` still typechecks (the dep is optional) and silently
+    // serves only the curated fallback list, so the wiring needs its own assertion.
+    expect(await registry.requireAdapter('opencode').listModels(conn)).toEqual([
+      {
+        id: 'github-copilot/claude-sonnet-4.6',
+        label: 'GitHub Copilot/Claude Sonnet 4.6',
+        source: 'tool'
+      }
+    ])
+    expect(openCodeSessionLister).toHaveBeenCalledWith({ binaryPath: '/bin/opencode' })
+    expect(hermesSessionLister).not.toHaveBeenCalled()
   })
 
   it('returns undefined for an unknown adapter and never builds completion/gemini', () => {

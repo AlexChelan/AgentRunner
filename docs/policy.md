@@ -12,5 +12,3 @@ backend.
 opencompanion policy show                                # per-backend ceiling, network, and work folder
 opencompanion policy set --url https://your-saas.example/api --permission-mode read-only --network off
 ```
-
-Full guide: [generatesaas.com/docs/opencompanion/policy](https://generatesaas.com/docs/opencompanion/policy).

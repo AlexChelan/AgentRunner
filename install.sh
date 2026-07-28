@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # OpenCompanion installer for macOS and Linux. One command, no npm:
 #
-#   curl -fsSL https://github.com/Duzbee/OpenCompanion/releases/latest/download/install.sh | sh -s -- --url https://your-saas.example/api
+#   curl -fsSL https://github.com/AlexChelan/OpenCompanion/releases/latest/download/install.sh | sh -s -- --url https://your-saas.example/api
 #
 # It downloads the self-contained OpenCompanion daemon (a vendored Node runtime + the bundled daemon)
 # for your OS and architecture, verifies it against the release SHA256SUMS, installs it under
@@ -9,20 +9,27 @@
 # connect your CLIs + install the always-on service). Re-run any time to upgrade in place;
 # uninstall with `opencompanion uninstall`.
 #
+# Pass --app-scoped (or set OPENCOMPANION_APP_SCOPED=1) to install the binary only and SKIP setup - the
+# product app then drives pairing and starts the daemon itself, so no always-on service is installed.
+#
 # Nothing is baked in. The daemon is fetched from the GitHub release by default; point
 # OPENCOMPANION_RELEASE_BASE at a mirror to fetch it elsewhere. No backend URL is embedded: pass
 # `--url <backend>` (or set OPENCOMPANION_BACKEND_URL) to pair with your SaaS at setup time.
 set -eu
 
-RELEASE_BASE="${OPENCOMPANION_RELEASE_BASE:-https://github.com/Duzbee/OpenCompanion/releases/latest/download}"
+RELEASE_BASE="${OPENCOMPANION_RELEASE_BASE:-https://github.com/AlexChelan/OpenCompanion/releases/latest/download}"
 INSTALL_DIR="${OPENCOMPANION_HOME:-$HOME/.opencompanion}"
 BIN_DIR="${OPENCOMPANION_BIN_DIR:-$HOME/.local/bin}"
 BACKEND_URL="${OPENCOMPANION_BACKEND_URL:-}"
+# App-scoped is driven by the --app-scoped flag below or OPENCOMPANION_APP_SCOPED=1. The env is compared to
+# `1` exactly (never `-n`, which any non-empty value satisfies, so `0` would wrongly mean app-scoped).
+APP_SCOPED="${OPENCOMPANION_APP_SCOPED:-}"
 
 while [ $# -gt 0 ]; do
   case "$1" in
     --url) BACKEND_URL="${2:-}"; shift 2 ;;
     --url=*) BACKEND_URL="${1#--url=}"; shift ;;
+    --app-scoped) APP_SCOPED=1; shift ;;
     *) shift ;;
   esac
 done
@@ -141,16 +148,22 @@ case ":${PATH}:" in
   *) info "Add ${BIN_DIR} to your PATH to run 'opencompanion' directly." ;;
 esac
 
-ok "Installed. Running setup..."
-if [ -n "${BACKEND_URL}" ]; then set -- setup --url "${BACKEND_URL}"; else set -- setup; fi
-# Piped installs (curl | sh) leave stdin on the exhausted script pipe; re-attach the real terminal
-# so setup's prompts and the CLIs' interactive logins still work. Headless (no controlling tty),
-# setup degrades gracefully: it pairs, reports the detected CLIs, and installs the service without
-# prompting. Probe the redirection itself (not just -e/-r): on a headless host /dev/tty can exist
-# and pass the permission tests yet fail to open with ENXIO. The `if` keeps `set -e` from aborting
-# on that expected headless failure; only a working /dev/tty takes the redirected path.
-if { : < /dev/tty; } 2>/dev/null; then
-  "${INSTALL_DIR}/opencompanion" "$@" < /dev/tty
+if [ "${APP_SCOPED}" = "1" ]; then
+  # App-scoped: the product app supervises the daemon, so install the binary only and let the app drive
+  # pairing + an app-scoped setup + a plain `serve`. Never install the always-on service from here.
+  ok "Installed. The app will pair and start OpenCompanion for you."
 else
-  "${INSTALL_DIR}/opencompanion" "$@"
+  ok "Installed. Running setup..."
+  if [ -n "${BACKEND_URL}" ]; then set -- setup --url "${BACKEND_URL}"; else set -- setup; fi
+  # Piped installs (curl | sh) leave stdin on the exhausted script pipe; re-attach the real terminal
+  # so setup's prompts and the CLIs' interactive logins still work. Headless (no controlling tty),
+  # setup degrades gracefully: it pairs, reports the detected CLIs, and installs the service without
+  # prompting. Probe the redirection itself (not just -e/-r): on a headless host /dev/tty can exist
+  # and pass the permission tests yet fail to open with ENXIO. The `if` keeps `set -e` from aborting
+  # on that expected headless failure; only a working /dev/tty takes the redirected path.
+  if { : < /dev/tty; } 2>/dev/null; then
+    "${INSTALL_DIR}/opencompanion" "$@" < /dev/tty
+  else
+    "${INSTALL_DIR}/opencompanion" "$@"
+  fi
 fi

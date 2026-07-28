@@ -3,9 +3,12 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { describe, expect, it } from 'vitest'
+import { BRAND } from '../src/brand'
 import {
   checkLatest,
   flipCurrent,
+  hasReleaseBase,
+  isSourceBuild,
   pruneVersions,
   readCurrent,
   rollbackTarget,
@@ -49,8 +52,8 @@ function fakeDownload(assets: Record<string, string>): UpdaterDeps['download'] {
   }
 }
 
-/** The Linux x64 artifact name the deps below resolve to. */
-const ARTIFACT = 'opencompanion-linux-x64.tar.gz'
+/** The Linux x64 artifact name the deps below resolve to (brand-derived, like `artifactName`). */
+const ARTIFACT = `${BRAND.binary}-linux-x64.tar.gz`
 
 /**
  * A run seam that fakes `tar` extraction (materializing the per-version launcher in the `-C` dir) and
@@ -66,12 +69,12 @@ function fakeRun(opts: {
     if (cmd === 'tar') {
       if (opts.extractOk === false) return { ok: false, stdout: 'tar: corrupt archive' }
       const dest = args[args.indexOf('-C') + 1]
-      writeFileSync(join(dest, 'opencompanion'), '#!/bin/sh\n')
+      writeFileSync(join(dest, BRAND.binary), '#!/bin/sh\n')
       return { ok: true, stdout: '' }
     }
     // Anything else is the launcher --version sanity probe.
     if (opts.sanityOk === false) return { ok: false, stdout: '' }
-    return { ok: true, stdout: `opencompanion ${opts.sanityVersion}\n` }
+    return { ok: true, stdout: `${BRAND.binary} ${opts.sanityVersion}\n` }
   }
 }
 
@@ -145,7 +148,7 @@ describe('stageVersion', () => {
       '1.4.0'
     )
     expect(staged).toBe(join(dir, 'versions', '1.4.0'))
-    expect(existsSync(join(staged, 'opencompanion'))).toBe(true)
+    expect(existsSync(join(staged, BRAND.binary))).toBe(true)
   })
 
   it('accepts a `*`-prefixed (binary-mode) filename in SHA256SUMS', async () => {
@@ -159,7 +162,7 @@ describe('stageVersion', () => {
       }),
       '1.4.0'
     )
-    expect(existsSync(join(staged, 'opencompanion'))).toBe(true)
+    expect(existsSync(join(staged, BRAND.binary))).toBe(true)
   })
 
   it('throws on a checksum mismatch and leaves no versions/<v> residue', async () => {
@@ -303,6 +306,27 @@ describe('pruneVersions', () => {
     // Both real versions kept; the stray staging dir is left untouched, not counted as a version.
     expect(existsSync(join(dir, 'versions', '1.2.0'))).toBe(true)
     expect(existsSync(join(dir, 'versions', '1.3.0'))).toBe(true)
+  })
+})
+
+describe('hasReleaseBase', () => {
+  it('is true for a configured base and false for an empty or whitespace one', () => {
+    // An empty base is how a freshly-exported companion signals it has no releases repo yet, so the
+    // update commands and the daemon's auto-check treat it as a friendly no-op rather than a failed fetch.
+    expect(hasReleaseBase('https://github.com/acme/companion/releases/latest/download')).toBe(true)
+    expect(hasReleaseBase('')).toBe(false)
+    expect(hasReleaseBase('   ')).toBe(false)
+  })
+})
+
+describe('isSourceBuild', () => {
+  it('classifies the dev fallback as a source run and real versions as installed', () => {
+    // A source run must never self-update: 0.0.0-dev compares older than every published release, so
+    // the auto-update loop would download the release and exit the dev process on every start.
+    expect(isSourceBuild('0.0.0-dev')).toBe(true)
+    expect(isSourceBuild('0.1.0')).toBe(false)
+    // Under vitest the process itself IS a source run, so the zero-arg default must be true.
+    expect(isSourceBuild()).toBe(true)
   })
 })
 

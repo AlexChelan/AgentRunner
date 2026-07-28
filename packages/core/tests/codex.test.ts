@@ -74,6 +74,20 @@ describe('codex adapter', () => {
     expect(capturedMcp).toEqual({ appTools: { type: 'http', url: 'http://127.0.0.1:1/t/mcp' } })
   })
 
+  it('threads the run codexHome into the driver params (isolated CODEX_HOME)', async () => {
+    let capturedHome: string | undefined
+    const a = makeAdapter({
+      driver: async function* (params: AgenticCliDriverParams) {
+        capturedHome = params.codexHome
+        yield { kind: 'done' }
+      }
+    })
+    const sink = collect()
+    a.run({ ...baseReq, codexHome: '/iso/codex-home' }, ctx, resolvers, sink.emit)
+    await vi.waitFor(() => expect(sink.events.at(-1)?.type).toBe('done'))
+    expect(capturedHome).toBe('/iso/codex-home')
+  })
+
   it('prepends the run system prompt to the prompt the driver receives', async () => {
     let capturedPrompt: string | undefined
     const a = makeAdapter({

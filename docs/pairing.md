@@ -11,5 +11,3 @@ opencompanion pair --url https://your-saas.example/api   # link this machine to 
 opencompanion connect                                    # detect, install, and log in your CLIs
 opencompanion backends                                   # device id, connected CLIs, ceiling, daemon state
 ```
-
-Full guide: [generatesaas.com/docs/opencompanion/pairing](https://generatesaas.com/docs/opencompanion/pairing).

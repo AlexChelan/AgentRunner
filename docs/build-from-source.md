@@ -3,7 +3,7 @@
 You do not need the prebuilt release to run OpenCompanion. This repository is the full source; you can
 build and run the self-contained daemon yourself, and read exactly what it does before you do.
 
-Hosted guides for everyday use: [generatesaas.com/docs/opencompanion](https://generatesaas.com/docs/opencompanion).
+For everyday use, see the [README](../README.md) and the guides alongside this one.
 
 ## Toolchain
 
@@ -21,7 +21,7 @@ node --version   # confirm it satisfies >=22
 ## Build the daemon
 
 ```sh
-git clone https://github.com/Duzbee/OpenCompanion.git
+git clone https://github.com/AlexChelan/OpenCompanion.git
 cd opencompanion
 pnpm install
 pnpm --filter opencompanion standalone

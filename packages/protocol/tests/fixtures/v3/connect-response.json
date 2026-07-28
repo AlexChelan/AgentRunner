@@ -1,0 +1,6 @@
+{
+  "companionId": "u1:d1",
+  "wireToken": "wire.token.value",
+  "pollIntervalMs": 10000,
+  "protocolVersion": 2
+}

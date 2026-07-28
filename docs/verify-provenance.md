@@ -8,7 +8,7 @@ something swapped in transit or on the release page.
 The installer already verifies the checksum for you and refuses to install on a mismatch. Do the
 steps below when you download an artifact by hand, or when you want to confirm provenance yourself.
 
-Hosted guides for everyday use: [generatesaas.com/docs/opencompanion](https://generatesaas.com/docs/opencompanion).
+For everyday use, see the [README](../README.md) and the guides alongside this one.
 
 ## Verify the checksum
 
@@ -31,7 +31,7 @@ The release artifacts are published with a signed provenance attestation that ti
 GitHub Actions workflow and commit that built them. Verify it with the GitHub CLI:
 
 ```sh
-gh attestation verify opencompanion-<os>-<arch>.tar.gz --repo Duzbee/OpenCompanion
+gh attestation verify opencompanion-<os>-<arch>.tar.gz --repo AlexChelan/OpenCompanion
 ```
 
 A successful check confirms the artifact was built by this repository's release workflow from a

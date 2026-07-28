@@ -7,8 +7,33 @@ import { BRAND } from './brand'
 /** The reverse-DNS service label / unit id used across platforms. */
 export const SERVICE_LABEL = BRAND.serviceLabel
 
-/** The Windows Scheduled Task name (no dots; schtasks rejects a reverse-DNS label). */
-export const WINDOWS_TASK_NAME = BRAND.name
+/**
+ * The LEGACY (pre-upgrade) Windows Scheduled Task name: a bare, machine-global name with no folder.
+ * Kept only so {@link uninstallService} can still delete the task an install that predates
+ * {@link windowsTaskName} registered; nothing creates a task under it any more.
+ */
+const LEGACY_WINDOWS_TASK_NAME = BRAND.name
+
+/**
+ * The Windows Scheduled Task name, namespaced per OS user (no dots; schtasks rejects a reverse-DNS label).
+ *
+ * `schtasks /Create /F /TN <name>` with a BARE name writes into the MACHINE-GLOBAL root of the Task
+ * Scheduler Library and force-overwrites, so on a shared PC the second OS user to install the service
+ * silently repointed the first user's logon task at their own binary and the first user's companion
+ * stopped starting at login. A `\<Brand>\<user>` path puts each user's task in its own folder, matching
+ * the per-user scoping macOS (`~/Library/LaunchAgents`) and Linux (`systemd --user`) already have.
+ *
+ * The username is sanitized because `\` is the schtasks FOLDER SEPARATOR: a domain login like
+ * `CORP\alice` would otherwise nest a folder rather than name one task. An empty result falls back to
+ * `default`, so a blank username still yields a valid task path.
+ *
+ * @param username - The current OS username.
+ * @returns The fully-qualified task name to pass to `/TN`.
+ */
+export function windowsTaskName(username: string): string {
+  const safe = username.replace(/[\\/:*?"<>|]+/g, '-').trim() || 'default'
+  return `\\${BRAND.name}\\${safe}`
+}
 
 /** The Linux systemd user unit filename (brand-derived, matching the macOS/Windows identities). */
 const SYSTEMD_UNIT = `${BRAND.binary}.service`
@@ -113,6 +138,8 @@ export interface ServiceDeps {
   home?: string
   /** Numeric user id for `launchctl` domain targets (defaults to `os.userInfo().uid`). */
   uid?: number
+  /** OS username, for the per-user Windows task folder (defaults to `os.userInfo().username`). */
+  username?: string
   /** Writes a file (defaults to `fs.writeFileSync`), creating parent dirs. */
   writeFile?: (path: string, content: string) => void
   /** Removes a file (defaults to `fs.rmSync`, ignoring a missing file). */
@@ -127,6 +154,7 @@ function resolveDeps(deps: ServiceDeps): Required<ServiceDeps> {
     platform: deps.platform ?? process.platform,
     home: deps.home ?? homedir(),
     uid: deps.uid ?? userInfo().uid,
+    username: deps.username ?? userInfo().username,
     writeFile:
       deps.writeFile ??
       ((path, content): void => {
@@ -192,17 +220,23 @@ export function installService(
   }
   if (d.platform === 'win32') {
     const tr = spec.program.map((arg) => `"${arg}"`).join(' ')
-    d.run('schtasks', ['/Create', '/F', '/SC', 'ONLOGON', '/TN', WINDOWS_TASK_NAME, '/TR', tr])
+    const task = windowsTaskName(d.username)
+    d.run('schtasks', ['/Create', '/F', '/SC', 'ONLOGON', '/TN', task, '/TR', tr])
     // A logon task alone would leave the companion offline until the NEXT logon, so start it now
     // (matching launchd `bootstrap` / systemd `--now`, which both start the service immediately).
-    d.run('schtasks', ['/Run', '/TN', WINDOWS_TASK_NAME])
-    return { path: `Scheduled Task ${WINDOWS_TASK_NAME}`, message: 'installed and started logon Scheduled Task' }
+    d.run('schtasks', ['/Run', '/TN', task])
+    return { path: `Scheduled Task ${task}`, message: 'installed and started logon Scheduled Task' }
   }
   throw new Error(`unsupported platform: ${d.platform}`)
 }
 
 /**
  * Stops and removes the installed service. Best-effort: a missing unit is not an error.
+ *
+ * On Windows it deletes BOTH task names: the per-user {@link windowsTaskName} this version registers
+ * AND the legacy bare {@link LEGACY_WINDOWS_TASK_NAME} a pre-upgrade install left in the machine-global
+ * root. Deleting only the qualified name would strand the old task forever, leaving an upgraded install
+ * with two logon tasks it can never remove. Both deletes ignore errors, so the absent one is a no-op.
  *
  * @param deps - Injected platform side effects.
  * @returns A human-readable status line.
@@ -223,7 +257,8 @@ export function uninstallService(deps: ServiceDeps = {}): { message: string } {
     return { message: 'removed systemd user service' }
   }
   if (d.platform === 'win32') {
-    d.run('schtasks', ['/Delete', '/F', '/TN', WINDOWS_TASK_NAME], true)
+    d.run('schtasks', ['/Delete', '/F', '/TN', windowsTaskName(d.username)], true)
+    d.run('schtasks', ['/Delete', '/F', '/TN', LEGACY_WINDOWS_TASK_NAME], true)
     return { message: 'removed logon Scheduled Task' }
   }
   throw new Error(`unsupported platform: ${d.platform}`)
@@ -250,10 +285,45 @@ export function serviceStatus(deps: ServiceDeps = {}): { installed: boolean; mes
     return { installed: existsSync(unitPath('linux', d.home)), message: `systemd: ${active || 'inactive'}` }
   }
   if (d.platform === 'win32') {
-    const out = d.run('schtasks', ['/Query', '/TN', WINDOWS_TASK_NAME], true)
-    return { installed: out.includes(WINDOWS_TASK_NAME), message: out ? 'task present' : 'not installed' }
+    const installed = isWindowsTaskRegistered(d)
+    return { installed, message: installed ? 'task present' : 'not installed' }
   }
   throw new Error(`unsupported platform: ${d.platform}`)
+}
+
+/**
+ * Whether this machine's always-on OS service is registered, by the CHEAPEST check per platform: the unit
+ * FILE's existence on macOS/Linux (a plain `existsSync`, NO subprocess), and the Scheduled Task query on
+ * Windows (which registers no unit file, so a `schtasks /Query` is unavoidable). Unlike {@link serviceStatus}
+ * it never spawns `launchctl`/`systemctl`: the local health surface reads this PER `/v1/health` request, where
+ * a per-request subprocess would be wasteful, and it returns exactly `serviceStatus().installed`.
+ *
+ * @param deps - Injected platform side effects (for testing).
+ * @returns Whether the OS service unit (or Windows Scheduled Task) is registered.
+ */
+export function isServiceUnitPresent(deps: ServiceDeps = {}): boolean {
+  const d = resolveDeps(deps)
+  if (d.platform === 'darwin' || d.platform === 'linux') return existsSync(unitPath(d.platform, d.home))
+  if (d.platform === 'win32') return isWindowsTaskRegistered(d)
+  return false
+}
+
+/**
+ * Whether this user's Windows Scheduled Task is registered, read from `schtasks /Query`'s EXIT STATUS
+ * rather than by searching its output for the task name.
+ *
+ * The name is folder-qualified (`\<Brand>\<user>` - see {@link windowsTaskName}), and `schtasks` prints
+ * the folder on a `Folder:` line with only the LEAF name in the TaskName column, so the qualified string
+ * never appears verbatim in the output. Substring-matching it therefore reported "not installed" for a
+ * task that had just been installed successfully, and any caller gated on that re-offered the install
+ * forever. A query for a missing task exits non-zero, which the tolerant `run` reports as empty output -
+ * so presence is exactly "the query produced something".
+ *
+ * @param d - The resolved platform deps (its `run` and `username`).
+ * @returns Whether the task exists.
+ */
+function isWindowsTaskRegistered(d: Required<ServiceDeps>): boolean {
+  return d.run('schtasks', ['/Query', '/TN', windowsTaskName(d.username)], true).trim().length > 0
 }
 
 /**
@@ -277,8 +347,9 @@ export function restartService(deps: ServiceDeps = {}): { message: string } {
     return { message: 'restarted systemd user service' }
   }
   if (d.platform === 'win32') {
-    d.run('schtasks', ['/End', '/TN', WINDOWS_TASK_NAME], true)
-    d.run('schtasks', ['/Run', '/TN', WINDOWS_TASK_NAME])
+    const task = windowsTaskName(d.username)
+    d.run('schtasks', ['/End', '/TN', task], true)
+    d.run('schtasks', ['/Run', '/TN', task])
     return { message: 'restarted logon Scheduled Task' }
   }
   throw new Error(`unsupported platform: ${d.platform}`)

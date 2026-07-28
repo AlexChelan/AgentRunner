@@ -1,3 +1,4 @@
+import { scopeBackendUrl } from '@opencompanion/core/runtime/account-scope'
 import { BRAND } from '../brand'
 import {
   buildCompanionRegistry,
@@ -7,10 +8,11 @@ import {
   CONNECTABLE_TOOL_IDS,
   type ConnectableToolId,
   type ConnectDeps
-} from '../connect'
-import { managedCliDir } from '../paths'
+} from '@opencompanion/core/runtime/connect'
+import { isLocalScope } from '@opencompanion/core/runtime/local/scope'
+import { managedCliDir } from '@opencompanion/core/runtime/paths'
 import * as ui from '../ui'
-import { CLI_OPTIONS, openStores, positionalArg, resolveCommandBackend } from './shared'
+import { CLI_OPTIONS, openStores, positionalArg, resolveCommandScope } from './shared'
 
 /**
  * Connects coding CLIs with a detection-first flow: every CLI that is already installed and signed
@@ -51,10 +53,10 @@ export async function connectCliInteractively(deps: ConnectDeps): Promise<{ ok: 
 export async function cmdConnect(argv: string[]): Promise<void> {
   ui.intro()
   const { appDataRoot, state } = openStores()
-  const backendUrl = await resolveCommandBackend(argv, state)
-  if (backendUrl === undefined) return
-  if (!state.getPairedBackend(backendUrl)) {
-    ui.p.cancel(`Not paired with ${backendUrl}. Run '${BRAND.binary} pair' first.`)
+  const scope = await resolveCommandScope(argv, state)
+  if (scope === undefined) return
+  if (!isLocalScope(scope) && !state.getPairedBackend(scope)) {
+    ui.p.cancel(`Not paired with ${scopeBackendUrl(scope)}. Run '${BRAND.binary} pair' first.`)
     process.exit(1)
     return
   }
@@ -63,7 +65,8 @@ export async function cmdConnect(argv: string[]): Promise<void> {
     registry: buildCompanionRegistry(baseDir),
     baseDir,
     state,
-    backendUrl,
+    // The connection record is per ACCOUNT, so it keys on the scope rather than the backend URL.
+    backendUrl: scope,
     write: ui.line
   }
   const only = positionalArg(argv)
@@ -93,17 +96,19 @@ export async function cmdConnect(argv: string[]): Promise<void> {
  * per-backend connection record, WITHOUT uninstalling or logging the CLI out (it stays installed and
  * signed in - only the companion stops using it). The running daemon reads connections fresh, so the
  * removal takes effect within one poll: it drops from `GET /devices` and the web offers the CLI as
- * "Connect" again. Requires the backend to be paired and a valid tool id. Exits with the right code.
+ * "Connect" again. Requires the backend to be paired (or `--local` for a purely-local connection) and a
+ * valid tool id. Exits with the right code.
  *
- * @param argv - The process arguments (the tool id is the positional; `--url` selects the backend).
+ * @param argv - The process arguments (the tool id is the positional; `--url`/`--user` select the
+ *   pairing, `--local` the local pseudo-scope).
  */
 export async function cmdDisconnect(argv: string[]): Promise<void> {
   ui.intro()
   const { state } = openStores()
-  const backendUrl = await resolveCommandBackend(argv, state)
-  if (backendUrl === undefined) return
-  if (!state.getPairedBackend(backendUrl)) {
-    ui.p.cancel(`Not paired with ${backendUrl}. Run '${BRAND.binary} pair' first.`)
+  const scope = await resolveCommandScope(argv, state)
+  if (scope === undefined) return
+  if (!isLocalScope(scope) && !state.getPairedBackend(scope)) {
+    ui.p.cancel(`Not paired with ${scopeBackendUrl(scope)}. Run '${BRAND.binary} pair' first.`)
     process.exit(1)
     return
   }
@@ -113,8 +118,8 @@ export async function cmdDisconnect(argv: string[]): Promise<void> {
     process.exit(1)
     return
   }
-  const removed = state.removeConnection(backendUrl, toolId)
+  const removed = state.removeConnection(scope, toolId)
   if (removed) ui.outro(`Disconnected ${toolId}. It stays installed and signed in.`)
-  else ui.p.cancel(`${toolId} was not connected on ${backendUrl}.`)
+  else ui.p.cancel(`${toolId} was not connected on ${scopeBackendUrl(scope)}.`)
   process.exit(removed ? 0 : 1)
 }

@@ -35,8 +35,16 @@ import type { ExecResult } from '../src/adapters/types'
 let baseDir: string
 beforeEach(() => {
   baseDir = realpathSync(mkdtempSync(join(tmpdir(), 'cli-install-')))
+  // Start every test from a known token state. The installer reads `GH_TOKEN ?? GITHUB_TOKEN`, so a
+  // token in the ambient environment - the companion publish workflow exports a real one - outranks
+  // whatever a test stubs, and the assertion then compares against that live secret instead.
+  vi.stubEnv('GH_TOKEN', undefined)
+  vi.stubEnv('GITHUB_TOKEN', undefined)
 })
-afterEach(() => rmSync(baseDir, { recursive: true, force: true }))
+afterEach(() => {
+  vi.unstubAllEnvs()
+  rmSync(baseDir, { recursive: true, force: true })
+})
 
 /** A minimal `fetch`-like Response over fixed bytes/text/json. */
 function fakeResponse(body: { text?: string; json?: unknown; bytes?: Uint8Array }): Response {

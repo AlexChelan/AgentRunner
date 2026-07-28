@@ -30,13 +30,13 @@ single work folder, and records what it did to a log only it can write.
 macOS and Linux:
 
 ```sh
-curl -fsSL https://github.com/Duzbee/OpenCompanion/releases/latest/download/install.sh | sh -s -- --url https://your-saas.example/api
+curl -fsSL https://github.com/AlexChelan/OpenCompanion/releases/latest/download/install.sh | sh -s -- --url https://your-saas.example/api
 ```
 
 Windows (PowerShell):
 
 ```powershell
-$env:OPENCOMPANION_BACKEND_URL='https://your-saas.example/api'; irm https://github.com/Duzbee/OpenCompanion/releases/latest/download/install.ps1 | iex
+$env:OPENCOMPANION_BACKEND_URL='https://your-saas.example/api'; irm https://github.com/AlexChelan/OpenCompanion/releases/latest/download/install.ps1 | iex
 ```
 
 The installer downloads the daemon for your OS and architecture, verifies it against the release
@@ -90,8 +90,7 @@ OpenCompanion updates itself by default. The always-on daemon stages each new re
 path, verifies its `SHA256SUMS` checksum, and applies it only while the daemon is idle, so a run in
 flight is never interrupted. Pin to the current version with `opencompanion update --auto off`. For
 manual control, `opencompanion update` updates on demand and `opencompanion update --rollback`
-reverses the last update. Full guide:
-[generatesaas.com/docs/opencompanion/updating](https://generatesaas.com/docs/opencompanion/updating).
+reverses the last update.
 
 ## Requirements
 
@@ -99,10 +98,9 @@ reverses the last update. Full guide:
 - A coding CLI you already use and pay for (Claude Code, Codex, OpenCode, or Hermes). OpenCompanion
   drives your own installed tool with your own subscription; it never ships one or holds a key.
 
-## Maintained by GenerateSaaS
+## Maintaining this repository
 
-OpenCompanion is developed by GenerateSaaS and released here under the MIT license. This repository is
-generated from the GenerateSaaS monorepo, so fixes and features are reviewed and applied upstream,
-then re-exported here. Issues and pull requests are welcome; see
-[CONTRIBUTING.md](CONTRIBUTING.md) for how changes flow back. Security reports:
-[SECURITY.md](SECURITY.md).
+OpenCompanion is released here under the MIT license. This repository is generated from an upstream
+monorepo, so fixes and features are reviewed and applied upstream, then re-exported here. Issues and
+pull requests are welcome; see [CONTRIBUTING.md](CONTRIBUTING.md) for how changes flow back. Security
+reports: [SECURITY.md](SECURITY.md).

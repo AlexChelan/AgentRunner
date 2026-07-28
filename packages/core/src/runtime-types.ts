@@ -42,6 +42,27 @@ export type RuntimeRunRequest = RunRequest & {
    * blocked network. Absent leaves the tool's network-on default (interactive parity).
    */
   network?: 'on' | 'off'
+  /**
+   * Absolute paths the spawned CLI must NOT be able to READ. The companion daemon sets this to its
+   * own `secrets/` directory for every dispatched run, so an UNATTENDED (prompt-injectable) run
+   * cannot read the master key + encrypted device bearer that grant full authority over the user's
+   * account. Each agentic adapter enforces it with its CLI's own OS-enforced mechanism (Codex: a
+   * permissions profile; Claude Code: its sandbox plus permission rules) - NOT with the sandbox tier,
+   * which on both CLIs grants full-filesystem read at every non-`full` posture. Absent leaves the run
+   * unconfined, which is correct for the interactive terminal (a human is present).
+   */
+  denyReadPaths?: string[]
+  /**
+   * An ISOLATED `CODEX_HOME` for a headless chat/schedule run (consumed only by the Codex adapter).
+   * Codex reads its `config.toml` (the user's personal `mcp_servers`, profiles) from `CODEX_HOME` and
+   * offers no strict-MCP flag, so the companion isolates a run by pointing `CODEX_HOME` at a
+   * companion-managed home whose `config.toml` declares NO personal MCP servers - the run then sees
+   * only the app tools plus Codex's built-ins. Subscription auth is preserved because that home's
+   * `auth.json` is a symlink to the user's real one (keyring-auth platforms need no file and are
+   * unaffected). Absent leaves the user's own `~/.codex` (the interactive terminal, which keeps the
+   * full personal config). Ignored by every non-Codex adapter.
+   */
+  codexHome?: string
 }
 
 /**

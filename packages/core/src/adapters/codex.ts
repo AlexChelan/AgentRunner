@@ -3,18 +3,26 @@ import type { RunContext, RunContextResolvers } from '../context'
 import type { RuntimeRunEvent, RuntimeRunRequest, RuntimeToolAdapter } from '../runtime-types'
 import {
   apiKeyAuthStatus,
+  applyAdvertisedEfforts,
   detectBinary,
+  memoizeAdvertisedModels,
   registryModelsOrFallback,
   runAgenticDriver,
   subscriptionStatusCheck
 } from './agentic-run'
 import { prependSystemPrompt } from './mapping'
-import type { AgenticCliDriver, CommonAdapterDeps } from './types'
+import type { AdvertisedModelLister, AgenticCliDriver, CommonAdapterDeps } from './types'
 
 /** Dependencies for the Codex adapter (all injectable for unit tests). */
 export interface CodexAdapterDeps extends CommonAdapterDeps {
   /** SDK glue that drives Codex for one run. */
   driver: AgenticCliDriver
+  /**
+   * Asks the app-server which models it advertises (`model/list`), so each model's real effort
+   * ladder replaces the declared floor. Omitted leaves the catalog exactly as the registry serves
+   * it - the picker then falls back to {@link CAPABILITIES}'s floor.
+   */
+  listAdvertisedModels?: AdvertisedModelLister
 }
 
 /** The `codex` binary name + not-installed copy, referenced by both `detect` and the run. */
@@ -32,7 +40,17 @@ const CAPABILITIES: AdapterCapabilities = {
   enforcesNetworkOff: true,
   // Codex consumes an http MCP server via its `mcp_servers.*` config, so the
   // app-MCP reaches it (native coding stays on; our integration tools are added).
-  httpMcp: true
+  httpMcp: true,
+  // The floor for a machine where `model/list` has not answered yet. `canDisable` is FALSE on
+  // purpose: no Codex model advertises a disable level, and omitting the effort parameter makes
+  // Codex apply its own `defaultReasoningEffort` - so offering "off" would claim a reasoning-off
+  // run while the model keeps thinking. `ultra` is real but only on some models, so it belongs to
+  // per-model discovery rather than to a floor that must be correct for every model.
+  effort: {
+    supported: true,
+    levels: ['low', 'medium', 'high', 'xhigh', 'max'],
+    canDisable: false
+  }
 }
 
 /**
@@ -42,13 +60,16 @@ const CAPABILITIES: AdapterCapabilities = {
  * approval hook, so it runs the static posture derived from the run's permission mode.
  * Binary + key resolve THROUGH the per-run resolvers (no module global), `req.conversationId`
  * is threaded to the driver as `resume`, and `req.network` is threaded as the OS-enforced
- * sandbox egress flag so an unattended `network: 'off'` actually blocks the network.
+ * sandbox egress flag so an unattended `network: 'off'` actually blocks the network. `listModels`
+ * serves the registry catalog enriched with what the app-server's `model/list` advertises per
+ * model, so the picker offers each model's real effort ladder rather than one shipped constant.
  *
- * @param deps - The injected driver, binary resolver, key loader, and registry lookup.
+ * @param deps - The injected driver, binary resolver, key loader, registry lookup, and model probe.
  * @returns The Codex runtime adapter.
  */
 export function createCodexAdapter(deps: CodexAdapterDeps): RuntimeToolAdapter {
   const detect = (): Promise<DetectResult> => detectBinary(deps, BINARY)
+  const advertisedModels = memoizeAdvertisedModels(deps.listAdvertisedModels)
 
   return {
     id: 'codex',
@@ -66,8 +87,12 @@ export function createCodexAdapter(deps: CodexAdapterDeps): RuntimeToolAdapter {
         errorDetail: 'Could not determine login status'
       })
     },
-    listModels(): Promise<ModelInfo[]> {
-      return registryModelsOrFallback(deps, 'openai')
+    async listModels(): Promise<ModelInfo[]> {
+      const [models, advertised] = await Promise.all([
+        registryModelsOrFallback(deps, 'openai'),
+        advertisedModels(deps.resolveBinary(BINARY))
+      ])
+      return applyAdvertisedEfforts(models, advertised)
     },
     run(
       req: RuntimeRunRequest,
@@ -92,6 +117,12 @@ export function createCodexAdapter(deps: CodexAdapterDeps): RuntimeToolAdapter {
             // Thread the run's network posture into the driver's OS-enforced sandbox flag (I2);
             // an unattended `network: 'off'` actually blocks egress, not just records the intent.
             ...(req.network ? { network: req.network } : {}),
+            // Paths the run may NOT read (the daemon's own `secrets/`). Codex's sandbox tiers all
+            // grant full-filesystem read, so the driver enforces this with a permissions profile.
+            ...(req.denyReadPaths ? { denyReadPaths: req.denyReadPaths } : {}),
+            // Isolated CODEX_HOME for a headless run (config.toml with NO personal MCP servers; auth
+            // symlinked). Absent = the user's own ~/.codex (the interactive terminal keeps its config).
+            ...(req.codexHome ? { codexHome: req.codexHome } : {}),
             ...(req.conversationId ? { resume: req.conversationId } : {}),
             signal
           })

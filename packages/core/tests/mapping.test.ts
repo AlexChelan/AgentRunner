@@ -3,9 +3,11 @@ import { join } from 'node:path'
 import { describe, expect, it } from 'vitest'
 import {
   buildCodexAppServerArgs,
+  buildCodexPermissionProfileOverrides,
   buildCodexThreadResumeParams,
   buildCodexThreadStartParams,
   buildCodexTurnStartParams,
+  claudeConfinementSettings,
   claudePermissionOptions,
   claudeReasoningOptions,
   codexAppServerItemToMessage,
@@ -177,6 +179,32 @@ describe('claudeReasoningOptions', () => {
     })
     expect(claudeReasoningOptions('low')).toEqual({ thinking: { type: 'adaptive' }, effort: 'low' })
   })
+  it('forwards xhigh and max, and withholds a level the SDK never defined', () => {
+    // The advertised top of Claude's ladder used to be dropped on the floor: `xhigh`/`max` landed on
+    // bare adaptive thinking with no named effort, though the installed SDK's `EffortLevel` accepts
+    // both. The line is drawn AT that union - the SDK validates this option and a rejected one fails
+    // the whole run, so a level it has never defined is withheld, with thinking still on.
+    expect(claudeReasoningOptions('xhigh')).toEqual({
+      thinking: { type: 'adaptive' },
+      effort: 'xhigh'
+    })
+    expect(claudeReasoningOptions('max')).toEqual({ thinking: { type: 'adaptive' }, effort: 'max' })
+    expect(claudeReasoningOptions('ultra')).toEqual({ thinking: { type: 'adaptive' } })
+    expect(claudeReasoningOptions('minimal')).toEqual({ thinking: { type: 'adaptive' } })
+  })
+  it('never forwards a level the Agent SDK cannot accept, whatever is discovered', () => {
+    // The wire and the runtime types now carry ANY advertised level, so this mapping is reachable
+    // with one the SDK has never defined - `ultra` is real on Codex and absent from the SDK's
+    // `EffortLevel`. Forwarding it verbatim would make the SDK reject the whole run. Thinking must
+    // still be left on either way. WHICH of the SDK's own levels are forwarded may widen; this
+    // holds regardless.
+    const sdkLevels = ['low', 'medium', 'high', 'xhigh', 'max']
+    for (const level of ['xhigh', 'max', 'ultra', 'hyper', 'minimal']) {
+      const mapped = claudeReasoningOptions(level)
+      expect(mapped.thinking).toEqual({ type: 'adaptive' })
+      if (mapped.effort !== undefined) expect(sdkLevels).toContain(mapped.effort)
+    }
+  })
 })
 
 describe('codexReasoningEffort', () => {
@@ -186,6 +214,28 @@ describe('codexReasoningEffort', () => {
     expect(codexReasoningEffort('default')).toBeUndefined()
     expect(codexReasoningEffort('off')).toBeUndefined()
     expect(codexReasoningEffort(undefined)).toBeUndefined()
+  })
+  it('forwards an advertised level above high verbatim', () => {
+    // Live `model/list`: gpt-5.6-sol advertises low/medium/high/xhigh/max/ultra. Re-narrowing to a
+    // ladder this build happens to know reached 3 of those 6 and hid the rest.
+    expect(codexReasoningEffort('xhigh')).toBe('xhigh')
+    expect(codexReasoningEffort('max')).toBe('max')
+    expect(codexReasoningEffort('ultra')).toBe('ultra')
+  })
+  it('omits a blank level rather than putting one on the wire', () => {
+    // Codex declares `ReasoningEffort` as a non-empty string (`minLength: 1`). Now that any level
+    // passes through, a blank one has to be dropped here instead of reaching `turn/start`.
+    expect(codexReasoningEffort('')).toBeUndefined()
+    expect(codexReasoningEffort('   ')).toBeUndefined()
+  })
+  it('either forwards a discovered level unchanged or omits it - never invents one', () => {
+    // Codex types its own `ReasoningEffort` as an OPEN string, so the only wrong answer here is a
+    // value the caller never asked for. Whether an advertised level above `high` is forwarded or
+    // omitted may widen; substituting a DIFFERENT level would silently run at the wrong depth.
+    for (const level of ['xhigh', 'max', 'ultra', 'hyper']) {
+      const mapped = codexReasoningEffort(level)
+      expect(mapped === undefined || mapped === level).toBe(true)
+    }
   })
 })
 
@@ -408,10 +458,13 @@ describe('buildCodexTurnStartParams', () => {
     expect(params.input).toEqual([{ type: 'text', text: '--dangerous' }])
     expect(params.effort).toBe('high')
     // Network egress is OS-enforced off; hosted web search (a server-side tool) is unaffected.
+    // `readOnlyAccess` is deliberately ABSENT: no such field exists in the codex app-server protocol
+    // (its `SandboxPolicy` has no read-narrowing knob at all), so emitting one was a silently-ignored
+    // no-op that implied a read restriction this policy never applied. Reads are confined by the
+    // permissions profile instead - see `buildCodexPermissionProfileOverrides`.
     expect(params.sandboxPolicy).toEqual({
       type: 'readOnly',
       writableRoots: [],
-      readOnlyAccess: { type: 'fullAccess' },
       networkAccess: false,
       excludeTmpdirEnvVar: false,
       excludeSlashTmp: false
@@ -617,4 +670,150 @@ describe('codexAppServerNotificationToMessages', () => {
     )
     expect(out.messages).toEqual([{ kind: 'tool', name: 'list_schedules', status: 'completed' }])
   })
+})
+
+describe('buildCodexPermissionProfileOverrides (secrets read-deny)', () => {
+  const SECRETS = join(tmpdir(), 'appdata', 'secrets')
+
+  it('emits no overrides when nothing is denied (the interactive terminal path)', () => {
+    expect(
+      buildCodexPermissionProfileOverrides({
+        sandboxMode: 'workspace-write',
+        networkAccessEnabled: true,
+        denyReadPaths: []
+      })
+    ).toEqual([])
+  })
+
+  it('denies the secrets dir at the DEFAULT (auto-edit -> workspace-write) ceiling', () => {
+    const overrides = buildCodexPermissionProfileOverrides({
+      sandboxMode: 'workspace-write',
+      networkAccessEnabled: true,
+      denyReadPaths: [SECRETS]
+    })
+    const line = (key: string): string =>
+      overrides.find((o) => o.startsWith(`${key}=`)) ?? ''
+    // The tier is carried by `extends` (not the legacy thread `sandbox`), the network posture is
+    // restated on the profile, and the secrets dir maps to "deny" - an OS-enforced read-deny.
+    expect(line('permissions.companion-confined.extends')).toBe(
+      'permissions.companion-confined.extends=":workspace"'
+    )
+    expect(line('permissions.companion-confined.network')).toBe(
+      'permissions.companion-confined.network={enabled = true}'
+    )
+    const fs = line('permissions.companion-confined.filesystem')
+    expect(fs).toContain(`"${SECRETS}" = "deny"`)
+    // The profile is actually SELECTED, else it would be defined but never applied.
+    expect(overrides).toContain('default_permissions="companion-confined"')
+  })
+
+  it('a read-only ceiling is at least as strict: still denies the secrets dir', () => {
+    const overrides = buildCodexPermissionProfileOverrides({
+      sandboxMode: 'read-only',
+      networkAccessEnabled: false,
+      denyReadPaths: [SECRETS]
+    })
+    expect(overrides).toContain('permissions.companion-confined.extends=":read-only"')
+    expect(overrides).toContain('permissions.companion-confined.network={enabled = false}')
+    expect(
+      overrides.some((o) => o.includes(`"${SECRETS}" = "deny"`))
+    ).toBe(true)
+    expect(overrides).toContain('default_permissions="companion-confined"')
+  })
+
+  it('carries the profile overrides through into the app-server argv', () => {
+    const overrides = buildCodexPermissionProfileOverrides({
+      sandboxMode: 'workspace-write',
+      networkAccessEnabled: true,
+      denyReadPaths: [SECRETS]
+    })
+    const args = buildCodexAppServerArgs({ permissionProfile: overrides })
+    // Every override rides a `-c` flag so codex loads it into the session config layer.
+    for (const o of overrides) expect(args).toContain(o)
+    expect(args).toContain('default_permissions="companion-confined"')
+  })
+})
+
+describe('buildCodexThreadStartParams under a confined profile', () => {
+  it('OMITS the legacy sandbox tier when a profile is active (passing it nulls the profile)', () => {
+    const dir = join(tmpdir(), 'work')
+    const params = buildCodexThreadStartParams({
+      cwd: dir,
+      sandboxMode: 'workspace-write',
+      approvalPolicy: 'never',
+      permissionProfileActive: true
+    })
+    // The tier comes from the profile's `extends`; a thread-level `sandbox` would make codex ignore
+    // the profile entirely (activePermissionProfile: null) and silently drop the read-deny.
+    expect(params.sandbox).toBeUndefined()
+    expect(params).toEqual({ cwd: dir, approvalPolicy: 'never' })
+  })
+
+  it('keeps the legacy sandbox tier when NO profile is active (unconfined terminal path)', () => {
+    const dir = join(tmpdir(), 'work')
+    const params = buildCodexThreadStartParams({
+      cwd: dir,
+      sandboxMode: 'workspace-write',
+      approvalPolicy: 'never'
+    })
+    expect(params.sandbox).toBe('workspace-write')
+  })
+})
+
+describe('claudeConfinementSettings (secrets read-deny)', () => {
+  const SECRETS = join(tmpdir(), 'appdata', 'secrets')
+
+  it('returns undefined when nothing is denied (the interactive terminal path)', () => {
+    expect(claudeConfinementSettings([], true)).toBeUndefined()
+  })
+
+  it('denies the secrets dir on BOTH read paths: the OS sandbox (Bash) and permission rules', () => {
+    const settings = claudeConfinementSettings([SECRETS], true)
+    // A single `Read(...)` rule (Claude's `//<abs>` absolute-path syntax) gates ALL of the file-read
+    // tools - Read, Grep AND Glob - plus statically-recognized Bash reads. Verified live against Claude
+    // Code 2.1.207: a confined Grep and Glob targeting the denied path are both denied, no leak.
+    expect(settings?.permissions).toEqual({
+      deny: [`Read(/${SECRETS})`, `Read(/${SECRETS}/**)`]
+    })
+    // The Bash tool obeys the OS sandbox `denyRead` (which does NOT cover the Read/Grep/Glob tools).
+    const sandbox = settings?.sandbox as Record<string, unknown>
+    expect(sandbox.enabled).toBe(true)
+    expect(sandbox.filesystem).toEqual({ denyRead: [SECRETS] })
+  })
+
+  it('does NOT emit per-tool Grep()/Glob() rules (they gate call args, not the file path, so no-op)', () => {
+    // Verified live: a `Grep(//path/**)` rule does not stop a Grep of that path, and `Glob(//path/**)`
+    // does not stop a Glob of it - the `Read(...)` rule above is what covers those tools. Emitting them
+    // would falsely imply coverage, so the confinement must rely on Read() alone.
+    const deny = (claudeConfinementSettings([SECRETS], true)?.permissions as { deny: string[] }).deny
+    expect(deny.some((r) => r.startsWith('Grep(') || r.startsWith('Glob('))).toBe(false)
+  })
+
+  it('sets the sandbox availability + escape controls EXPLICITLY (platform coverage, no silent degrade)', () => {
+    const sandbox = claudeConfinementSettings([SECRETS], true)?.sandbox as Record<string, unknown>
+    // The confinement rides the settings layer, whose `failIfUnavailable` DEFAULT is false (silent
+    // degrade). Set it explicitly so the intent is on the record: a dispatched run on a sandbox-less
+    // host (headless Linux without bubblewrap) must not hard-error; it falls back to the permission
+    // rules. And `dangerouslyDisableSandbox` must be ignored so an obfuscated Bash read cannot opt out
+    // of the sandbox (verified live: without this, `dangerouslyDisableSandbox` reads the denied path).
+    expect(sandbox.failIfUnavailable).toBe(false)
+    expect(sandbox.allowUnsandboxedCommands).toBe(false)
+    expect(sandbox.autoAllowBashIfSandboxed).toBe(true)
+  })
+
+  it('reopens network egress for a network-on run (the sandbox blocks all egress by default)', () => {
+    const on = claudeConfinementSettings([SECRETS], true)?.sandbox as Record<string, unknown>
+    expect(on.network).toEqual({ allowLocalBinding: true, allowedDomains: ['*'] })
+    // A network-off run leaves egress denied (no allowedDomains).
+    const off = claudeConfinementSettings([SECRETS], false)?.sandbox as Record<string, unknown>
+    expect(off.network).toEqual({ allowLocalBinding: true })
+  })
+
+  // GAP 2 (symlink-from-writable-cwd -> Read tool) is closed by Claude Code itself, not by this
+  // mapping: verified live against Claude Code 2.1.207 that the permission engine canonicalizes a
+  // requested path (realpath) BEFORE matching the `Read(...)` deny, so a symlink planted in the
+  // writable cwd whose own path does not string-match the rule is still denied - and this holds under
+  // the permission rule ALONE (no sandbox), so it covers sandbox-less platforms too. There is no
+  // mapping output to assert for it beyond the `Read(...)` rules above; the evidence lives in
+  // .superpowers/sdd/secrets-exposure-report.md.
 })

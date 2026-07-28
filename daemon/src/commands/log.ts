@@ -1,7 +1,7 @@
 import { existsSync } from 'node:fs'
-import { createAuditLog, type AuditEntry } from '../audit-log'
+import { createAuditLog, type AuditEntry } from '@opencompanion/core/runtime/audit-log'
 import { BRAND } from '../brand'
-import { appDataDir, auditDir } from '../paths'
+import { appDataDir, auditDir } from '@opencompanion/core/runtime/paths'
 import { flagValue } from './shared'
 
 /** The default number of newest audit entries `log` prints when `-n` is not given. */
@@ -24,7 +24,8 @@ function backendHost(backendUrl: string): string {
 
 /**
  * Renders one audit entry as a single pager-friendly line: local time, event, and backend host, then
- * the run/product/tool ids and terminal outcome/duration when the entry carries them.
+ * the run/product/tool ids, what started the work, the terminal outcome/duration, and a refusal reason
+ * when the entry carries them.
  *
  * @param entry - The audit entry to format.
  * @returns The one-line rendering.
@@ -34,8 +35,14 @@ function formatLogEntry(entry: AuditEntry): string {
   if (entry.runId !== undefined) parts.push(`run ${entry.runId}`)
   if (entry.productId !== undefined) parts.push(`product ${entry.productId}`)
   if (entry.toolId !== undefined) parts.push(`tool ${entry.toolId}`)
+  // What STARTED the work: a dispatched run's origin tag, or the fixed `terminal` origin of a session
+  // the user opened themselves. Absent on the events that carry no attribution.
+  if (entry.detail?.origin !== undefined) parts.push(`origin ${entry.detail.origin}`)
   if (entry.outcome !== undefined) parts.push(`outcome ${entry.outcome}`)
   if (entry.durationMs !== undefined) parts.push(`${entry.durationMs}ms`)
+  // A `refused` run carries its refusal reason (e.g. origin_denied) here, so the trail shows WHY a run
+  // never executed; only refusals set `detail.reason`, so this is a no-op for every other event.
+  if (entry.detail?.reason !== undefined) parts.push(`reason ${entry.detail.reason}`)
   return parts.join('  ')
 }
 

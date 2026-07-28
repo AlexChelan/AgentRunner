@@ -33,8 +33,9 @@ export interface McpServerLike {
   /** Registers one tool by name, with its config and an invocation handler. */
   registerTool(name: string, config: RegisteredToolConfig, handler: ToolHandler): void
   /**
-   * Connects the server to its transport and returns the request handler the
-   * loopback HTTP listener routes every request to.
+   * Returns the request handler the loopback HTTP listener routes every request to.
+   * Each request is served through its own MCP server + transport, so a coding CLI
+   * that sends more than one `initialize` per run is never rejected.
    */
   connect(): Promise<HttpRequestHandler>
   /** Closes the server and releases its transport (idempotent). */
@@ -79,12 +80,24 @@ async function resolveInputSchema(tool: ToolSet[string]): Promise<unknown> {
 
 /**
  * Production MCP server factory backed by the low-level `@modelcontextprotocol/sdk`
- * `Server`. It implements {@link McpServerLike} by collecting tool registrations
- * and, on `connect`, installing `tools/list` (emitting each tool's JSON Schema)
- * and `tools/call` (dispatching to the registered handler) request handlers, then
- * connecting a stateful `StreamableHTTPServerTransport` and returning its Node
- * request handler. The low-level server lets us serve the AI SDK tools' real JSON
- * Schemas without the Zod-shape requirement of the higher-level `McpServer`.
+ * `Server`. It implements {@link McpServerLike} by collecting tool registrations and,
+ * on `connect`, returning a request handler that serves EACH incoming HTTP request
+ * through a FRESH low-level `Server` + stateless `StreamableHTTPServerTransport`
+ * (`sessionIdGenerator: undefined`, `enableJsonResponse: true`) - installing
+ * `tools/list` (emitting each tool's JSON Schema) and `tools/call` (dispatching to the
+ * registered handler) on that per-request server, then tearing both down once the
+ * response is produced.
+ *
+ * A per-request stateless transport is REQUIRED: a coding CLI may send more than one
+ * `initialize` per run (Codex does; Claude Code silently), and a single stateful
+ * transport rejects the second `initialize` with `-32600 Invalid Request: Server
+ * already initialized`, killing the app tools for the whole run. A stateless transport
+ * carries no session, so it never rejects a re-initialize; the SDK in turn forbids
+ * reusing one stateless transport across requests, so each request gets its own. This
+ * mirrors the app's outward MCP server (`packages/api/src/routes/internal/ai/mcp.ts`),
+ * which serves every request through a fresh stateless transport. The low-level server
+ * lets us serve the AI SDK tools' real JSON Schemas without the Zod-shape requirement
+ * of the higher-level `McpServer`.
  *
  * @param serverName - The MCP server identity advertised to the connecting CLI.
  * @returns A server adapter conforming to {@link McpServerLike}.
@@ -97,48 +110,64 @@ async function defaultServerFactory(serverName: string): Promise<McpServerLike> 
   const { StreamableHTTPServerTransport } = await import(
     '@modelcontextprotocol/sdk/server/streamableHttp.js'
   )
-  const server = new Server(
-    { name: serverName, version: '1.0.0' },
-    { capabilities: { tools: {} } }
-  )
   const tools = new Map<string, { config: RegisteredToolConfig; handler: ToolHandler }>()
+
+  /** Builds a fresh low-level server whose tools/list + tools/call read the shared registration map. */
+  function buildServer(): InstanceType<typeof Server> {
+    const server = new Server({ name: serverName, version: '1.0.0' }, { capabilities: { tools: {} } })
+    server.setRequestHandler(ListToolsRequestSchema, () => ({
+      tools: [...tools.entries()].map(([name, { config }]) => ({
+        name,
+        ...(config.description !== undefined ? { description: config.description } : {}),
+        inputSchema:
+          isRecord(config.inputSchema) && config.inputSchema.type === 'object'
+            ? config.inputSchema
+            : { type: 'object' as const }
+      }))
+    }))
+    server.setRequestHandler(CallToolRequestSchema, async (request) => {
+      const entry = tools.get(request.params.name)
+      if (!entry) {
+        return {
+          content: [{ type: 'text' as const, text: `Unknown tool: ${request.params.name}` }],
+          isError: true
+        }
+      }
+      const args = isRecord(request.params.arguments) ? request.params.arguments : {}
+      return entry.handler(args)
+    })
+    return server
+  }
 
   return {
     registerTool(name, config, handler): void {
       tools.set(name, { config, handler })
     },
     async connect(): Promise<HttpRequestHandler> {
-      server.setRequestHandler(ListToolsRequestSchema, () => ({
-        tools: [...tools.entries()].map(([name, { config }]) => ({
-          name,
-          ...(config.description !== undefined ? { description: config.description } : {}),
-          inputSchema:
-            isRecord(config.inputSchema) && config.inputSchema.type === 'object'
-              ? config.inputSchema
-              : { type: 'object' as const }
-        }))
-      }))
-      server.setRequestHandler(CallToolRequestSchema, async (request) => {
-        const entry = tools.get(request.params.name)
-        if (!entry) {
-          return {
-            content: [{ type: 'text' as const, text: `Unknown tool: ${request.params.name}` }],
-            isError: true
-          }
-        }
-        const args = isRecord(request.params.arguments) ? request.params.arguments : {}
-        return entry.handler(args)
-      })
-      const transport = new StreamableHTTPServerTransport({
-        sessionIdGenerator: () => crypto.randomUUID()
-      })
-      await server.connect(transport)
       return (req, res) => {
-        void transport.handleRequest(req, res)
+        // Serve every request through its OWN server + stateless transport. A coding CLI may send
+        // more than one `initialize` per run; a stateless transport carries no session so it never
+        // rejects a re-initialize, and the SDK requires a fresh stateless transport per request.
+        void (async () => {
+          const server = buildServer()
+          const transport = new StreamableHTTPServerTransport({
+            sessionIdGenerator: undefined,
+            enableJsonResponse: true
+          })
+          try {
+            await server.connect(transport)
+            await transport.handleRequest(req, res)
+          } catch {
+            if (!res.headersSent) res.writeHead(500).end()
+          } finally {
+            await transport.close().catch(() => undefined)
+            await server.close().catch(() => undefined)
+          }
+        })()
       }
     },
     async close(): Promise<void> {
-      await server.close()
+      // Nothing persistent to release: each request owns and disposes its own server + transport.
     }
   }
 }

@@ -2,14 +2,17 @@ import { spawn } from 'node:child_process'
 import { writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
-import { BRAND } from '../brand'
-import { appDataDir } from '../paths'
+import { BRAND, envVar } from '../brand'
+import { appDataDir } from '@opencompanion/core/runtime/paths'
 import { restartService } from '../service'
-import { createStateStore } from '../storage/state-store'
+import { createStateStore } from '@opencompanion/core/runtime/storage/state-store'
+import { messageOf } from '@opencompanion/core/runtime/error-message'
 import * as ui from '../ui'
 import {
   checkLatest,
   flipCurrent,
+  hasReleaseBase,
+  isSourceBuild,
   pruneVersions,
   readCurrent,
   rollbackTarget,
@@ -53,20 +56,20 @@ function runCommand(cmd: string, args: string[]): Promise<{ ok: boolean; stdout:
 
 /**
  * The versioned install root: the directory the stable root launcher exports as its own location
- * (`OPENCOMPANION_ROOT_LAUNCHER`), else `OPENCOMPANION_HOME`, else `~/.opencompanion` - matching what
- * the install scripts lay down.
+ * (the brand's `ROOT_LAUNCHER` env marker), else its `HOME` override, else `~/.<appDirName>` - matching
+ * what the install scripts lay down.
  *
  * @returns The absolute install root that holds `versions/` and the `current` pointer.
  */
 function resolveInstallDir(): string {
-  const launcher = process.env.OPENCOMPANION_ROOT_LAUNCHER
+  const launcher = process.env[envVar('ROOT_LAUNCHER')]
   if (launcher) return dirname(launcher)
-  return process.env.OPENCOMPANION_HOME ?? join(homedir(), `.${BRAND.appDirName}`)
+  return process.env[envVar('HOME')] ?? join(homedir(), `.${BRAND.appDirName}`)
 }
 
-/** The release download base: the `OPENCOMPANION_RELEASE_BASE` override, else the brand's latest-download URL. */
+/** The release download base: the brand's `RELEASE_BASE` env override, else its latest-download URL. */
 function resolveReleaseBase(): string {
-  return (process.env.OPENCOMPANION_RELEASE_BASE ?? BRAND.installBase).replace(/\/+$/, '')
+  return (process.env[envVar('RELEASE_BASE')] ?? BRAND.installBase).replace(/\/+$/, '')
 }
 
 /**
@@ -89,6 +92,16 @@ export function buildUpdaterDeps(log: (line: string) => void = ui.line): Updater
   }
 }
 
+/**
+ * Prints the not-yet-published notice and exits 0. Reached when no release base is configured - a
+ * freshly-exported companion whose owner has not published a releases repo yet - so `update` and
+ * `update --check` are a friendly no-op instead of a failed fetch.
+ */
+function reportNoReleaseRepo(): void {
+  ui.line('No release repo configured yet - publish your companion first.')
+  process.exit(0)
+}
+
 /** Restarts the service so the flipped version takes effect, degrading to a manual-restart hint if it can't. */
 function restartOrHint(target: string): void {
   try {
@@ -100,7 +113,9 @@ function restartOrHint(target: string): void {
 
 /** `update --check`: reports the installed and latest versions and the auto-update setting without changing anything. */
 async function cmdUpdateCheck(): Promise<void> {
-  const check = await checkLatest(buildUpdaterDeps())
+  const deps = buildUpdaterDeps()
+  if (!hasReleaseBase(deps.releaseBase)) return reportNoReleaseRepo()
+  const check = await checkLatest(deps)
   const autoUpdate = createStateStore({ cwd: appDataDir() }).getAutoUpdate()
   ui.line(`current: ${check.current}`)
   ui.line(`auto-update: ${autoUpdate ? 'on' : 'off'}`)
@@ -121,6 +136,12 @@ async function cmdUpdateCheck(): Promise<void> {
 /** `update`: stages, verifies, flips to, and restarts on the latest release; a no-op when already current. */
 async function cmdUpdateApply(): Promise<void> {
   const deps = buildUpdaterDeps()
+  if (isSourceBuild()) {
+    ui.line('Running from source (0.0.0-dev) - updates apply only to installed daemons.')
+    process.exit(0)
+    return
+  }
+  if (!hasReleaseBase(deps.releaseBase)) return reportNoReleaseRepo()
   const check = await checkLatest(deps)
   if (check.latest === null) {
     process.stderr.write('Could not reach the release server. Try again later.\n')
@@ -137,7 +158,7 @@ async function cmdUpdateApply(): Promise<void> {
     flipCurrent(deps.installDir, check.latest)
     pruneVersions(deps.installDir)
   } catch (err) {
-    process.stderr.write(`Update failed: ${err instanceof Error ? err.message : String(err)}\n`)
+    process.stderr.write(`Update failed: ${messageOf(err)}\n`)
     process.exit(1)
     return
   }

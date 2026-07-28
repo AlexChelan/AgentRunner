@@ -1,24 +1,33 @@
 import { rmSync } from 'node:fs'
-import { DEFAULT_CLIENT_ID, resolveBackendUrl } from '../backend-url'
+import { DEFAULT_CLIENT_ID, findPairedBackend, resolveBackendScope, resolveBackendUrl } from '@opencompanion/core/runtime/backend-url'
 import { BRAND } from '../brand'
-import { buildCompanionRegistry } from '../connect'
-import { runPair, runUnpair } from '../pair'
-import { managedCliDir } from '../paths'
+import { buildCompanionRegistry } from '@opencompanion/core/runtime/connect'
+import { runPair, runUnpair } from '@opencompanion/core/runtime/pair'
+import { managedCliDir } from '@opencompanion/core/runtime/paths'
 import { installService, uninstallService } from '../service'
+import { messageOf } from '@opencompanion/core/runtime/error-message'
 import * as ui from '../ui'
 import { connectCliInteractively } from './connect'
 import { buildServiceSpec } from './service'
-import { flagValue, openStores, selectBackendUrl } from './shared'
+import { flagValue, openStores, selectBackendUrl, selectPairedScope } from './shared'
 
 /**
  * Runs the one-shot `setup`: pair with the backend (skipping pairing when already paired), connect
- * the user's coding CLIs, then install the always-on OS service. This is the single command an
- * installer chains, so a fresh machine goes from nothing to a running, paired, boot-starting
- * companion in one step. Connect failures are non-fatal (the user can `opencompanion connect` more
- * later); a failed pairing aborts before the service is installed.
+ * the user's coding CLIs, then - unless `--app-scoped` - install the always-on OS service. This is the
+ * single command an installer chains, so a fresh machine goes from nothing to a running, paired,
+ * boot-starting companion in one step. Connect failures are non-fatal (the user can `opencompanion
+ * connect` more later); a failed pairing aborts before the service is installed.
+ *
+ * `--user <id>` picks the account when this machine already has two SaaS logins paired to the backend.
+ *
+ * With `--app-scoped` it stops BEFORE installing the boot service: the product app supervises a plain
+ * `serve` child itself, so no OS service is installed. Either way the resolved lifecycle mode is
+ * recorded locally (never wired) so `status --json` can report how the daemon is supervised; the boot
+ * service stays available on demand via `opencompanion service install`.
  */
 export async function cmdSetup(argv: string[]): Promise<void> {
   ui.intro()
+  const appScoped = argv.includes('--app-scoped')
   const { appDataRoot, state, secrets } = openStores()
   let backendUrl: string
   try {
@@ -27,12 +36,12 @@ export async function cmdSetup(argv: string[]): Promise<void> {
       prompt: selectBackendUrl
     })
   } catch (err) {
-    ui.p.cancel(err instanceof Error ? err.message : String(err))
+    ui.p.cancel(messageOf(err))
     process.exit(1)
     return
   }
 
-  if (state.getPairedBackend(backendUrl)) {
+  if (findPairedBackend(backendUrl, state)) {
     ui.line(`Already paired with ${backendUrl}.`)
   } else {
     const clientId = flagValue(argv, '--client-id') ?? DEFAULT_CLIENT_ID
@@ -44,14 +53,46 @@ export async function cmdSetup(argv: string[]): Promise<void> {
     }
   }
 
+  // A connection record is per ACCOUNT, so resolve the scope the pairing above landed under before
+  // recording anything. On a machine where two SaaS logins already share this backend the resolver
+  // refuses and names them, so `setup --user <id>` says which account is being set up rather than
+  // having one guessed.
+  let scope: string
+  try {
+    scope = await resolveBackendScope(backendUrl, flagValue(argv, '--user'), state, {
+      interactive: process.stdin.isTTY === true,
+      prompt: selectPairedScope
+    })
+  } catch (err) {
+    ui.p.cancel(messageOf(err))
+    process.exit(1)
+    return
+  }
+
   const baseDir = managedCliDir(appDataRoot)
   const { connected } = await connectCliInteractively({
     registry: buildCompanionRegistry(baseDir),
     baseDir,
     state,
-    backendUrl,
+    backendUrl: scope,
     write: ui.line
   })
+
+  // Record the resolved lifecycle mode before the service step so `status --json` reports it even when
+  // the (non-fatal) service install below is skipped or fails. Local only - never sent to any backend.
+  state.setAppScoped(appScoped)
+
+  // App-scoped: the product app supervises a plain `serve` child, so stop before installing the boot
+  // service. The always-on service stays available on demand via `opencompanion service install`.
+  if (appScoped) {
+    ui.outro(
+      connected > 0
+        ? `Setup complete. ${BRAND.name} is paired and ready; the app manages the daemon.`
+        : `Setup complete. Connect a coding CLI with '${BRAND.binary} connect' to start running tasks.`
+    )
+    process.exit(0)
+    return
+  }
 
   const { message } = installService(buildServiceSpec(appDataRoot))
   ui.line(message)
@@ -74,8 +115,8 @@ export function cmdUninstall(): void {
   const { appDataRoot, state, secrets } = openStores()
   const { message } = uninstallService()
   ui.line(message)
-  for (const backend of state.listPairedBackends()) {
-    runUnpair(backend.backendUrl, { state, secrets, write: ui.line })
+  for (const { scope } of state.listPairedScopes()) {
+    runUnpair(scope, { state, secrets, write: ui.line })
   }
   rmSync(appDataRoot, { recursive: true, force: true })
   ui.outro(`${BRAND.name} uninstalled: service removed, pairings dropped, data deleted.`)

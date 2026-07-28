@@ -4,30 +4,57 @@ import { fileURLToPath } from 'node:url'
 import { BRAND } from './brand'
 import { cmdBackends, cmdStatus } from './commands/backends'
 import { cmdConnect, cmdDisconnect } from './commands/connect'
+import { cmdLimits } from './commands/limits'
 import { cmdLog } from './commands/log'
+import { cmdMcp } from './commands/mcp'
 import { cmdPair, cmdUnpair } from './commands/pair'
 import { cmdPolicy } from './commands/policy'
 import { cmdServe } from './commands/serve'
 import { cmdService } from './commands/service'
 import { cmdSetup, cmdUninstall } from './commands/setup'
+import { cmdTerminal } from './commands/terminal'
 import { cmdUpdate } from './commands/update'
 import { daemonVersion } from './version'
 
 /** The usage banner printed for an unknown or missing command. */
 const USAGE =
   `Usage: ${BRAND.binary} <command>\n` +
-  '  setup [--url <backend>]                      pair + connect the CLIs + install the service (one-shot)\n' +
+  '  setup [--url <backend>] [--app-scoped]       pair + connect the CLIs, then install the service (one-shot)\n' +
+  '                                               (--app-scoped: skip the service; the app supervises the daemon)\n' +
   '  uninstall                                    remove the service, drop pairings, delete all data\n' +
   '  pair [--url <backend>] [--client-id <id>]   pair with a buyer backend (device authorization)\n' +
-  '  unpair [--url <backend>]                     remove a backend pairing and its stored bearer\n' +
-  '  connect [claude-code|codex|opencode|hermes]  detect / install / log in the coding CLIs\n' +
-  `  disconnect <claude-code|codex|opencode|hermes>  stop ${BRAND.name} driving a CLI (keeps it installed)\n` +
-  '  status                                       print pairing + per-CLI connection state\n' +
+  '       [--token <value|->]                     pair with a pre-authorized bearer instead (`-` reads it from stdin)\n' +
+  '  unpair [--url <backend>] [--user <id>]       remove a backend pairing and its stored bearer\n' +
+  '  (--user <id>)                                two SaaS logins can share this machine: each pairs, connects and\n' +
+  '                                               runs on its own. Every command that names a pairing takes --user,\n' +
+  '                                               and asks for it when one backend has two accounts\n' +
+  '  connect [claude-code|codex|opencode|hermes] [--local]  detect / install / log in the coding CLIs\n' +
+  '                                               (--local: connect for purely-local use, no backend pairing)\n' +
+  `  disconnect <claude-code|codex|opencode|hermes> [--local]  stop ${BRAND.name} driving a CLI (keeps it installed)\n` +
+  '  status [--json]                              print pairing + per-CLI connection state (--json: machine-readable)\n' +
   '  backends                                     list paired backends (device id, connected CLIs, ceiling, daemon state)\n' +
   '  log [--url <backend>] [--json] [-n <count>]  print the local audit trail (oldest-first; --json for piping)\n' +
-  '  policy show [--url <backend>]                show each backend permission ceiling, network, and confined work root\n' +
-  '  policy set --url <backend> [--permission-mode <read-only|auto-edit|full>] [--network <on|off>]\n' +
-  '                                               clamp a backend ceiling (at least one flag; an unset field is kept)\n' +
+  '  policy show [--url <backend>] [--local]      show each backend permission ceiling, network, confined work root, and granted folders\n' +
+  '  policy set (--url <backend> | --local) [--permission-mode <read-only|auto-edit|full>] [--network <on|off>]\n' +
+  '             [--schedule <allow|deny>] [--dispatch <allow|deny>]\n' +
+  '                                               clamp a backend ceiling and/or allow/deny scheduled and\n' +
+  '                                               app-dispatched runs (at least one flag; an unset field is kept)\n' +
+  '  policy grant-folder list [--url <backend>] [--local]   list the folders your terminal sessions may run in\n' +
+  '  policy grant-folder add <path> [--url <backend>] [--local]     let `terminal --cwd` run in one of YOUR folders\n' +
+  '  policy grant-folder remove <path> [--url <backend>] [--local]  revoke a folder grant\n' +
+  '                                               (grants are local, audited, and per backend; a backend can never add one)\n' +
+  '                                               (--local: manage records for purely-local use, no backend pairing)\n' +
+  '  limits [show]                                show the max concurrent runs cap (a local resource limit; default 2)\n' +
+  '  limits set --max-concurrent-runs <n>         cap how many dispatched runs execute at once (applies within a poll, no restart)\n' +
+  '  mcp list [--url <backend>] [--local]         list your own local MCP servers (a backend can never add one)\n' +
+  '  mcp add <name> (--url <backend> | --local)   connect one of YOUR MCP servers to your terminal sessions\n' +
+  '          (--http <url> | --command <bin> [--arg <a>]... [--env K=V]...)\n' +
+  '  mcp remove <name> (--url <backend> | --local)  drop a local MCP server\n' +
+  '                                               (--local: your own MCP servers for purely-local use, no backend pairing)\n' +
+  '  terminal [<productId>] [--url <backend>]     open your CLI as an interactive session wired to your product\n' +
+  '           [--cli claude-code|codex] [--model <id>]  (its tools, your MCP servers, its work folder)\n' +
+  '           [--cwd <path>]                      run the session in one of YOUR folders instead (must be granted)\n' +
+  '  terminal --local --app-config <path>         open that session with no backend at all - composed on this device\n' +
   '  serve [--url <backend>] [--if-paired]        pair + connect a CLI if needed, then run the daemon\n' +
   '                                               (--if-paired: run only when already paired, else print a hint and exit 0)\n' +
   '  service <install|uninstall|status>           manage the always-on OS service\n' +
@@ -42,14 +69,39 @@ const USAGE =
  * the companion driving one CLI (leaving it installed + signed in); `opencompanion status` prints
  * the non-secret pairing + connection state; `opencompanion backends` lists each paired backend with its
  * device id, connected-CLI count, capability ceiling, and daemon state; `opencompanion policy show` prints
- * each backend's capability ceiling, network, and confined work root, and `opencompanion policy set` clamps
- * a backend's ceiling (permission mode and/or network, auditing the change); `opencompanion log` prints the
+ * each backend's capability ceiling, network, confined work root, and granted folders, and `opencompanion policy set` clamps
+ * a backend's ceiling (permission mode and/or network, auditing the change); `opencompanion policy grant-folder
+ * list|add|remove` manages the folders a `terminal --cwd` may run in - the ONE way a session leaves its confined
+ * work folder, so a grant is named by the user at this machine, stored per backend, and audited like any other
+ * policy change (no backend can add, name, or widen one); `opencompanion limits show` prints
+ * the local concurrent-run cap and `opencompanion limits set --max-concurrent-runs <n>` changes it (applied within a poll,
+ * no restart); `opencompanion mcp list|add|remove` manages the user's OWN local MCP servers per backend -
+ * the servers a `terminal` session gets beside the app's tools, so a buyer's app can expose LOCAL data
+ * (a private database, an internal service) to the CLI without any of it crossing the network; they come
+ * ONLY from this local config (a backend can never add one - server-pushed MCP servers are always
+ * dropped), an unsafe server name is refused at write time, and an `--env` VALUE is stored encrypted in
+ * the secret store (never in the state file) and reaches the CLI through its environment, never its
+ * argv; `opencompanion log` prints the
  * local audit trail read-only (pretty by default, `--json` for piping, `--url`/`-n` to filter); `opencompanion unpair` removes a
  * pairing (auditing the event, and a running daemon stops serving it within one reconcile); `opencompanion
+ * terminal` opens the user's OWN coding CLI as an interactive session wired to their product - the product's
+ * tools served over a loopback MCP, the user's local MCP servers beside them, the backend's composed
+ * instructions as the system prompt, and the
+ * product's confined work folder as the cwd (`[<productId>]` names the workspace, `--cli` picks the CLI,
+ * `--model` pins the model, and `--cwd` runs it in a folder the user granted instead; the backend ceiling only
+ * ever clamps the session, never raises it, and it is
+ * audited fail-closed before the CLI starts); `opencompanion
  * serve` pairs + connects a CLI on demand then boots the daemon (foreground) so it receives + executes dispatched runs; `opencompanion
  * service` manages the always-on per-user OS service; `opencompanion update` applies the latest release
  * (staged + checksum-verified, with `--check`, `--rollback`, and `--auto on|off`). `--help`/`-h`/`help` prints the usage banner to
  * stdout and exits 0. Never throws to the top level: a failure prints a clear line and exits non-zero.
+ *
+ * TWO SaaS LOGINS CAN SHARE ONE MACHINE. Every per-pairing record - the bearer, the connected CLIs, the
+ * ceiling, the folder grants, the local MCP servers and the confined work folder - is keyed by the
+ * ACCOUNT the pairing belongs to, not by the backend URL alone, so a second login neither overwrites the
+ * first's pairing nor runs inside its files. `--url` still names the backend; `--user <id>` names the
+ * account when one backend carries two, and any command that would otherwise have to guess refuses and
+ * prints both ids instead.
  *
  * @param argv - The process arguments (defaults to `process.argv.slice(2)`).
  */
@@ -91,7 +143,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
     return
   }
   if (command === 'status') {
-    cmdStatus()
+    await cmdStatus(argv)
     return
   }
   if (command === 'backends') {
@@ -104,6 +156,18 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
   }
   if (command === 'policy') {
     await cmdPolicy(argv)
+    return
+  }
+  if (command === 'limits') {
+    await cmdLimits(argv)
+    return
+  }
+  if (command === 'mcp') {
+    await cmdMcp(argv)
+    return
+  }
+  if (command === 'terminal') {
+    await cmdTerminal(argv)
     return
   }
   if (command === 'serve') {

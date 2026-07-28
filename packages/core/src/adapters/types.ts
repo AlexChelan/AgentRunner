@@ -1,10 +1,5 @@
-import type { ModelInfo } from '@opencompanion/core-types'
-import type {
-  McpServerSpec,
-  PermissionMode,
-  ReasoningEffort,
-  TokenUsage
-} from '@opencompanion/protocol'
+import type { ModelInfo, RunImage } from '@opencompanion/core-types'
+import type { McpServerSpec, PermissionMode, TokenUsage } from '@opencompanion/protocol'
 
 /** Result of running a tool binary for detection / status probes. */
 export interface ExecResult {
@@ -28,6 +23,34 @@ export interface CommonAdapterDeps {
 }
 
 /**
+ * One model a coding CLI ADVERTISES for itself, with the reasoning-effort ladder it will
+ * actually accept for that model. Distinct from {@link ModelInfo}: this is the raw answer from
+ * the tool, matched by id onto the catalog the adapter already serves, never a catalog of its own.
+ */
+export interface AdvertisedModel {
+  /** The model id as the tool names it (matched against the registry catalog's ids). */
+  id: string
+  /**
+   * The levels the tool advertises for this model, weakest first. Deliberately `string[]`: both
+   * Codex and the Claude SDK vary the set per model, and Codex types its own `ReasoningEffort` as
+   * an OPEN string, so re-narrowing here would drop levels the installed CLI genuinely accepts.
+   */
+  effortLevels: string[]
+  /** The level the tool applies when a turn sends none, when it advertises one. */
+  defaultEffort?: string
+}
+
+/**
+ * Queries a tool for the models it advertises. NEVER throws and never hangs: a missing binary, a
+ * foreign CLI version, a failed handshake or a silent child all degrade to `[]`, which leaves the
+ * adapter on its registry catalog and the picker on the declared floor.
+ */
+export type AdvertisedModelLister = (params: {
+  /** Resolved absolute path to the user's CLI binary. */
+  binaryPath: string
+}) => Promise<AdvertisedModel[]>
+
+/**
  * A normalized message yielded by any agentic driver, decoupled from each SDK. The
  * adapter run-loop maps it to a {@link RuntimeRunEvent} in one place. The
  * `conversation` variant (spike D) carries the SDK session/thread id for resume.
@@ -46,6 +69,8 @@ export type CodexDriverMessage = AgenticDriverMessage
 /** Inputs the Claude driver needs for one run. */
 export interface ClaudeDriverParams {
   prompt: string
+  /** Images attached to a chat turn, sent as native base64 image content blocks alongside the prompt. */
+  images?: RunImage[]
   cwd: string
   model?: string
   /** BYOK key; absent means subscription mode (the tool resolves its own login). */
@@ -56,8 +81,12 @@ export interface ClaudeDriverParams {
   allowedTools?: string[]
   disallowedTools?: string[]
   systemPrompt?: string
-  /** Reasoning effort; absent/`"default"` leaves the model's native behaviour. */
-  effort?: ReasoningEffort
+  /**
+   * Reasoning effort; absent/`"default"` leaves the model's native behaviour. A plain string, not
+   * the shipped ladder - a discovered level reaches the driver unnarrowed and the driver's own
+   * mapping decides what its SDK can accept.
+   */
+  effort?: string
   /** Builder-configured MCP servers, passed natively to the Agent SDK. */
   mcpServers?: Record<string, McpServerSpec>
   /**
@@ -65,6 +94,19 @@ export interface ClaudeDriverParams {
    * `options.resume` so turn N continues turn N-1 without replaying the transcript.
    */
   resume?: string
+  /**
+   * Absolute paths whose reads are DENIED to the spawned CLI (the companion daemon passes its own
+   * `secrets/` dir). Enforced by BOTH of Claude's read-deny halves - an OS sandbox for Bash and
+   * permission rules for Read/Grep/Glob - since neither covers the other. Absent leaves the run
+   * unconfined (the interactive terminal path, where a human is present).
+   */
+  denyReadPaths?: string[]
+  /**
+   * Whether the run may reach the network. Only consulted when {@link denyReadPaths} is set, because
+   * the read-deny runs Claude under its OS sandbox, which denies ALL egress by default and so must be
+   * told to reopen it for a network-on run.
+   */
+  network?: 'on' | 'off'
   signal: AbortSignal
   /** Forward a permission request to the UI; resolves with the user's decision. */
   requestPermission: (toolName: string, input: unknown) => Promise<'allow' | 'deny'>
@@ -74,9 +116,9 @@ export interface ClaudeDriverParams {
 export type ClaudeDriver = (params: ClaudeDriverParams) => AsyncIterable<AgenticDriverMessage>
 
 /**
- * Inputs every headless agentic-CLI driver needs for one run (Codex, OpenCode). One
- * shape - binary path, prompt, cwd, model, permission mode, optional reasoning effort,
- * optional MCP servers, optional resume id, and an abort signal.
+ * Inputs every headless agentic-CLI driver needs for one run (Codex, plus the ACP-driven OpenCode
+ * and Hermes). One shape - binary path, prompt, cwd, model, permission mode, optional reasoning
+ * effort, optional MCP servers, optional resume id, and an abort signal.
  */
 export interface AgenticCliDriverParams {
   prompt: string
@@ -85,30 +127,54 @@ export interface AgenticCliDriverParams {
   apiKey?: string
   binaryPath: string
   permissionMode: PermissionMode
-  /** Reasoning effort; absent/`"default"` leaves the model's native behaviour. */
-  effort?: ReasoningEffort
+  /**
+   * Reasoning effort; absent/`"default"` leaves the model's native behaviour. A plain string, not
+   * the shipped ladder - a discovered level reaches the driver unnarrowed and the driver's own
+   * mapping decides what its CLI can accept.
+   */
+  effort?: string
   /** Builder/integration MCP servers, threaded to the CLI via its native MCP config. */
   mcpServers?: Record<string, McpServerSpec>
   /**
    * Whether the run may reach the network. Only the Codex driver enforces `"off"`: it maps to
    * the OS-enforced sandbox flag `networkAccessEnabled: false`, so an unattended Codex run's
-   * egress is actually blocked, not merely recorded for audit. The OpenCode CLI exposes no
-   * network flag on the `opencode run` path, so it ignores this field (its egress is NOT
-   * enforced - the adapter run-loop discloses that). Absent leaves the CLI's network-on default.
+   * egress is actually blocked, not merely recorded for audit. The ACP-driven agents (OpenCode,
+   * Hermes) have no egress switch on `session/prompt`, so they ignore this field (their egress is
+   * NOT enforced - the adapter run-loop discloses that). Absent leaves the CLI's network-on default.
    */
   network?: 'on' | 'off'
   /**
-   * Codex thread id to resume (spike D). When set, the Codex driver calls
-   * `codex.resumeThread(id)` instead of `startThread(...)`, continuing the thread.
-   * Ignored by OpenCode (its CLI has no resume primitive on this path).
+   * The prior conversation to continue: a Codex thread id (spike D), or an ACP session id. When set,
+   * the Codex driver calls `codex.resumeThread(id)` instead of `startThread(...)`, and the ACP driver
+   * sends `session/load` instead of `session/new` - which both OpenCode and Hermes advertise as
+   * `loadSession`.
    */
   resume?: string
+  /**
+   * Absolute paths whose reads are DENIED to the spawned CLI (the companion daemon passes its own
+   * `secrets/` dir). The Codex driver enforces this with a permissions PROFILE - the only per-spawn,
+   * OS-enforced read-deny codex offers, since its `workspace-write` AND `read-only` sandbox tiers both
+   * grant full-filesystem read. Ignored by the ACP-driven agents (no equivalent lever). Absent leaves the run
+   * unconfined (the interactive terminal path, where a human is present).
+   */
+  denyReadPaths?: string[]
+  /**
+   * Only the CODEX driver consumes this: an ISOLATED `CODEX_HOME` for the run. Codex reads its
+   * `config.toml` (personal `mcp_servers`, profiles) AND its file-based `auth.json` from `CODEX_HOME`,
+   * and offers no strict-MCP flag or separate auth path, so a headless chat/schedule run is isolated
+   * by pointing `CODEX_HOME` at a companion-managed home whose `config.toml` declares NO personal MCP
+   * servers. Subscription auth is preserved because that home's `auth.json` is a SYMLINK to the user's
+   * real one (so no credential is copied at rest, and a keyring-auth platform - which has no auth.json -
+   * is unaffected since the keyring is global). Absent = the user's own `~/.codex` (the interactive
+   * terminal path, which keeps the full personal config). Ignored by OpenCode.
+   */
+  codexHome?: string
   signal: AbortSignal
 }
 
 /**
- * Drives one headless agentic CLI (Codex or OpenCode) for a run, yielding normalized
- * messages. SDK/CLI glue; the two share this one signature.
+ * Drives one headless agentic CLI (Codex, OpenCode or Hermes) for a run, yielding normalized
+ * messages. SDK/CLI glue; the three share this one signature.
  */
 export type AgenticCliDriver = (
   params: AgenticCliDriverParams

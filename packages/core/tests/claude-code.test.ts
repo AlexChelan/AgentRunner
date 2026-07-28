@@ -56,6 +56,23 @@ describe('claude-code adapter', () => {
     expect(a.capabilities.subscriptionRequiresDisclosure).toBe(true)
     // Claude Code cannot OS-enforce network-off (no single egress switch in the Agent SDK).
     expect(a.capabilities.enforcesNetworkOff).toBe(false)
+    // The Agent SDK takes image content blocks, so a chat turn can carry attached photos.
+    expect(a.capabilities.images).toBe(true)
+  })
+
+  it('threads attached images into the driver params', async () => {
+    let capturedImages: ClaudeDriverParams['images']
+    const a = makeAdapter({
+      driver: async function* (params: ClaudeDriverParams) {
+        capturedImages = params.images
+        yield { kind: 'done' }
+      }
+    })
+    const sink = collect()
+    const images = [{ dataUrl: 'data:image/jpeg;base64,AAAA', mediaType: 'image/jpeg' }]
+    a.run({ ...baseReq, images }, ctx, resolvers, sink.emit)
+    await vi.waitFor(() => expect(sink.events.at(-1)?.type).toBe('done'))
+    expect(capturedImages).toEqual(images)
   })
 
   it('detects an installed binary via --version', async () => {

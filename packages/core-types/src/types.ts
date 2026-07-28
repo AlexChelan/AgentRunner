@@ -14,12 +14,7 @@
  */
 
 import type { ModelMessage, ToolSet } from 'ai'
-import type {
-  McpServerSpec,
-  PermissionMode,
-  ReasoningEffort,
-  RunEvent
-} from '@opencompanion/protocol'
+import type { McpServerSpec, PermissionMode, RunEvent } from '@opencompanion/protocol'
 
 export type { McpServerSpec, PermissionMode, ReasoningEffort, RunEvent, TokenUsage } from '@opencompanion/protocol'
 export { REASONING_EFFORTS, isReasoningEffort } from '@opencompanion/protocol'
@@ -84,11 +79,53 @@ export interface ModelInfo {
   releaseDate?: string
   /** True for the newest model in its family (UI may badge it). */
   recommended?: boolean
+  /**
+   * The reasoning-effort levels THIS model advertises, in the source's own ladder order
+   * (weakest first). Discovered, never assumed: a tool's runtime query (Codex `model/list`,
+   * the Claude Agent SDK's initialize response) wins over the models.dev registry, and the
+   * set genuinely varies per model - `ultra` exists on some Codex models and not others.
+   * Deliberately `string[]` and NOT the protocol's {@link ReasoningEffort} union: a source may
+   * advertise a level this build has never heard of, and re-narrowing here would silently drop
+   * the top of the ladder (the whole reason this field exists). ABSENT means nothing was
+   * discovered, which decodes to the adapter's declared floor and then to the shipped ladder -
+   * i.e. exactly the behaviour before discovery existed.
+   */
+  effortLevels?: string[]
+  /** The level the model applies to a turn that sends none, when the source advertises one. */
+  defaultEffort?: string
 }
 
 /**
+ * What reasoning effort an adapter can actually DELIVER to its tool - the static floor that is
+ * correct-if-coarse, works offline and on first paint, and is replaced per model by
+ * {@link ModelInfo.effortLevels} once discovery lands.
+ *
+ * `supported: false` is a positive declaration, not a gap: the adapter has NO channel to send a
+ * level through - OpenCode's `run` has no effort flag, and an ACP agent that advertises no
+ * `thought_level` config option (Hermes today) offers nothing to set - so a picker must hide the
+ * control rather than render one that changes nothing.
+ */
+export type AdapterEffortSupport =
+  | { supported: false }
+  | {
+      supported: true
+      /**
+       * The declared floor ladder, weakest first. The reserved `"default"` sentinel is NOT listed:
+       * it means "the model's native behaviour" and is always available regardless of the tool.
+       */
+      levels: readonly string[]
+      /**
+       * True only when this tool can genuinely DISABLE reasoning, so the reserved `"off"` sentinel
+       * may be offered. False is the honest answer for Codex: no Codex model advertises a disable
+       * level, and omitting the parameter makes Codex apply its own default - the model still
+       * thinks while the UI claims it does not.
+       */
+      canDisable: boolean
+    }
+
+/**
  * The canonical renderer<->main model reference: a provider (matching a connection's
- * `toolId`) + a model id, with an optional {@link ReasoningEffort}. Single source of
+ * `toolId`) + a model id, with an optional reasoning effort. Single source of
  * truth for the `{ providerId, modelId, effort? }` shape threaded across the desktop
  * IPC boundary (renderer override -> preload -> IPC validate -> run dispatch), so a
  * field add/rename is made once here rather than re-declared per site.
@@ -98,14 +135,40 @@ export interface ModelRef {
   providerId: string
   /** The model id within the provider. */
   modelId: string
-  /** Reasoning effort for this run; absent leaves the model's native behaviour. */
-  effort?: ReasoningEffort
+  /**
+   * Reasoning effort for this run; absent leaves the model's native behaviour. A plain string, NOT
+   * {@link ReasoningEffort}: the level the user picked may be one this build never shipped a
+   * constant for ({@link ModelInfo.effortLevels} is discovered per model), and narrowing it here
+   * would silently drop the top of the ladder somewhere between the picker and the CLI.
+   */
+  effort?: string
+}
+
+/**
+ * One image attached to a chat turn, sent to an image-capable agentic CLI in-flight only. `dataUrl`
+ * carries the full-resolution compressed image (`data:<mediaType>;base64,<data>`); the daemon never
+ * persists it (only a small thumbnail is stored in the transcript).
+ */
+export interface RunImage {
+  /** The image as a `data:` URL (full-resolution, compressed client-side). */
+  dataUrl: string
+  /** IANA media type of the image (`image/jpeg`, `image/png`, `image/webp`, `image/gif`). */
+  mediaType: string
+  /** Pixel width, when known. */
+  width?: number
+  /** Pixel height, when known. */
+  height?: number
 }
 
 /** One streamed run request. */
 export interface RunRequest {
   connectionId: string
   prompt: string
+  /**
+   * Images attached to the turn, forwarded to an adapter whose {@link AdapterCapabilities.images} is
+   * true (Claude Code). Adapters without the capability ignore them. Chat-only; absent otherwise.
+   */
+  images?: RunImage[]
   /**
    * Typed multi-turn history for a completion run, preferred over `prompt` when
    * present and non-empty. The chat handler builds it from the session's turns so
@@ -115,8 +178,13 @@ export interface RunRequest {
   messages?: ModelMessage[]
   /** Overrides the connection's pinned model for this run. */
   modelId?: string
-  /** Reasoning effort for this run; absent/`"default"` leaves the model's native behaviour. */
-  effort?: ReasoningEffort
+  /**
+   * Reasoning effort for this run; absent/`"default"` leaves the model's native behaviour. A plain
+   * string, NOT {@link ReasoningEffort}, mirroring the wire's `RunStart.effort`: a level discovered
+   * from the tool (Codex `ultra`, an SDK `xhigh`) has to reach the adapter UNNARROWED, and the
+   * adapter - not this type - is what rejects a level its own CLI cannot accept.
+   */
+  effort?: string
   /** Working directory the agentic run operates in (validated by the caller). */
   cwd: string
   /** Permission posture; defaults to `read-only` at the call site. */
@@ -162,12 +230,24 @@ export interface AdapterCapabilities {
   /** True if selecting subscription mode must show a blocking ToS risk disclosure first. */
   subscriptionRequiresDisclosure: boolean
   /**
+   * True when this agentic adapter can accept image attachments on a chat turn (forwarded as native
+   * image content to the CLI). Claude Code sets it (the Agent SDK takes base64 image content blocks).
+   * Omitted (falsy) for adapters whose turn input is text-only ON THE DRIVEN PATH, so the desktop
+   * composer hides the attach control for them - which is a statement about what OUR driver sends,
+   * not about what the tool could accept. Codex is text-only end to end. OpenCode and Hermes both
+   * ADVERTISE `promptCapabilities.image` over ACP, but this client's `session/prompt` sends text
+   * parts only and its driver params carry no images, so declaring it for them would offer an attach
+   * control whose attachments are silently discarded. Irrelevant to completion adapters; omitted.
+   */
+  images?: boolean
+  /**
    * True when this agentic adapter can OS-enforce `network: 'off'` (actually cut all egress)
    * for the run it drives. Codex sets it: its SDK exposes `networkAccessEnabled: false`, an
    * OS-enforced sandbox switch, so an unattended `network: 'off'` run is genuinely blocked.
    * Omitted (falsy) for adapters that cannot - Claude Code (the Agent SDK has no single egress
    * boolean; restriction is permission-rule + sandbox based, platform-dependent, and can
-   * hard-fail) and OpenCode (`opencode run` exposes no network flag). This is the honest
+   * hard-fail) and the ACP-driven agents, OpenCode and Hermes (ACP's `session/prompt` exposes no
+   * OS-enforced egress switch, and neither agent advertises one). This is the honest
    * contract the orchestrator/UI reads to decide whether a requested network-off is a real
    * guarantee or merely advisory: when a run requests `network: 'off'` against an adapter whose
    * `enforcesNetworkOff` is falsy, the run still proceeds (non-fatal, since Claude Code is the
@@ -184,6 +264,15 @@ export interface AdapterCapabilities {
    * (which run tools in-process), so omitted there.
    */
   httpMcp?: boolean
+  /**
+   * The adapter's reasoning-effort floor - what it can deliver with no discovery at all, plus
+   * whether `off` is real for this tool. Declared by the agentic adapters that touch effort
+   * (Codex, Claude Code) AND by the two that provably ignore it (OpenCode, Hermes), which say so
+   * with `{ supported: false }` so the UI can hide a control that would change nothing. Omitted
+   * where the answer is genuinely unknown (completion adapters), which decodes to the shipped
+   * ladder - exactly the behaviour before this field existed.
+   */
+  effort?: AdapterEffortSupport
   /**
    * True when starting this provider's OAuth sign-in must show the subscription ToS
    * disclosure first (subscription-backed OAuth like ChatGPT/Codex or Google/Gemini).

@@ -9,7 +9,12 @@ import type {
 } from '@opencompanion/core-types'
 import type { RunContext, RunContextResolvers } from '../context'
 import type { RuntimeRunEvent, RuntimeRunRequest } from '../runtime-types'
-import type { AgenticDriverMessage, CommonAdapterDeps } from './types'
+import type {
+  AdvertisedModel,
+  AdvertisedModelLister,
+  AgenticDriverMessage,
+  CommonAdapterDeps
+} from './types'
 
 /**
  * Returns a provider's registry models, falling back to the shared
@@ -28,6 +33,121 @@ export async function registryModelsOrFallback(
 ): Promise<ModelInfo[]> {
   const registry = await deps.listRegistryModels(provider)
   return registry.length > 0 ? registry : (FALLBACK_MODELS[provider] ?? [])
+}
+
+/**
+ * Folds a tool's own model advertisements onto a registry catalog, matching by exact model id.
+ *
+ * The tool WINS wherever it speaks: it is the thing that will accept or reject the level, while the
+ * registry is a community catalog that is measurably wrong for at least one live model (models.dev
+ * offers `gpt-5.5` a `none` level the Codex app-server does not advertise). An advertisement with an
+ * EMPTY ladder is treated as silence rather than as "this model has no levels": a partial or
+ * older tool listing must not erase what the registry knows.
+ *
+ * @param models - The adapter's catalog (registry or fallback), left untouched where nothing matches.
+ * @param advertised - What the tool answered; `[]` when the probe found nothing.
+ * @returns The catalog with `effortLevels`/`defaultEffort` filled in from the tool where it spoke.
+ */
+export function applyAdvertisedEfforts(
+  models: ModelInfo[],
+  advertised: readonly AdvertisedModel[]
+): ModelInfo[] {
+  if (advertised.length === 0) return models
+  const byId = new Map(advertised.map((entry) => [entry.id, entry]))
+  return models.map((model) => {
+    const entry = byId.get(model.id)
+    if (!entry || entry.effortLevels.length === 0) return model
+    return {
+      ...model,
+      effortLevels: [...entry.effortLevels],
+      ...(entry.defaultEffort ? { defaultEffort: entry.defaultEffort } : {})
+    }
+  })
+}
+
+/** How long a tool's model advertisement stays good before the adapter probes the CLI again. */
+const ADVERTISED_MODELS_TTL_MS = 5 * 60 * 1000
+
+/** The per-probe knobs {@link memoizeBinaryProbe} needs to recognize (and refuse to cache) a miss. */
+export interface BinaryProbeMemoOptions<T> {
+  /** The value served when discovery is unavailable, the binary is unresolved, or the probe threw. */
+  empty: () => T
+  /** True when a probe answered nothing, so the answer is neither cached nor treated as discovery. */
+  isEmpty: (value: T) => boolean
+  /** Injectable clock (ms) for deterministic tests. */
+  now?: () => number
+}
+
+/**
+ * Wraps a per-binary discovery probe in a memo so opening the model picker does not spawn a CLI
+ * every time. Concurrent callers join one in-flight probe (the picker can ask for several tools at
+ * once), a result is reused for {@link ADVERTISED_MODELS_TTL_MS}, and a probe that found NOTHING is
+ * not cached - a tool that was not installed a minute ago may be installed now. A probe that throws
+ * degrades to the empty value, so discovery can never fail a catalog read.
+ *
+ * Two things make the JOIN correct rather than merely convenient, and both were wrong when a joiner
+ * simply received the in-flight promise:
+ * - The join goes through the SAME degrade-to-empty as the originator. A raw in-flight promise carries
+ *   the rejection to the joiner instead, which for the drive's model route escaped `listToolModels` and
+ *   became a bare 500 - the picker showing a request failure where the memo promises a fallback catalog.
+ * - The join is keyed by `binaryPath`. Sharing one slot across paths handed a caller probing a different
+ *   resolved binary the OTHER binary's offer.
+ *
+ * @param probe - The underlying probe, or `undefined` when the host wired no discovery.
+ * @param options - The empty value, the emptiness test, and an injectable clock.
+ * @returns A probe that resolves the binary path and serves the empty value when discovery is unavailable.
+ */
+export function memoizeBinaryProbe<T>(
+  probe: ((params: { binaryPath: string }) => Promise<T>) | undefined,
+  options: BinaryProbeMemoOptions<T>
+): (binaryPath: string | null) => Promise<T> {
+  const now = options.now ?? Date.now
+  if (!probe) return () => Promise.resolve(options.empty())
+  let cached: { at: number; binaryPath: string; value: T } | undefined
+  const inflight = new Map<string, Promise<T>>()
+  return async (binaryPath) => {
+    if (!binaryPath) return options.empty()
+    if (cached && cached.binaryPath === binaryPath && now() - cached.at < ADVERTISED_MODELS_TTL_MS) {
+      return cached.value
+    }
+    const joined = inflight.get(binaryPath)
+    const pending =
+      joined ??
+      (async (): Promise<T> => {
+        const value = await probe({ binaryPath })
+        if (!options.isEmpty(value)) cached = { at: now(), binaryPath, value }
+        return value
+      })()
+    if (!joined) inflight.set(binaryPath, pending)
+    try {
+      return await pending
+    } catch {
+      return options.empty()
+    } finally {
+      // Only the ORIGINATOR clears the slot; a joiner unwinding first must not free it under the probe
+      // still running, which would let the next caller spawn a second CLI for the same binary.
+      if (!joined && inflight.get(binaryPath) === pending) inflight.delete(binaryPath)
+    }
+  }
+}
+
+/**
+ * The {@link memoizeBinaryProbe} instance for a {@link AdvertisedModelLister}: an empty list is the
+ * miss, so a tool that answered nothing is re-probed on the next picker open.
+ *
+ * @param lister - The underlying probe, or `undefined` when the host wired no discovery.
+ * @param now - Injectable clock (ms) for deterministic tests.
+ * @returns A lister that resolves the binary path and returns `[]` whenever discovery is unavailable.
+ */
+export function memoizeAdvertisedModels(
+  lister: AdvertisedModelLister | undefined,
+  now: () => number = Date.now
+): (binaryPath: string | null) => Promise<AdvertisedModel[]> {
+  return memoizeBinaryProbe(lister, {
+    empty: () => [],
+    isEmpty: (models) => models.length === 0,
+    now
+  })
 }
 
 /**

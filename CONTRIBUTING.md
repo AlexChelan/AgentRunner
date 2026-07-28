@@ -4,7 +4,7 @@ Thanks for your interest in OpenCompanion. Issues and pull requests are welcome.
 
 ## How this repository is maintained
 
-OpenCompanion is developed inside the GenerateSaaS monorepo and exported here. This repository is the
+OpenCompanion is developed inside an upstream monorepo and exported here. This repository is the
 canonical open-source source you build and run, but changes are integrated upstream and re-exported,
 rather than committed here in isolation. In practice:
 

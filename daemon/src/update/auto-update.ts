@@ -1,5 +1,6 @@
-import type { UpdateState } from '../poll-client'
-import { checkLatest, flipCurrent, pruneVersions, stageVersion, type UpdaterDeps } from './updater'
+import { messageOf } from '@opencompanion/core/runtime/error-message'
+import type { UpdateState } from '@opencompanion/core/runtime/poll-client'
+import { checkLatest, flipCurrent, hasReleaseBase, pruneVersions, stageVersion, type UpdaterDeps } from './updater'
 
 /** The default full-check cadence (ms): every six hours. */
 const DEFAULT_INTERVAL_MS = 6 * 60 * 60 * 1_000
@@ -111,7 +112,7 @@ export function startAutoUpdate(deps: AutoUpdateDeps): AutoUpdateHandle {
     } catch (err) {
       // Flipping/pruning failed (a read-only or vanished install dir): abandon this staged version and
       // let the next full cycle re-detect and re-stage, rather than retrying the flip in a tight loop.
-      log(`could not apply staged ${version}: ${err instanceof Error ? err.message : String(err)}`)
+      log(`could not apply staged ${version}: ${messageOf(err)}`)
       staged = null
       scheduleCycle()
       return
@@ -124,6 +125,12 @@ export function startAutoUpdate(deps: AutoUpdateDeps): AutoUpdateHandle {
 
   const runCycle = async (): Promise<void> => {
     if (stopped) return
+    // No release base configured (a companion that has not published yet): skip the check silently and
+    // try again next cycle, rather than firing a doomed fetch against a malformed URL every interval.
+    if (!hasReleaseBase(deps.updater.releaseBase)) {
+      scheduleCycle()
+      return
+    }
     const check = await checkLatest(deps.updater)
     if (stopped) return
     // Record the outcome for presence ONLY when the server was reachable (a null latest is an offline
@@ -140,7 +147,7 @@ export function startAutoUpdate(deps: AutoUpdateDeps): AutoUpdateHandle {
     try {
       await stageVersion(deps.updater, check.latest)
     } catch (err) {
-      log(`could not stage ${check.latest}: ${err instanceof Error ? err.message : String(err)}`)
+      log(`could not stage ${check.latest}: ${messageOf(err)}`)
       scheduleCycle()
       return
     }

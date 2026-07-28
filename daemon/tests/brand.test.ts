@@ -2,8 +2,9 @@ import { readFileSync, readdirSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { describe, expect, it } from 'vitest'
-import { DEFAULT_CLIENT_ID } from '../src/backend-url'
-import { BRAND } from '../src/brand'
+import brandJson from '../brand.json'
+import { DEFAULT_CLIENT_ID } from '@opencompanion/core/runtime/backend-url'
+import { BRAND, envVar } from '../src/brand'
 
 const srcDir = join(dirname(fileURLToPath(import.meta.url)), '..', 'src')
 
@@ -15,17 +16,27 @@ function srcFiles(): string[] {
 }
 
 describe('BRAND', () => {
-  it('freezes the user-visible product identity verbatim', () => {
-    // A whole-object match so adding, dropping, or editing any field trips this freeze - the rename
-    // sweep is a deliberate edit to brand.ts (plus the install/build scripts), never an accident.
-    expect(BRAND).toEqual({
-      name: 'OpenCompanion',
-      binary: 'opencompanion',
-      serviceLabel: 'com.generatesaas.opencompanion',
-      appDirName: 'opencompanion',
-      repoUrl: 'https://github.com/Duzbee/OpenCompanion',
-      installBase: 'https://github.com/Duzbee/OpenCompanion/releases/latest/download'
-    })
+  it('freezes the brand CONTRACT: the nine fields, their types, and the derivation invariants', () => {
+    // Brand VALUES are per-buyer - `init` rebrands brand.json, so this can no longer pin the
+    // OpenCompanion strings (that would break for every rebranded companion). It freezes the SHAPE
+    // instead: EXACTLY these nine fields (so a stray wire id like `client_id` can never appear on the
+    // brand), the six identity fields non-empty, the three URL fields strings (legitimately empty
+    // pre-publish), and the structural derivations the exporter/CLI guarantee for EVERY brand -
+    // asserted here so both the monorepo (OpenCompanion) and any rebranded buyer satisfy them.
+    expect(Object.keys(BRAND).sort()).toEqual(
+      ['appDirName', 'binary', 'docsUrl', 'envPrefix', 'installBase', 'name', 'repoUrl', 'scope', 'serviceLabel']
+    )
+    for (const field of ['name', 'binary', 'scope', 'serviceLabel', 'appDirName', 'envPrefix'] as const) {
+      expect(typeof BRAND[field], field).toBe('string')
+      expect(BRAND[field].length, field).toBeGreaterThan(0)
+    }
+    for (const field of ['docsUrl', 'repoUrl', 'installBase'] as const) {
+      expect(typeof BRAND[field], field).toBe('string')
+    }
+    expect(BRAND.scope).toBe(`@${BRAND.binary}`)
+    expect(BRAND.appDirName).toBe(BRAND.binary)
+    expect(BRAND.envPrefix).toBe(BRAND.binary.toUpperCase().replace(/-/g, '_'))
+    expect(BRAND.serviceLabel.endsWith(`.${BRAND.binary}`)).toBe(true)
   })
 
   it('keeps the device-authorization client id wire-frozen as "companion"', () => {
@@ -75,5 +86,17 @@ describe('BRAND', () => {
     const formerName = new RegExp(['deck', 'mate'].join(''), 'i')
     const offenders = srcFiles().filter((rel) => formerName.test(readFileSync(join(srcDir, rel), 'utf8')))
     expect(offenders).toEqual([])
+  })
+})
+
+describe('brand', () => {
+  it('BRAND mirrors brand.json exactly', () => {
+    expect(BRAND).toEqual(brandJson)
+  })
+  it('envVar derives from envPrefix', () => {
+    expect(envVar('RELEASE_BASE')).toBe(`${brandJson.envPrefix}_RELEASE_BASE`)
+  })
+  it('brand.json holds no wire identity', () => {
+    expect(JSON.stringify(brandJson)).not.toContain('client_id')
   })
 })

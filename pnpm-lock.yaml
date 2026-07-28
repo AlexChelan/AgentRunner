@@ -19,9 +19,6 @@ importers:
       '@opencompanion/protocol':
         specifier: workspace:*
         version: link:../packages/protocol
-      conf:
-        specifier: ^15.1.0
-        version: 15.1.0
       picocolors:
         specifier: ^1.1.1
         version: 1.1.1
@@ -45,6 +42,40 @@ importers:
         specifier: 4.1.5
         version: 4.1.5(@opentelemetry/api@1.9.1)(@types/node@25.6.0)(vite@8.1.3(@types/node@25.6.0)(esbuild@0.27.7)(tsx@4.21.0))
 
+  packages/ai-providers:
+    dependencies:
+      '@ai-sdk/anthropic':
+        specifier: ^3.0.82
+        version: 3.0.99(zod@4.4.3)
+      '@ai-sdk/google':
+        specifier: ^3.0.80
+        version: 3.0.98(zod@4.4.3)
+      '@ai-sdk/openai':
+        specifier: ^3.0.69
+        version: 3.0.86(zod@4.4.3)
+      '@ai-sdk/openai-compatible':
+        specifier: ^2.0.48
+        version: 2.0.62(zod@4.4.3)
+      '@opencompanion/core-types':
+        specifier: workspace:*
+        version: link:../core-types
+      '@openrouter/ai-sdk-provider':
+        specifier: ^2.9.0
+        version: 2.10.0(ai@6.0.208(zod@4.4.3))(zod@4.4.3)
+      ai:
+        specifier: 6.0.208
+        version: 6.0.208(zod@4.4.3)
+    devDependencies:
+      '@types/node':
+        specifier: 25.6.0
+        version: 25.6.0
+      typescript:
+        specifier: 6.0.3
+        version: 6.0.3
+      vitest:
+        specifier: 4.1.5
+        version: 4.1.5(@opentelemetry/api@1.9.1)(@types/node@25.6.0)(vite@8.1.3(@types/node@25.6.0)(esbuild@0.27.7)(tsx@4.21.0))
+
   packages/core:
     dependencies:
       '@anthropic-ai/claude-agent-sdk':
@@ -53,6 +84,9 @@ importers:
       '@modelcontextprotocol/sdk':
         specifier: ^1.29.0
         version: 1.29.0(zod@4.4.3)
+      '@opencompanion/ai-providers':
+        specifier: workspace:*
+        version: link:../ai-providers
       '@opencompanion/core-types':
         specifier: workspace:*
         version: link:../core-types
@@ -62,6 +96,9 @@ importers:
       ai:
         specifier: 6.0.208
         version: 6.0.208(zod@4.4.3)
+      conf:
+        specifier: ^15.1.0
+        version: 15.1.0
       cross-spawn:
         specifier: ^7.0.6
         version: 7.0.6
@@ -119,8 +156,32 @@ importers:
 
 packages:
 
+  '@ai-sdk/anthropic@3.0.99':
+    resolution: {integrity: sha512-/q4MW3nfwpIHDhfcPcaW6PF8twF7WhfMWVhKMgmFTwFo8oCoFUebp/+Rt4YVSu1a/rEzm7Ap4sQXhfmmzF5xuw==}
+    engines: {node: '>=18'}
+    peerDependencies:
+      zod: ^3.25.76 || ^4.1.8
+
   '@ai-sdk/gateway@3.0.133':
     resolution: {integrity: sha512-Ebs+7iS9zUgJu5B0RlxM2JmDWzq79Cpd6YdiqcCzB5qFdpfQJPUDiXutqlQP89F2XGjOdDeidulBTXUdXWzOxw==}
+    engines: {node: '>=18'}
+    peerDependencies:
+      zod: ^3.25.76 || ^4.1.8
+
+  '@ai-sdk/google@3.0.98':
+    resolution: {integrity: sha512-TeZdNKvzAq6Rxanu936sJojXSAuap6E5lNvoroXx0uYptVkw7lMgVL+UJkXsIPKJpKqPZdWL85vVXxZANpYE4g==}
+    engines: {node: '>=18'}
+    peerDependencies:
+      zod: ^3.25.76 || ^4.1.8
+
+  '@ai-sdk/openai-compatible@2.0.62':
+    resolution: {integrity: sha512-lRe54zvyIS1a60N8UVhnwKZRI5I+GSV8uhKkPpId+aiKO7z7UgSbNqFmXkBBMD3yc9UrLnQnATV2EQyXNhzEkA==}
+    engines: {node: '>=18'}
+    peerDependencies:
+      zod: ^3.25.76 || ^4.1.8
+
+  '@ai-sdk/openai@3.0.86':
+    resolution: {integrity: sha512-np3jjvNmWVZyBjI02a1fx4TzWVnOaOp3yJAfOJw9dxEAPmvnOhyx22TkFcJ91LqyFuCbGKZKtSBj6ee7ARsiPw==}
     engines: {node: '>=18'}
     peerDependencies:
       zod: ^3.25.76 || ^4.1.8
@@ -131,8 +192,18 @@ packages:
     peerDependencies:
       zod: ^3.25.76 || ^4.1.8
 
+  '@ai-sdk/provider-utils@4.0.40':
+    resolution: {integrity: sha512-OL5IrpUm9Y8Dwy+w/vvFwPotS6m52O9W0op2oXgXdCROMJIBalBI0oro6OIBYkPxvm5Xg02GSkoQN25RlR0bnw==}
+    engines: {node: '>=18'}
+    peerDependencies:
+      zod: ^3.25.76 || ^4.1.8
+
   '@ai-sdk/provider@3.0.10':
     resolution: {integrity: sha512-Q3BZ27qfpYqnCYGvE3vt+Qi6LGOF9R5Nmzn+9JoM1lCRsD9mYaIhfJLkSunN48nfGXJ6n+XNV0J/XVpqGQl7Dw==}
+    engines: {node: '>=18'}
+
+  '@ai-sdk/provider@3.0.14':
+    resolution: {integrity: sha512-5X1k57JBJ4H7H1QjX7CnJYAB1I19r/trVZTMcSms7/kLNZ8RaU4Nt2agcwZzv82Hfx6Q7/TOLU7agAKeFfc8cA==}
     engines: {node: '>=18'}
 
   '@anthropic-ai/claude-agent-sdk-darwin-arm64@0.3.198':
@@ -407,6 +478,13 @@ packages:
     peerDependencies:
       '@emnapi/core': ^1.7.1
       '@emnapi/runtime': ^1.7.1
+
+  '@openrouter/ai-sdk-provider@2.10.0':
+    resolution: {integrity: sha512-FMsAEjLUt5pWuRE2LDC/LCvVrFjLlrEzUITH5+5SZtfq7KZ2wrOHjQVxzz92sju8S9ltpzW87CLW8/b0oBXVCw==}
+    engines: {node: '>=18'}
+    peerDependencies:
+      ai: ^6.0.0
+      zod: ^3.25.0 || ^4.0.0
 
   '@opentelemetry/api@1.9.1':
     resolution: {integrity: sha512-gLyJlPHPZYdAk1JENA9LeHejZe1Ti77/pTeFm/nMXmQH/HFZlcS/O2XJB+L8fkbrNSqhdtlvjBVjxwUYanNH5Q==}
@@ -1578,11 +1656,35 @@ packages:
 
 snapshots:
 
+  '@ai-sdk/anthropic@3.0.99(zod@4.4.3)':
+    dependencies:
+      '@ai-sdk/provider': 3.0.14
+      '@ai-sdk/provider-utils': 4.0.40(zod@4.4.3)
+      zod: 4.4.3
+
   '@ai-sdk/gateway@3.0.133(zod@4.4.3)':
     dependencies:
       '@ai-sdk/provider': 3.0.10
       '@ai-sdk/provider-utils': 4.0.30(zod@4.4.3)
       '@vercel/oidc': 3.2.0
+      zod: 4.4.3
+
+  '@ai-sdk/google@3.0.98(zod@4.4.3)':
+    dependencies:
+      '@ai-sdk/provider': 3.0.14
+      '@ai-sdk/provider-utils': 4.0.40(zod@4.4.3)
+      zod: 4.4.3
+
+  '@ai-sdk/openai-compatible@2.0.62(zod@4.4.3)':
+    dependencies:
+      '@ai-sdk/provider': 3.0.14
+      '@ai-sdk/provider-utils': 4.0.40(zod@4.4.3)
+      zod: 4.4.3
+
+  '@ai-sdk/openai@3.0.86(zod@4.4.3)':
+    dependencies:
+      '@ai-sdk/provider': 3.0.14
+      '@ai-sdk/provider-utils': 4.0.40(zod@4.4.3)
       zod: 4.4.3
 
   '@ai-sdk/provider-utils@4.0.30(zod@4.4.3)':
@@ -1592,7 +1694,18 @@ snapshots:
       eventsource-parser: 3.1.0
       zod: 4.4.3
 
+  '@ai-sdk/provider-utils@4.0.40(zod@4.4.3)':
+    dependencies:
+      '@ai-sdk/provider': 3.0.14
+      '@standard-schema/spec': 1.1.0
+      eventsource-parser: 3.1.0
+      zod: 4.4.3
+
   '@ai-sdk/provider@3.0.10':
+    dependencies:
+      json-schema: 0.4.0
+
+  '@ai-sdk/provider@3.0.14':
     dependencies:
       json-schema: 0.4.0
 
@@ -1796,6 +1909,11 @@ snapshots:
       '@emnapi/runtime': 1.11.1
       '@tybys/wasm-util': 0.10.3
     optional: true
+
+  '@openrouter/ai-sdk-provider@2.10.0(ai@6.0.208(zod@4.4.3))(zod@4.4.3)':
+    dependencies:
+      ai: 6.0.208(zod@4.4.3)
+      zod: 4.4.3
 
   '@opentelemetry/api@1.9.1': {}
 

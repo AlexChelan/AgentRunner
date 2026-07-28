@@ -74,13 +74,14 @@ describe('forwardOverride', () => {
   })
 })
 
-/** A fake `query` async-iterable yielding the supplied SDK messages, capturing options. */
+/** A fake `query` async-iterable yielding the supplied SDK messages, capturing the prompt + options. */
 function fakeQuery(
   messages: unknown[],
-  capture: { options?: unknown }
+  capture: { options?: unknown; prompt?: string | AsyncIterable<unknown> }
 ): ClaudeQuery {
   return ((params: { prompt: string | AsyncIterable<unknown>; options?: unknown }) => {
     capture.options = params.options
+    capture.prompt = params.prompt
     return (async function* () {
       for (const m of messages) yield m
     })()
@@ -127,6 +128,74 @@ describe('claudeDriver', () => {
     const { claudeDriver: cd2 } = makeDrivers({ query: query2 })
     await drain(cd2(claudeParams()))
     expect((capture2.options as { resume?: string }).resume).toBeUndefined()
+  })
+
+  it('passes the prompt as a plain string when no images are attached', async () => {
+    const capture: { prompt?: string | AsyncIterable<unknown> } = {}
+    const query = fakeQuery(
+      [{ type: 'result', subtype: 'success', session_id: 's', usage: { input_tokens: 0, output_tokens: 0 } }],
+      capture
+    )
+    const { claudeDriver } = makeDrivers({ query })
+    await drain(claudeDriver(claudeParams({ prompt: 'plain' })))
+    expect(capture.prompt).toBe('plain')
+  })
+
+  it('sends a streamed user message with base64 image content blocks when images are attached', async () => {
+    const capture: { prompt?: string | AsyncIterable<unknown> } = {}
+    const query = fakeQuery(
+      [{ type: 'result', subtype: 'success', session_id: 's', usage: { input_tokens: 0, output_tokens: 0 } }],
+      capture
+    )
+    const { claudeDriver } = makeDrivers({ query })
+    await drain(
+      claudeDriver(
+        claudeParams({
+          prompt: 'describe this',
+          images: [{ dataUrl: 'data:image/png;base64,QUJD', mediaType: 'image/png' }]
+        })
+      )
+    )
+    // A turn with images passes a one-message async stream (not the plain string), carrying the prompt
+    // text plus one base64 image content block per attachment.
+    expect(typeof capture.prompt).not.toBe('string')
+    const messages: unknown[] = []
+    for await (const message of capture.prompt as AsyncIterable<unknown>) messages.push(message)
+    expect(messages).toEqual([
+      {
+        type: 'user',
+        parent_tool_use_id: null,
+        message: {
+          role: 'user',
+          content: [
+            { type: 'text', text: 'describe this' },
+            { type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'QUJD' } }
+          ]
+        }
+      }
+    ])
+  })
+
+  it('isolates the run from the user personal config (strict MCP + no filesystem settings)', async () => {
+    // A headless chat/schedule run must see ONLY the app-provided MCP servers and Claude Code's
+    // built-ins, never the user's personal MCP servers (dokploy, etc.) or custom settings. The Agent
+    // SDK enforces that with `strictMcpConfig` (ignore ~/.claude + project .mcp.json servers) and
+    // `settingSources: []` (load no user/project settings or CLAUDE.md). Auth is unaffected - neither
+    // option repoints CLAUDE_CONFIG_DIR - so the subscription/BYOK credentials still resolve.
+    const capture: { options?: unknown } = {}
+    const query = fakeQuery(
+      [{ type: 'result', subtype: 'success', session_id: 's', usage: { input_tokens: 0, output_tokens: 0 } }],
+      capture
+    )
+    const { claudeDriver } = makeDrivers({ query })
+    await drain(
+      claudeDriver(
+        claudeParams({ mcpServers: { companion: { type: 'http', url: 'http://127.0.0.1:1/t/mcp' } } })
+      )
+    )
+    const options = capture.options as { strictMcpConfig?: boolean; settingSources?: unknown }
+    expect(options.strictMcpConfig).toBe(true)
+    expect(options.settingSources).toEqual([])
   })
 
   it('passes the BYOK key through the child env as ANTHROPIC_API_KEY', async () => {
@@ -186,6 +255,9 @@ class FakeAppServer extends EventEmitter {
       notifications?: unknown[]
       threadError?: string
       turnError?: string
+      /** `model/list` reply payload; absent answers the generic empty result. */
+      modelList?: unknown
+      modelListError?: string
     } = {}
   ) {
     super()
@@ -242,6 +314,12 @@ class FakeAppServer extends EventEmitter {
       }
       this.push({ jsonrpc: '2.0', id, result: { turn: { id: turnId } } })
       for (const n of this.opts.notifications ?? []) this.push(n as RpcMessage)
+    } else if (method === 'model/list') {
+      if (this.opts.modelListError) {
+        this.push({ jsonrpc: '2.0', id, error: { message: this.opts.modelListError } })
+        return
+      }
+      this.push({ jsonrpc: '2.0', id, result: this.opts.modelList ?? { data: [] } })
     } else if (method === 'turn/interrupt') {
       this.push({ jsonrpc: '2.0', id, result: {} })
       this.push({
@@ -419,6 +497,28 @@ describe('codexDriver', () => {
     expect(callArgs().opts.env?.CODEX_API_KEY).toBe('sk-codex')
   })
 
+  it('points CODEX_HOME at the isolated home when one is supplied (else leaves it unset)', async () => {
+    // A headless run passes an isolated CODEX_HOME so codex loads a config with NO personal MCP
+    // servers; the terminal path passes none and keeps the user's own ~/.codex.
+    const withHome = new FakeAppServer({ notifications: successNotifications() })
+    const spawn1 = fakeSpawn(withHome)
+    await drain(
+      makeDrivers({ spawnFn: spawn1.spawnFn }).codexDriver(
+        cliParams({ binaryPath: '/usr/local/bin/codex', codexHome: '/iso/codex-home' })
+      )
+    )
+    expect(spawn1.callArgs().opts.env?.CODEX_HOME).toBe('/iso/codex-home')
+
+    const noHome = new FakeAppServer({ notifications: successNotifications() })
+    const spawn2 = fakeSpawn(noHome)
+    await drain(
+      makeDrivers({ spawnFn: spawn2.spawnFn }).codexDriver(
+        cliParams({ binaryPath: '/usr/local/bin/codex' })
+      )
+    )
+    expect(spawn2.callArgs().opts.env?.CODEX_HOME).toBeUndefined()
+  })
+
   it('threads MCP servers into -c mcp_servers overrides (auto-approved)', async () => {
     const child = new FakeAppServer({ notifications: successNotifications() })
     const { spawnFn, callArgs } = fakeSpawn(child)
@@ -557,114 +657,182 @@ describe('codexDriver', () => {
 })
 
 /** A minimal fake child process the injected spawnFn returns. */
-class FakeChild extends EventEmitter {
-  stdout: AsyncGenerator<Buffer> | null
-  stderr = new EventEmitter()
-  constructor(stdoutChunks: Buffer[]) {
-    super()
-    this.stdout = (async function* () {
-      for (const c of stdoutChunks) yield c
-    })()
-  }
-}
-
-describe('openCodeDriver abort handling', () => {
+describe('openCodeDriver wiring', () => {
   afterEach(() => {
     vi.restoreAllMocks()
   })
 
-  it('swallows an ABORT_ERR child error (no error message, no unhandled rejection)', async () => {
-    const unhandled = vi.fn()
-    process.once('unhandledRejection', unhandled)
+  /** A child that records the spawn and never answers, so the driver stops after `initialize`. */
+  class SilentAcpChild extends EventEmitter {
+    stdin = { on: (): void => {}, end: (): void => {}, write: (): boolean => true }
+    stdout = new PassThrough()
+    stderr = new EventEmitter()
+    kill(): void {
+      this.stdout.end()
+    }
+  }
 
-    const child = new FakeChild([])
-    const spawnFn = vi.fn(() => child) as unknown as (typeof import('cross-spawn'))['default']
+  it('drives `opencode acp`, not `opencode run` - the prompt never reaches the argv', async () => {
+    const child = new SilentAcpChild()
+    const { spawnFn, callArgs } = fakeSpawn(child)
     const { openCodeDriver } = makeDrivers({ spawnFn })
-
-    const controller = new AbortController()
-    const iterable = openCodeDriver(cliParams({ signal: controller.signal }))
-    const collected: AgenticDriverMessage[] = []
-    const consume = (async () => {
-      for await (const m of iterable) collected.push(m)
-    })()
-
-    // Simulate cross-spawn surfacing the aborted-spawn error.
-    queueMicrotask(() => {
-      controller.abort()
-      child.emit('error', Object.assign(new Error('aborted'), { code: 'ABORT_ERR' }))
-      child.emit('close', null)
-    })
-
+    const consume = drain(openCodeDriver(cliParams({ prompt: 'leak me' })))
+    queueMicrotask(() => child.kill())
     await consume
-    await new Promise((r) => setTimeout(r, 10))
-    process.removeListener('unhandledRejection', unhandled)
-
-    expect(collected.some((m) => m.kind === 'error')).toBe(false)
-    expect(unhandled).not.toHaveBeenCalled()
+    expect(callArgs().args).toEqual(['acp'])
+    expect(callArgs().args).not.toContain('leak me')
   })
 
-  it('surfaces a non-abort child error as an error message', async () => {
-    const child = new FakeChild([])
-    const spawnFn = vi.fn(() => child) as unknown as (typeof import('cross-spawn'))['default']
+  it('spawns inside the run cwd so process-relative ops stay confined', async () => {
+    const child = new SilentAcpChild()
+    const { spawnFn, callArgs } = fakeSpawn(child)
     const { openCodeDriver } = makeDrivers({ spawnFn })
-
-    const iterable = openCodeDriver(cliParams())
-    const collected: AgenticDriverMessage[] = []
-    const consume = (async () => {
-      for await (const m of iterable) collected.push(m)
-    })()
-
-    queueMicrotask(() => {
-      child.emit('error', Object.assign(new Error('spawn ENOENT'), { code: 'ENOENT' }))
-      child.emit('close', 1)
-    })
-
-    await consume
-    expect(collected.some((m) => m.kind === 'error' && m.message.includes('spawn ENOENT'))).toBe(
-      true
-    )
-  })
-
-  it('maps a clean exit (code 0) to done', async () => {
-    const child = new FakeChild([Buffer.from('working')])
-    const spawnFn = vi.fn(() => child) as unknown as (typeof import('cross-spawn'))['default']
-    const { openCodeDriver } = makeDrivers({ spawnFn })
-
-    const iterable = openCodeDriver(cliParams())
-    const collected: AgenticDriverMessage[] = []
-    const consume = (async () => {
-      for await (const m of iterable) collected.push(m)
-    })()
-
-    queueMicrotask(() => {
-      child.emit('close', 0)
-    })
-
-    await consume
-    expect(collected).toContainEqual({ kind: 'text', text: 'working' })
-    expect(collected.at(-1)).toEqual({ kind: 'done' })
-  })
-
-  it('spawns inside the run cwd so process-relative ops stay confined (--dir is only a hint)', async () => {
-    const child = new FakeChild([])
-    const spawnFn = vi.fn(() => child) as unknown as (typeof import('cross-spawn'))['default']
-    const { openCodeDriver } = makeDrivers({ spawnFn })
-
     const runCwd = join(tmpdir(), 'confined-work')
-    const iterable = openCodeDriver(cliParams({ cwd: runCwd }))
-    const consume = (async () => {
-      for await (const _m of iterable) {
-        /* drain */
-      }
-    })()
-
-    queueMicrotask(() => {
-      child.emit('close', 0)
-    })
-
+    const consume = drain(openCodeDriver(cliParams({ cwd: runCwd })))
+    queueMicrotask(() => child.kill())
     await consume
-    expect(spawnFn).toHaveBeenCalledTimes(1)
-    const options = vi.mocked(spawnFn).mock.calls[0][2] as { cwd?: string }
-    expect(options.cwd).toBe(runCwd)
+    expect(callArgs().opts.cwd).toBe(runCwd)
+  })
+
+  it('exposes a session lister that probes with the read-only ACP args', async () => {
+    const child = new SilentAcpChild()
+    const { spawnFn, callArgs } = fakeSpawn(child)
+    const { openCodeSessionLister } = makeDrivers({ spawnFn })
+    const pending = openCodeSessionLister({ binaryPath: '/usr/local/bin/opencode' })
+    queueMicrotask(() => child.emit('error', new Error('spawn ENOENT')))
+    // A probe that cannot even spawn degrades to the empty offer; it must never throw at a caller
+    // that is only filling a model picker.
+    expect(await pending).toEqual({ models: [] })
+    expect(callArgs().args).toEqual(['acp'])
+  })
+})
+
+/** The `model/list` reply shape the real Codex 0.145.0 app-server returns (trimmed to what we read). */
+function modelListReply(): unknown {
+  return {
+    data: [
+      {
+        id: 'gpt-5.6-sol',
+        displayName: 'GPT-5.6-Sol',
+        supportedReasoningEfforts: [
+          { reasoningEffort: 'low', description: 'Fast responses with lighter reasoning' },
+          { reasoningEffort: 'medium', description: 'Balances speed and reasoning depth' },
+          { reasoningEffort: 'high', description: 'Greater reasoning depth' },
+          { reasoningEffort: 'xhigh', description: 'Extra high reasoning depth' },
+          { reasoningEffort: 'max', description: 'Maximum reasoning depth' },
+          { reasoningEffort: 'ultra', description: 'Maximum reasoning with task delegation' }
+        ],
+        defaultReasoningEffort: 'low'
+      },
+      {
+        id: 'gpt-5.5',
+        displayName: 'GPT-5.5',
+        supportedReasoningEfforts: [
+          { reasoningEffort: 'low' },
+          { reasoningEffort: 'medium' },
+          { reasoningEffort: 'high' },
+          { reasoningEffort: 'xhigh' }
+        ],
+        defaultReasoningEffort: 'medium'
+      }
+    ]
+  }
+}
+
+describe('codexModelLister', () => {
+  it('asks the app-server for model/list and returns each model with its advertised efforts', async () => {
+    const child = new FakeAppServer({ modelList: modelListReply() })
+    const { spawnFn } = fakeSpawn(child)
+    const { codexModelLister } = makeDrivers({ spawnFn })
+    const models = await codexModelLister({ binaryPath: '/usr/local/bin/codex' })
+    expect(models).toEqual([
+      {
+        id: 'gpt-5.6-sol',
+        effortLevels: ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'],
+        defaultEffort: 'low'
+      },
+      { id: 'gpt-5.5', effortLevels: ['low', 'medium', 'high', 'xhigh'], defaultEffort: 'medium' }
+    ])
+  })
+
+  it('sends initialize -> initialized -> model/list and starts NO thread or turn', async () => {
+    const child = new FakeAppServer({ modelList: modelListReply() })
+    const { spawnFn } = fakeSpawn(child)
+    const { codexModelLister } = makeDrivers({ spawnFn })
+    await codexModelLister({ binaryPath: '/usr/local/bin/codex' })
+    expect(child.requests.map((r) => r.method)).toEqual(['initialize', 'initialized', 'model/list'])
+  })
+
+  it('degrades to an empty list when the app-server answers with an error', async () => {
+    const child = new FakeAppServer({ modelListError: 'unknown method' })
+    const { spawnFn } = fakeSpawn(child)
+    const { codexModelLister } = makeDrivers({ spawnFn })
+    expect(await codexModelLister({ binaryPath: '/usr/local/bin/codex' })).toEqual([])
+  })
+
+  it('degrades to an empty list when the child dies without answering', async () => {
+    const child = new FakeAppServer()
+    const { spawnFn } = fakeSpawn(child)
+    const { codexModelLister } = makeDrivers({ spawnFn })
+    const pending = codexModelLister({ binaryPath: '/usr/local/bin/codex' })
+    queueMicrotask(() => child.kill())
+    expect(await pending).toEqual([])
+  })
+})
+
+/**
+ * A fake `query` whose `supportedModels()` answers with the SDK's initialize-response models. The
+ * returned object is deliberately NOT iterated by the lister, so the generator here only has to
+ * satisfy the Query surface the lister touches.
+ */
+function fakeModelQuery(
+  models: unknown,
+  capture: { options?: unknown } = {}
+): ClaudeQuery {
+  return ((params: { prompt: unknown; options?: unknown }) => {
+    capture.options = params.options
+    return Object.assign(
+      (async function* () {
+        /* the lister never iterates a model probe */
+      })(),
+      { supportedModels: async () => models }
+    )
+  }) as unknown as ClaudeQuery
+}
+
+describe('claudeModelLister', () => {
+  it('reads the initialize response models and keeps each model supportedEffortLevels', async () => {
+    const query = fakeModelQuery([
+      {
+        value: 'claude-opus-5',
+        displayName: 'Opus 5',
+        description: '',
+        supportsEffort: true,
+        supportedEffortLevels: ['low', 'medium', 'high', 'xhigh', 'max']
+      },
+      { value: 'claude-haiku-4-5', displayName: 'Haiku 4.5', description: '' }
+    ])
+    const { claudeModelLister } = makeDrivers({ query })
+    expect(await claudeModelLister({ binaryPath: '/usr/local/bin/claude' })).toEqual([
+      { id: 'claude-opus-5', effortLevels: ['low', 'medium', 'high', 'xhigh', 'max'] },
+      { id: 'claude-haiku-4-5', effortLevels: [] }
+    ])
+  })
+
+  it('never sends a turn: the prompt is a stream and no filesystem settings are loaded', async () => {
+    const capture: { options?: { settingSources?: unknown; strictMcpConfig?: unknown } } = {}
+    const query = fakeModelQuery([], capture)
+    const { claudeModelLister } = makeDrivers({ query })
+    await claudeModelLister({ binaryPath: '/usr/local/bin/claude' })
+    expect(capture.options?.settingSources).toEqual([])
+    expect(capture.options?.strictMcpConfig).toBe(true)
+  })
+
+  it('degrades to an empty list when the SDK throws', async () => {
+    const query = (() => {
+      throw new Error('claude not signed in')
+    }) as unknown as ClaudeQuery
+    const { claudeModelLister } = makeDrivers({ query })
+    expect(await claudeModelLister({ binaryPath: '/usr/local/bin/claude' })).toEqual([])
   })
 })

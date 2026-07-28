@@ -3,11 +3,12 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { BRAND } from '../src/brand'
 import { startAutoUpdate, type AutoUpdateDeps } from '../src/update/auto-update'
 import type { UpdaterDeps } from '../src/update/updater'
 
-/** The Linux x64 artifact name the fake updater deps resolve to. */
-const ARTIFACT = 'opencompanion-linux-x64.tar.gz'
+/** The Linux x64 artifact name the fake updater deps resolve to (brand-derived, like `artifactName`). */
+const ARTIFACT = `${BRAND.binary}-linux-x64.tar.gz`
 
 /** The sha256 hex of a string, matching how SHA256SUMS lines are generated. */
 function sha256(content: string): string {
@@ -74,10 +75,10 @@ function fakeUpdater(opts: {
     run: async (cmd, args) => {
       if (cmd === 'tar') {
         const dest = args[args.indexOf('-C') + 1]
-        writeFileSync(join(dest, 'opencompanion'), '#!/bin/sh\n')
+        writeFileSync(join(dest, BRAND.binary), '#!/bin/sh\n')
         return { ok: true, stdout: '' }
       }
-      return { ok: true, stdout: `opencompanion ${opts.sanityVersion ?? opts.latest ?? ''}` }
+      return { ok: true, stdout: `${BRAND.binary} ${opts.sanityVersion ?? opts.latest ?? ''}` }
     },
     log: (line) => void logs.push(line)
   }
@@ -232,6 +233,25 @@ describe('startAutoUpdate', () => {
     await vi.advanceTimersByTimeAsync(1_000)
     await flush()
     expect(downloads[ARTIFACT]).toBe(2)
+    loop.stop()
+  })
+
+  it('skips the check silently when no release base is configured (an unpublished companion)', async () => {
+    const install = freshInstall('1.0.0')
+    const shutdown = vi.fn()
+    const { deps, downloads } = fakeUpdater({ installDir: install, latest: '1.1.0' })
+    const loop = startAutoUpdate(
+      autoDeps({ updater: { ...deps, releaseBase: '' }, requestShutdown: shutdown })
+    )
+    await flush()
+    // No release base: it never probes VERSION, stages nothing, and reports no update - just reschedules.
+    expect(downloads.VERSION).toBeUndefined()
+    expect(loop.state()).toEqual({})
+    expect(shutdown).not.toHaveBeenCalled()
+    // The next interval also skips silently rather than attempting a (doomed) fetch.
+    await vi.advanceTimersByTimeAsync(1_000)
+    await flush()
+    expect(downloads.VERSION).toBeUndefined()
     loop.stop()
   })
 

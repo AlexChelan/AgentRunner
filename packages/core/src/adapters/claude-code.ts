@@ -3,16 +3,24 @@ import type { RunContext, RunContextResolvers } from '../context'
 import type { RuntimeRunEvent, RuntimeRunRequest, RuntimeToolAdapter } from '../runtime-types'
 import {
   apiKeyAuthStatus,
+  applyAdvertisedEfforts,
   detectBinary,
+  memoizeAdvertisedModels,
   registryModelsOrFallback,
   runAgenticDriver
 } from './agentic-run'
-import type { ClaudeDriver, CommonAdapterDeps } from './types'
+import type { AdvertisedModelLister, ClaudeDriver, CommonAdapterDeps } from './types'
 
 /** Dependencies for the Claude Code adapter (all injectable for unit tests). */
 export interface ClaudeAdapterDeps extends CommonAdapterDeps {
   /** SDK glue that drives Claude Code for one run. */
   driver: ClaudeDriver
+  /**
+   * Reads the models (and their `supportedEffortLevels`) out of the Agent SDK's initialize
+   * response, so each model's real effort ladder replaces the declared floor. Omitted leaves the
+   * catalog exactly as the registry serves it.
+   */
+  listAdvertisedModels?: AdvertisedModelLister
 }
 
 /** The `claude` binary name + not-installed copy, referenced by both `detect` and the run. */
@@ -28,7 +36,19 @@ const CAPABILITIES: AdapterCapabilities = {
   // sandbox based, platform-dependent, and can hard-fail), so it cannot OS-enforce network-off.
   enforcesNetworkOff: false,
   // The Agent SDK threads http/sse MCP servers natively, so the app-MCP reaches it.
-  httpMcp: true
+  httpMcp: true,
+  // The Agent SDK's `query` takes a streamed user message with base64 image content blocks, so a chat
+  // turn can carry attached photos to Claude Code natively.
+  images: true,
+  // The floor for a machine whose CLI has not answered yet: the SDK's own `EffortLevel` union.
+  // `canDisable` is TRUE because `thinking: { type: 'disabled' }` genuinely turns extended thinking
+  // off - unlike Codex, "off" here is not a lie. Per-model discovery narrows this to the subset a
+  // given model advertises.
+  effort: {
+    supported: true,
+    levels: ['low', 'medium', 'high', 'xhigh', 'max'],
+    canDisable: true
+  }
 }
 
 /**
@@ -37,13 +57,16 @@ const CAPABILITIES: AdapterCapabilities = {
  * the user's own `claude login` (the tool resolves its own auth) and BYOK passes a stored
  * `ANTHROPIC_API_KEY`. Interactive permission requests are forwarded to the UI and
  * answered via the run handle. Binary + key resolve THROUGH the per-run resolvers (no
- * module global), and `req.conversationId` is threaded to the driver as `resume`.
+ * module global), and `req.conversationId` is threaded to the driver as `resume`. `listModels`
+ * serves the registry catalog enriched with the `supportedEffortLevels` the SDK's initialize
+ * response already carries, so the picker offers each model's real ladder rather than a constant.
  *
- * @param deps - The injected driver, binary resolver, key loader, and registry lookup.
+ * @param deps - The injected driver, binary resolver, key loader, registry lookup, and model probe.
  * @returns The Claude Code runtime adapter.
  */
 export function createClaudeCodeAdapter(deps: ClaudeAdapterDeps): RuntimeToolAdapter {
   const detect = (): Promise<DetectResult> => detectBinary(deps, BINARY)
+  const advertisedModels = memoizeAdvertisedModels(deps.listAdvertisedModels)
 
   return {
     id: 'claude-code',
@@ -67,8 +90,12 @@ export function createClaudeCodeAdapter(deps: ClaudeAdapterDeps): RuntimeToolAda
       }
       throw new Error(NOT_INSTALLED)
     },
-    listModels(): Promise<ModelInfo[]> {
-      return registryModelsOrFallback(deps, 'anthropic')
+    async listModels(): Promise<ModelInfo[]> {
+      const [models, advertised] = await Promise.all([
+        registryModelsOrFallback(deps, 'anthropic'),
+        advertisedModels(deps.resolveBinary(BINARY))
+      ])
+      return applyAdvertisedEfforts(models, advertised)
     },
     run(
       req: RuntimeRunRequest,
@@ -93,6 +120,13 @@ export function createClaudeCodeAdapter(deps: ClaudeAdapterDeps): RuntimeToolAda
             systemPrompt: req.systemPrompt,
             effort: req.effort,
             mcpServers: req.mcpServers,
+            // Attached photos ride the turn as native image content blocks; absent on a text-only turn.
+            ...(req.images && req.images.length > 0 ? { images: req.images } : {}),
+            // Paths the run may NOT read (the daemon's own `secrets/`), plus the network posture the
+            // resulting OS sandbox has to reopen for a network-on run. Claude has no cwd confinement
+            // on reads, so without this an unattended run reads any absolute path.
+            ...(req.denyReadPaths ? { denyReadPaths: req.denyReadPaths } : {}),
+            ...(req.network ? { network: req.network } : {}),
             ...(req.conversationId ? { resume: req.conversationId } : {}),
             signal,
             requestPermission

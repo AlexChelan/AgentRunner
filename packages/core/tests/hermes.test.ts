@@ -76,11 +76,126 @@ describe('hermes adapter', () => {
     expect(await makeAdapter({ resolveBinary: () => null }).detect()).toEqual({ installed: false })
   })
 
-  it('lists a single informational "configured model" entry (the agent owns its model)', async () => {
+  it('falls back to a single informational entry when the session advertises no models', async () => {
     const models = await makeAdapter().listModels(subConn)
     expect(models).toEqual([
       { id: 'default', label: "Agent's configured model", source: 'fallback', recommended: true }
     ])
+  })
+
+  it('lists the models the ACP session advertises, flagging the current one', async () => {
+    const models = await makeAdapter({
+      listSession: async () => ({
+        models: [
+          { id: 'openrouter:anthropic/claude-opus-5', name: 'anthropic/claude-opus-5' },
+          { id: 'openrouter:openai/gpt-5.6-sol', name: 'openai/gpt-5.6-sol' }
+        ],
+        currentModelId: 'openrouter:openai/gpt-5.6-sol'
+      })
+    }).listModels(subConn)
+    expect(models).toEqual([
+      {
+        id: 'openrouter:anthropic/claude-opus-5',
+        label: 'anthropic/claude-opus-5',
+        source: 'tool'
+      },
+      {
+        id: 'openrouter:openai/gpt-5.6-sol',
+        label: 'openai/gpt-5.6-sol',
+        source: 'tool',
+        recommended: true
+      }
+    ])
+  })
+
+  it('prefers the stable model config option over the advertised model list', async () => {
+    const models = await makeAdapter({
+      listSession: async () => ({
+        models: [{ id: 'legacy:model', name: 'Legacy' }],
+        modelConfig: {
+          id: 'model',
+          category: 'model',
+          currentValue: 'openrouter:anthropic/claude-opus-5',
+          values: [{ value: 'openrouter:anthropic/claude-opus-5', name: 'Claude Opus 5' }]
+        }
+      })
+    }).listModels(subConn)
+    expect(models).toEqual([
+      {
+        id: 'openrouter:anthropic/claude-opus-5',
+        label: 'Claude Opus 5',
+        source: 'tool',
+        recommended: true
+      }
+    ])
+  })
+
+  it('does not probe the session when the binary is not installed', async () => {
+    const listSession = vi.fn(async () => ({ models: [] }))
+    const models = await makeAdapter({ resolveBinary: () => null, listSession }).listModels(subConn)
+    expect(listSession).not.toHaveBeenCalled()
+    expect(models).toEqual([
+      { id: 'default', label: "Agent's configured model", source: 'fallback', recommended: true }
+    ])
+  })
+
+  it('probes the session once per catalog read and reuses the answer', async () => {
+    const listSession = vi.fn(async () => ({ models: [{ id: 'm', name: 'M' }] }))
+    const adapter = makeAdapter({ listSession })
+    await adapter.listModels(subConn)
+    await adapter.listModels(subConn)
+    expect(listSession).toHaveBeenCalledTimes(1)
+  })
+
+  it('declares NO effort support while the session advertises no thought_level (today’s Hermes)', async () => {
+    const adapter = makeAdapter({ listSession: async () => ({ models: [{ id: 'm', name: 'M' }] }) })
+    const models = await adapter.listModels(subConn)
+    expect(adapter.capabilities.effort).toEqual({ supported: false })
+    expect(models[0]?.effortLevels).toBeUndefined()
+  })
+
+  it('declares the ladder the session advertises as a thought_level option', async () => {
+    const adapter = makeAdapter({
+      listSession: async () => ({
+        models: [{ id: 'm', name: 'M' }],
+        thoughtLevel: {
+          id: 'reasoning_effort',
+          category: 'thought_level',
+          currentValue: 'medium',
+          values: [{ value: 'low' }, { value: 'medium' }, { value: 'high' }]
+        }
+      })
+    })
+    const models = await adapter.listModels(subConn)
+    expect(adapter.capabilities.effort).toEqual({
+      supported: true,
+      levels: ['low', 'medium', 'high'],
+      canDisable: false
+    })
+    // The ladder rides on the model entries too, so it reaches every picker that reads the catalog.
+    expect(models[0]).toMatchObject({
+      effortLevels: ['low', 'medium', 'high'],
+      defaultEffort: 'medium'
+    })
+  })
+
+  it('claims it can disable reasoning only when the advertised ladder carries a disable level', async () => {
+    const adapter = makeAdapter({
+      listSession: async () => ({
+        models: [{ id: 'm', name: 'M' }],
+        thoughtLevel: {
+          id: 'effort',
+          category: 'thought_level',
+          values: [{ value: 'off' }, { value: 'high' }]
+        }
+      })
+    })
+    await adapter.listModels(subConn)
+    expect(adapter.capabilities.effort).toEqual({
+      supported: true,
+      levels: ['off', 'high'],
+      canDisable: true
+    })
   })
 
   it('reports authenticated when the ACP probe finds a usable provider', async () => {
@@ -112,6 +227,26 @@ describe('hermes adapter', () => {
     await expect(makeAdapter({ resolveBinary: () => null }).authStatus(subConn)).rejects.toThrow(
       /not installed/i
     )
+  })
+
+  it('threads the pinned model and effort to the driver (the ACP session decides what it can set)', async () => {
+    let captured: AgenticCliDriverParams | undefined
+    const a = makeAdapter({
+      driver: async function* (params) {
+        captured = params
+        yield { kind: 'done' }
+      }
+    })
+    const sink = collect()
+    a.run(
+      { ...baseReq, modelId: 'openrouter:openai/gpt-5.6-sol', effort: 'high' },
+      ctx,
+      resolvers,
+      sink.emit
+    )
+    await vi.waitFor(() => expect(sink.events.at(-1)?.type).toBe('done'))
+    expect(captured?.model).toBe('openrouter:openai/gpt-5.6-sol')
+    expect(captured?.effort).toBe('high')
   })
 
   it('threads prompt-prefix, mcpServers, resume, network and permissionMode to the driver', async () => {

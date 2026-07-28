@@ -1,20 +1,27 @@
 # OpenCompanion installer for Windows. One command, no npm:
 #
-#   $env:OPENCOMPANION_BACKEND_URL='https://your-saas.example/api'; irm https://github.com/Duzbee/OpenCompanion/releases/latest/download/install.ps1 | iex
+#   $env:OPENCOMPANION_BACKEND_URL='https://your-saas.example/api'; irm https://github.com/AlexChelan/OpenCompanion/releases/latest/download/install.ps1 | iex
 #
 # It downloads the self-contained OpenCompanion daemon for your architecture, verifies it against the
-# release SHA256SUMS, installs it under %LOCALAPPDATA%\OpenCompanion, adds it to your PATH, then runs
+# release SHA256SUMS, installs it under %LOCALAPPDATA%\opencompanion, adds it to your PATH, then runs
 # `opencompanion setup` (pair + connect your CLIs + install the always-on Scheduled Task). Re-run any
 # time to upgrade in place; uninstall with `opencompanion uninstall`.
+#
+# Set OPENCOMPANION_APP_SCOPED=1 (or pass -AppScoped) to install the binary only and SKIP setup - the
+# product app then drives pairing and starts the daemon itself, so no always-on task is installed.
 #
 # Nothing is baked in. No backend URL is embedded: set OPENCOMPANION_BACKEND_URL (or pass -Url when you
 # run a saved copy of this script) to pair with your SaaS at setup time. Point OPENCOMPANION_RELEASE_BASE
 # at a mirror to fetch the daemon elsewhere.
-param([string]$Url = $env:OPENCOMPANION_BACKEND_URL)
+param([string]$Url = $env:OPENCOMPANION_BACKEND_URL, [switch]$AppScoped)
 $ErrorActionPreference = 'Stop'
+# App-scoped is driven by the -AppScoped switch or OPENCOMPANION_APP_SCOPED=1 (the `irm | iex` one-liner
+# cannot pass a switch, so the env var is its channel). The env var is compared to '1' explicitly: a
+# [bool] cast would make ANY non-empty value truthy, so '0' would wrongly mean app-scoped.
+$appScopedMode = $AppScoped.IsPresent -or ($env:OPENCOMPANION_APP_SCOPED -eq '1')
 
-$ReleaseBase = if ($env:OPENCOMPANION_RELEASE_BASE) { $env:OPENCOMPANION_RELEASE_BASE } else { 'https://github.com/Duzbee/OpenCompanion/releases/latest/download' }
-$InstallDir  = if ($env:OPENCOMPANION_HOME)         { $env:OPENCOMPANION_HOME }         else { Join-Path $env:LOCALAPPDATA 'OpenCompanion' }
+$ReleaseBase = if ($env:OPENCOMPANION_RELEASE_BASE) { $env:OPENCOMPANION_RELEASE_BASE } else { 'https://github.com/AlexChelan/OpenCompanion/releases/latest/download' }
+$InstallDir  = if ($env:OPENCOMPANION_HOME)         { $env:OPENCOMPANION_HOME }         else { Join-Path $env:LOCALAPPDATA 'opencompanion' }
 
 function Fail($msg) { Write-Host "error: $msg" -ForegroundColor Red; exit 1 }
 
@@ -114,8 +121,14 @@ endlocal & exit /b %ERRORLEVEL%
     Write-Host "Added $InstallDir to your PATH (restart the terminal to use 'opencompanion' directly)."
   }
 
-  Write-Host "Installed. Running setup..." -ForegroundColor Green
-  if ($Url) { & $exe setup --url $Url } else { & $exe setup }
+  if ($appScopedMode) {
+    # App-scoped: the product app supervises the daemon, so install the binary only and let the app drive
+    # pairing + an app-scoped setup + a plain `serve`. Never install the always-on task from here.
+    Write-Host "Installed. The app will pair and start OpenCompanion for you." -ForegroundColor Green
+  } else {
+    Write-Host "Installed. Running setup..." -ForegroundColor Green
+    if ($Url) { & $exe setup --url $Url } else { & $exe setup }
+  }
 } finally {
   Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue
 }

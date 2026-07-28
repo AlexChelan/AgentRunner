@@ -2,7 +2,11 @@ import { existsSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { BRAND } from '../src/brand'
 import { acquireSingleInstanceLock, DEFAULT_DRAIN_TIMEOUT_MS, drainThenExit, installShutdownHandlers } from '../src/lifecycle'
+
+/** The single-instance lock's PID file name, brand-derived like the daemon writes it. */
+const PID_FILE = `${BRAND.binary}.pid`
 
 /** A fresh temp lock dir under the OS temp root. */
 function dir(): string {
@@ -14,7 +18,7 @@ describe('single-instance lock', () => {
     const d = dir()
     const lock = acquireSingleInstanceLock({ dir: d, isAlive: () => false })
     expect(lock).not.toBeNull()
-    expect(existsSync(join(d, 'opencompanion.pid'))).toBe(true)
+    expect(existsSync(join(d, PID_FILE))).toBe(true)
     lock?.release()
   })
 
@@ -29,7 +33,7 @@ describe('single-instance lock', () => {
 
   it('refuses (without clobbering) when the pidfile already exists with a live holder', () => {
     const d = dir()
-    const pidFile = join(d, 'opencompanion.pid')
+    const pidFile = join(d, PID_FILE)
     writeFileSync(pidFile, '4242', { mode: 0o644 })
     const acquired = acquireSingleInstanceLock({ dir: d, pid: 777, isAlive: (pid) => pid === 4242 })
     expect(acquired).toBeNull()
@@ -40,7 +44,7 @@ describe('single-instance lock', () => {
     const d = dir()
     const first = acquireSingleInstanceLock({ dir: d, isAlive: () => false })
     first?.release()
-    writeFileSync(join(d, 'opencompanion.pid'), '9999', { mode: 0o644 })
+    writeFileSync(join(d, PID_FILE), '9999', { mode: 0o644 })
     const reclaimed = acquireSingleInstanceLock({ dir: d, isAlive: () => false })
     expect(reclaimed).not.toBeNull()
     reclaimed?.release()
@@ -50,7 +54,7 @@ describe('single-instance lock', () => {
     const d = dir()
     const lock = acquireSingleInstanceLock({ dir: d, isAlive: () => false })
     lock?.release()
-    expect(existsSync(join(d, 'opencompanion.pid'))).toBe(false)
+    expect(existsSync(join(d, PID_FILE))).toBe(false)
   })
 })
 

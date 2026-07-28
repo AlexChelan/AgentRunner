@@ -43,6 +43,83 @@ export const NEW_SESSION_RESULT = {
   }
 } as const
 
+/**
+ * A `session/new` result carrying SEVERAL selectable models (shapes copied from the live Hermes
+ * 0.18.2 probe of 2026-07-28, whose `availableModels` really does list 30+ `openrouter:*` entries
+ * with `name` + `description`, one flagged current). Trimmed to three so the assertions stay legible.
+ */
+export const NEW_SESSION_RESULT_MULTI_MODEL = {
+  sessionId: NEW_SESSION_RESULT.sessionId,
+  models: {
+    availableModels: [
+      { modelId: 'openrouter:anthropic/claude-opus-5', name: 'anthropic/claude-opus-5', description: 'current' },
+      { modelId: 'openrouter:openai/gpt-5.6-sol', name: 'openai/gpt-5.6-sol', description: '' },
+      { modelId: 'openrouter:deepseek/deepseek-v4-flash', name: 'deepseek/deepseek-v4-flash', description: 'default' }
+    ],
+    currentModelId: 'openrouter:anthropic/claude-opus-5'
+  },
+  modes: NEW_SESSION_RESULT.modes
+} as const
+
+/**
+ * A `session/new` result with NO model state and NO config options - the shape an ACP agent that
+ * resolves everything from its own config returns. It must decode to exactly the pre-discovery
+ * behaviour: no `session/set_model`, no `session/set_config_option`, no effort ladder.
+ */
+export const NEW_SESSION_RESULT_BARE = {
+  sessionId: NEW_SESSION_RESULT.sessionId,
+  modes: NEW_SESSION_RESULT.modes
+} as const
+
+/**
+ * A `session/new` result advertising the reserved `thought_level` config option (the ACP v1
+ * session-config-options shape: `{ id, name, category, type, currentValue, options: [{value,name}] }`,
+ * as codex-acp and claude-agent-acp emit it). Hermes 0.18.2 advertises NO `configOptions`; this is
+ * the forward-looking shape the driver must handle the moment any agent does.
+ */
+export const NEW_SESSION_RESULT_THOUGHT_LEVEL = {
+  sessionId: NEW_SESSION_RESULT.sessionId,
+  models: NEW_SESSION_RESULT.models,
+  modes: NEW_SESSION_RESULT.modes,
+  configOptions: [
+    {
+      id: 'reasoning_effort',
+      name: 'Reasoning effort',
+      category: 'thought_level',
+      type: 'select',
+      currentValue: 'medium',
+      options: [
+        { value: 'low', name: 'Low' },
+        { value: 'medium', name: 'Medium' },
+        { value: 'high', name: 'High' }
+      ]
+    }
+  ]
+} as const
+
+/**
+ * A `session/new` result advertising BOTH model paths: the stable `category: "model"` config option
+ * and the older `models.availableModels` pair. The client must prefer the stable one.
+ */
+export const NEW_SESSION_RESULT_MODEL_CONFIG = {
+  sessionId: NEW_SESSION_RESULT.sessionId,
+  models: NEW_SESSION_RESULT_MULTI_MODEL.models,
+  modes: NEW_SESSION_RESULT.modes,
+  configOptions: [
+    {
+      id: 'model',
+      name: 'Model',
+      category: 'model',
+      type: 'select',
+      currentValue: 'openrouter:anthropic/claude-opus-5',
+      options: [
+        { value: 'openrouter:anthropic/claude-opus-5', name: 'Claude Opus 5' },
+        { value: 'openrouter:openai/gpt-5.6-sol', name: 'GPT-5.6-Sol' }
+      ]
+    }
+  ]
+} as const
+
 const SESSION_ID = NEW_SESSION_RESULT.sessionId
 
 /** A streamed reasoning chunk. */

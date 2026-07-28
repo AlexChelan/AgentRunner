@@ -15,9 +15,10 @@
 //   dist-standalone/opencompanion-<os>-<arch>/opencompanion[.cmd]          the launcher: `opencompanion serve | pair | connect | service ...`
 //
 // Cross-platform: by default the CURRENT platform's Node (`process.execPath`) is vendored and the
-// artifact is named for `process.platform`/`process.arch`. For a CI cross-build, set
-// OPENCOMPANION_VENDOR_NODE to a downloaded official Node binary for the target, plus OPENCOMPANION_TARGET_OS /
-// OPENCOMPANION_TARGET_ARCH so the launcher type and artifact name match that target.
+// artifact is named for `process.platform`/`process.arch`. For a CI cross-build, set the brand-prefixed
+// env vars (<envPrefix> from brand.json): <envPrefix>_VENDOR_NODE to a downloaded official Node binary for
+// the target, plus <envPrefix>_TARGET_OS / <envPrefix>_TARGET_ARCH so the launcher type and artifact name
+// match that target.
 import { execFileSync } from 'node:child_process'
 import {
   chmodSync,
@@ -34,10 +35,15 @@ import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 const companionDir = dirname(dirname(fileURLToPath(import.meta.url)))
+// Single source of the product identity. This .mjs runs outside the TS build (both in the monorepo
+// and in the exported public repo) so it cannot import src/brand.ts - it reads the same data file.
+const brand = JSON.parse(readFileSync(new URL('../brand.json', import.meta.url), 'utf8'))
+/** Brand-scoped environment variable name, mirroring src/brand.ts's envVar helper (e.g. `TARGET_OS`). */
+const envVar = (suffix) => `${brand.envPrefix}_${suffix}`
 // The per-OS release artifact folder, named for the (optionally cross-build-overridden) target.
-const targetOs = process.env.OPENCOMPANION_TARGET_OS ?? process.platform
-const targetArch = process.env.OPENCOMPANION_TARGET_ARCH ?? process.arch
-const artifactName = `opencompanion-${targetOs}-${targetArch}`
+const targetOs = process.env[envVar('TARGET_OS')] ?? process.platform
+const targetArch = process.env[envVar('TARGET_ARCH')] ?? process.arch
+const artifactName = `${brand.binary}-${targetOs}-${targetArch}`
 const distDir = join(companionDir, 'dist-standalone', artifactName)
 const daemonOut = join(distDir, 'daemon')
 const nodeOut = distDir
@@ -110,17 +116,17 @@ run('npm', ['install', '--omit=optional', '--no-audit', '--no-fund', '--loglevel
 // 4. Vendor the Node runtime for this (or the target) platform.
 const isWin = targetOs === 'win32'
 const vendoredNode = isWin ? 'node.exe' : 'node'
-copyFileSync(process.env.OPENCOMPANION_VENDOR_NODE ?? process.execPath, join(nodeOut, vendoredNode))
+copyFileSync(process.env[envVar('VENDOR_NODE')] ?? process.execPath, join(nodeOut, vendoredNode))
 if (!isWin) chmodSync(join(nodeOut, vendoredNode), 0o755)
 
 // 5. The launcher: `opencompanion <cmd>` runs the vendored node against the bundle.
 if (isWin) {
   writeFileSync(
-    join(distDir, 'opencompanion.cmd'),
+    join(distDir, `${brand.binary}.cmd`),
     '@echo off\r\n"%~dp0node.exe" "%~dp0daemon\\cli.js" %*\r\n'
   )
 } else {
-  const launcher = join(distDir, 'opencompanion')
+  const launcher = join(distDir, brand.binary)
   writeFileSync(
     launcher,
     '#!/bin/sh\nDIR="$(cd "$(dirname "$0")" && pwd)"\nexec "$DIR/node" "$DIR/daemon/cli.js" "$@"\n'
@@ -129,4 +135,4 @@ if (isWin) {
 }
 
 console.log(`[standalone] done -> ${distDir}`)
-console.log(`[standalone]   run: ${join(distDir, isWin ? 'opencompanion.cmd' : 'opencompanion')} serve`)
+console.log(`[standalone]   run: ${join(distDir, isWin ? `${brand.binary}.cmd` : brand.binary)} serve`)

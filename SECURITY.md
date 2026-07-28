@@ -5,10 +5,9 @@ the whole point. We take reports seriously and want to hear about anything that 
 
 ## Reporting a vulnerability
 
-Please report suspected vulnerabilities privately, not in a public issue:
-
-- Open a private advisory via GitHub Security Advisories on this repository, or
-- Email security@generatesaas.com.
+Please report suspected vulnerabilities privately, not in a public issue. Use GitHub's private
+vulnerability reporting on this repository ("Security" tab -> "Report a vulnerability"), which opens a
+private advisory with the maintainers.
 
 Include the version or commit, your platform, and enough detail to reproduce. We aim to acknowledge
 a report within a few business days and will keep you updated as we investigate and fix.

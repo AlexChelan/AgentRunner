@@ -1,11 +1,12 @@
 import { hostname } from 'node:os'
-import { DEFAULT_CLIENT_ID } from '../backend-url'
+import { canonicalizeBackendUrl, DEFAULT_CLIENT_ID, findPairedBackend, findPairedScopes } from '@opencompanion/core/runtime/backend-url'
 import { BRAND } from '../brand'
-import { buildCompanionRegistry, connectTool, type ConnectableToolId } from '../connect'
-import { runPair } from '../pair'
-import { appDataDir, managedCliDir } from '../paths'
+import { buildCompanionRegistry, connectTool, type ConnectableToolId } from '@opencompanion/core/runtime/connect'
+import { isDaemonRunning } from '../lifecycle'
+import { runPair } from '@opencompanion/core/runtime/pair'
+import { appDataDir, managedCliDir } from '@opencompanion/core/runtime/paths'
 import { startDaemon, type Daemon } from '../serve'
-import { createStateStore, type StateStore } from '../storage/state-store'
+import { createStateStore, type StateStore } from '@opencompanion/core/runtime/storage/state-store'
 import * as ui from '../ui'
 import { daemonVersion } from '../version'
 import { buildUpdaterDeps } from './update'
@@ -20,15 +21,15 @@ import { CLI_OPTIONS, flagValue, openStores } from './shared'
  *
  * @param appDataRoot - The app-data root (the managed-CLI base dir lives under it).
  * @param state - The state store (reads existing connections, records the new one).
- * @param backendUrl - The paired backend the connection is recorded under.
+ * @param scope - The paired ACCOUNT SCOPE the connection is recorded under.
  */
 async function ensureCliConnected(
   appDataRoot: string,
   state: StateStore,
-  backendUrl: string
+  scope: string
 ): Promise<void> {
   if (!process.stdin.isTTY) return
-  if (state.listConnections(backendUrl).length > 0) return
+  if (state.listConnections(scope).length > 0) return
   const choice = await ui.p.select<ConnectableToolId | 'skip'>({
     message: 'Connect a coding CLI now?',
     options: [...CLI_OPTIONS, { value: 'skip', label: 'Skip for now', hint: `run '${BRAND.binary} connect' later` }]
@@ -39,7 +40,7 @@ async function ensureCliConnected(
     registry: buildCompanionRegistry(baseDir),
     baseDir,
     state,
-    backendUrl,
+    backendUrl: scope,
     write: ui.line
   })
 }
@@ -47,18 +48,38 @@ async function ensureCliConnected(
 /**
  * Boots the daemon and blocks until a signal drains it, or exits on a failed boot. The daemon installs
  * its own SIGINT/SIGTERM handlers (cancel runs -> close transport -> release lock -> exit), so this
- * resolves only on a failed boot. Under `--if-paired` (a dev/boot run) a failed boot exits 0 so the
- * rest of `pnpm dev` keeps running, where a bare `serve` exits 1.
+ * resolves only on a failed boot.
+ *
+ * `startDaemon` returns null for TWO distinct reasons, and the exit code must tell them apart so a
+ * process supervisor (the product app's runner) does not restart-fight a healthy daemon: a LIVE
+ * daemon already holding the single-instance lock is a GOOD state (exit 0, a clear "already running"
+ * line), while nothing-paired / a corrupt pairing is a real boot failure (exit 1). The live-lock probe
+ * is `isDaemonRunning` - by the time we see null the corrupt-pairing path has already released the lock,
+ * so a held live lock means another instance owns it. Under `--if-paired` (a dev/boot run) any null is a
+ * quiet exit 0 so the rest of `pnpm dev` keeps running.
  *
  * @param daemon - The booted daemon, or `null` when boot failed (the lock is held, or nothing to serve).
  * @param ifPaired - Whether this is the opportunistic `--if-paired` run.
  * @param label - What the success line reports the daemon is serving.
+ * @param appDataRoot - The app-data root holding the single-instance lock (probed to split the null signal).
  */
-async function blockUntilDrained(daemon: Daemon | null, ifPaired: boolean, label: string): Promise<void> {
+async function blockUntilDrained(
+  daemon: Daemon | null,
+  ifPaired: boolean,
+  label: string,
+  appDataRoot: string
+): Promise<void> {
   if (!daemon) {
-    // startDaemon already wrote why it could not boot (another instance holds the lock, or nothing is
-    // paired). Under `--if-paired` exit 0 so the rest of `pnpm dev` keeps running.
+    // startDaemon already wrote why it could not boot. Under `--if-paired` exit 0 so `pnpm dev` runs on.
     if (ifPaired) return
+    // A live daemon already holds the lock: a GOOD state, not a crash. Exit 0 so a supervisor leaves the
+    // running daemon in place instead of reading exit 1 as a crash and restart-fighting the lock.
+    if (isDaemonRunning({ dir: appDataRoot })) {
+      ui.p.log.info(`${BRAND.name} is already running on this machine; leaving it in place.`)
+      process.exit(0)
+      return
+    }
+    // No live daemon: the boot genuinely failed (nothing paired / corrupt pairing). Surface it non-zero.
     ui.p.cancel(`Could not start the ${BRAND.binary} daemon.`)
     process.exit(1)
     return
@@ -98,6 +119,7 @@ export async function cmdServe(argv: string[]): Promise<void> {
   // paired yet - a bare `serve` needs a --url to pair against, since pairing DEFINES a backend URL.
   if (explicitUrl === undefined) {
     if (pairingState.listPairedBackends().length === 0) {
+      // Checked before any store opens: nothing is paired, so there is nothing to serve.
       if (ifPaired) {
         ui.line(idleHint)
         return
@@ -109,7 +131,7 @@ export async function cmdServe(argv: string[]): Promise<void> {
     ui.intro()
     const { appDataRoot, state, secrets } = openStores()
     await blockUntilDrained(
-      startDaemon({
+      await startDaemon({
         appDataRoot,
         state,
         secrets,
@@ -119,32 +141,43 @@ export async function cmdServe(argv: string[]): Promise<void> {
         write: ui.line
       }),
       ifPaired,
-      'all paired backends'
+      'all paired backends',
+      appDataRoot
     )
     return
   }
 
-  // --url <backend>: filter to that one backend, pairing + connecting it on demand.
-  if (ifPaired && !pairingState.getPairedBackend(explicitUrl)) {
+  // --url <backend>: filter to that one backend (every account paired to it), pairing + connecting it
+  // on demand. The paired probe is variant-tolerant AND account-agnostic: a pairing is now stored under
+  // an account scope, so an exact-key lookup on the URL would report a paired machine as unpaired.
+  if (ifPaired && !findPairedBackend(explicitUrl, pairingState)) {
     ui.line(idleHint)
     return
   }
   ui.intro()
   const { appDataRoot, state, secrets } = openStores()
-  if (!state.getPairedBackend(explicitUrl)) {
+  // Resolve the target through the canonicalizer, and look it up variant-tolerantly: a legacy pairing
+  // stored under a raw URL variant still counts as paired (its store re-key happens lock-held inside
+  // startDaemon), so a variant `--url` (case/slash/default-port) never re-pairs or forks a session.
+  const targetUrl = canonicalizeBackendUrl(explicitUrl)
+  if (!findPairedBackend(targetUrl, state)) {
     const clientId = flagValue(argv, '--client-id') ?? DEFAULT_CLIENT_ID
-    const { ok } = await runPair({ backendUrl: explicitUrl, clientId }, { state, secrets, write: ui.line })
+    const { ok } = await runPair({ backendUrl: targetUrl, clientId }, { state, secrets, write: ui.line })
     if (!ok) {
       ui.p.cancel('Pairing failed.')
       process.exit(1)
       return
     }
   }
-  await ensureCliConnected(appDataRoot, state, explicitUrl)
+  // Connect under the ONE account paired to this backend. With two SaaS logins on it there is no single
+  // record to write, and a machine that far along is already set up, so the offer is simply skipped.
+  const paired = findPairedScopes(targetUrl, state)
+  const only = paired.length === 1 ? paired[0] : undefined
+  if (only) await ensureCliConnected(appDataRoot, state, only.scope)
   await blockUntilDrained(
-    startDaemon({
+    await startDaemon({
       appDataRoot,
-      filterUrl: explicitUrl,
+      filterUrl: targetUrl,
       state,
       secrets,
       version: daemonVersion(),
@@ -153,6 +186,7 @@ export async function cmdServe(argv: string[]): Promise<void> {
       write: ui.line
     }),
     ifPaired,
-    explicitUrl
+    targetUrl,
+    appDataRoot
   )
 }

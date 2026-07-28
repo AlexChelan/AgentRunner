@@ -181,6 +181,39 @@ describe('serveToolsOverHttp', () => {
       await handle.close()
     }
   })
+
+  it('survives a CLI that initializes the endpoint more than once per run', async () => {
+    const tools: ToolSet = {
+      record: tool({
+        description: 'records its input',
+        inputSchema: jsonSchema<{ note?: string }>({
+          type: 'object',
+          properties: { note: { type: 'string' } }
+        }),
+        execute: async ({ note }) => `stored:${note ?? ''}`
+      })
+    }
+    const handle = await serveToolsOverHttp(tools)
+    // Two independent MCP clients against the SAME served endpoint each perform their own
+    // `initialize` handshake, reproducing a CLI that initializes more than once per run. A single
+    // stateful transport rejects the second with `-32600 Server already initialized`; the stateless
+    // per-request transport serves both.
+    const first = await mcpServersToTools({ local: handle.spec })
+    const second = await mcpServersToTools({ local: handle.spec })
+    try {
+      expect(Object.keys(first.tools)).toEqual(['record'])
+      expect(Object.keys(second.tools)).toEqual(['record'])
+      const result = await second.tools.record.execute?.(
+        { note: 'again' },
+        { toolCallId: '2', messages: [] }
+      )
+      expect(JSON.stringify(result)).toContain('stored:again')
+    } finally {
+      await first.close()
+      await second.close()
+      await handle.close()
+    }
+  })
 })
 
 describe('shouldServeLocalTools', () => {

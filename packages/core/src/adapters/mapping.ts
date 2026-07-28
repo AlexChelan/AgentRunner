@@ -2,9 +2,9 @@
 // deleted at the end of the Tauri migration); this is now the single canonical copy. It holds the
 // `codexAppServerItemToMessage`/permission/posture/mcp maps; the `mcpToolCall` case below is covered
 // by a test to catch drift.
-import type { McpServerConfig } from '@anthropic-ai/claude-agent-sdk'
-import type { McpServerSpec, PermissionMode, ReasoningEffort, TokenUsage } from '@opencompanion/protocol'
-import type { AgenticDriverMessage } from './types'
+import type { EffortLevel, McpServerConfig } from '@anthropic-ai/claude-agent-sdk'
+import type { McpServerSpec, PermissionMode, TokenUsage } from '@opencompanion/protocol'
+import type { AdvertisedModel, AgenticDriverMessage } from './types'
 
 /** Claude Agent SDK options derived from the abstract permission mode. */
 export interface ClaudePermissionOptions {
@@ -63,6 +63,13 @@ export function codexPosture(mode: PermissionMode): CodexPosture {
  * SDK's {@link McpServerConfig} shapes (stdio/sse/http), preserving the server
  * names. Each entry keeps only the fields its transport defines and drops any
  * that are `undefined`, so a bare stdio spec emits just `type` + `command`.
+ *
+ * A CALLER'S `env` IS NOT A PRIVATE CHANNEL. The mapped config is serialized into the spawned CLI's
+ * ARGV (`claude --mcp-config <json>`; see {@link claudeTerminalArgs}), and a process argv is readable by
+ * any local user on Linux (`/proc/<pid>/cmdline`) for the life of the process. A caller that puts a
+ * CREDENTIAL in `env` therefore exposes it. Pass secrets in the spawned CLI's own ENVIRONMENT instead -
+ * its stdio MCP children inherit it - which is what the companion daemon's `terminal` command does for
+ * the servers a user adds with `mcp add`.
  */
 export function mapMcpServers(
   specs: Record<string, McpServerSpec>
@@ -113,6 +120,10 @@ export type CodexMcpServerConfig =
  * Every entry is tagged `default_tools_approval_mode: 'approve'` so Codex auto-approves
  * the app's tools without an approver present (see {@link CodexToolsApprovalMode}).
  * Entries missing their transport's required field are skipped (never half-formed).
+ *
+ * Like {@link mapMcpServers}, a spec's `env` ends up in the spawned CLI's ARGV (`codex -c
+ * mcp_servers.<name>.env=...`), which is world-readable on Linux, so it must not carry a credential;
+ * pass those in the CLI's own environment.
  *
  * @param specs - Builder/integration MCP servers keyed by server name.
  * @returns The Codex `mcp_servers` config object.
@@ -206,35 +217,61 @@ function summarizeToolInput(input: unknown): { detail?: string } {
 }
 
 /**
- * Claude Agent SDK reasoning controls for an abstract {@link ReasoningEffort}.
+ * Every level the INSTALLED Claude Agent SDK's `EffortLevel` accepts. Annotated with the SDK's own
+ * union rather than inferred, so a level the SDK later drops fails this package's typecheck instead
+ * of reaching the SDK at runtime and failing a buyer's run.
+ */
+const CLAUDE_SDK_EFFORT_LEVELS: readonly EffortLevel[] = ['low', 'medium', 'high', 'xhigh', 'max']
+
+/**
+ * Claude Agent SDK reasoning controls for a requested effort level.
  * `default` leaves the model's native (adaptive) behaviour untouched; `off` disables
- * extended thinking; `low/medium/high` keep adaptive thinking on and pass the named
- * `effort` level to guide depth (per hermes `anthropic_adapter.py`).
+ * extended thinking; a named level keeps adaptive thinking on and passes the `effort`
+ * level to guide depth (per hermes `anthropic_adapter.py`).
  *
- * @param effort - The abstract effort, or `undefined`.
+ * The parameter is a plain string because the level now arrives from DISCOVERY and may be one this
+ * build never shipped a constant for. What is emitted is every level the installed SDK declares -
+ * `low/medium/high/xhigh/max` - so the advertised top of Claude's ladder is now reachable. A level
+ * OUTSIDE that union (Codex advertises `ultra`, hermes `minimal`) is WITHHELD rather than forwarded
+ * verbatim, because the SDK validates this option and a rejected one fails the WHOLE run: the caller
+ * loses the extra depth, not the run. Thinking is still turned on either way, so an unrepresentable
+ * level lands exactly where it landed before.
+ *
+ * @param effort - The requested effort level, or `undefined`.
  * @returns A partial of `{ thinking, effort }` to spread into the SDK `Options`.
  */
-export function claudeReasoningOptions(effort: ReasoningEffort | undefined): {
+export function claudeReasoningOptions(effort: string | undefined): {
   thinking?: { type: 'disabled' } | { type: 'adaptive' }
-  effort?: 'low' | 'medium' | 'high'
+  effort?: EffortLevel
 } {
   if (effort === undefined || effort === 'default') return {}
   if (effort === 'off') return { thinking: { type: 'disabled' } }
-  return { thinking: { type: 'adaptive' }, effort }
+  const level = CLAUDE_SDK_EFFORT_LEVELS.find((candidate) => candidate === effort)
+  return { thinking: { type: 'adaptive' }, ...(level ? { effort: level } : {}) }
 }
 
 /**
- * Codex `modelReasoningEffort` for an abstract {@link ReasoningEffort}, or `undefined`
- * to leave Codex's native default. `low/medium/high` pass through; `off`/`default`
- * leave it unset.
+ * Codex `modelReasoningEffort` for a requested effort level, or `undefined`
+ * to leave Codex's native default. Any advertised level passes through unchanged;
+ * `off`/`default` leave it unset.
  *
- * @param effort - The abstract effort, or `undefined`.
+ * The parameter is a plain string for the same reason as {@link claudeReasoningOptions}, and so is
+ * the RESULT: Codex declares its own `ReasoningEffort` as an open non-empty string, advertised per
+ * model at runtime (`gpt-5.6-sol` offers `ultra`, `gpt-5.5` does not), so re-narrowing to a ladder
+ * this build happens to know would hide the top of every model's range - which is exactly what it
+ * used to do. A level is forwarded verbatim or omitted, never swapped for a neighbour: a
+ * substitution would silently run at a depth the caller did not ask for, while an unadvertised level
+ * fails loudly at Codex with a message naming the level.
+ *
+ * `off` maps to "omit", which makes Codex apply its own `defaultReasoningEffort` - no Codex model
+ * advertises a disable level, so this is unchanged and deliberately not fixed here.
+ *
+ * @param effort - The requested effort level, or `undefined`.
  * @returns The Codex effort, or `undefined`.
  */
-export function codexReasoningEffort(
-  effort: ReasoningEffort | undefined
-): 'low' | 'medium' | 'high' | undefined {
-  return effort === 'low' || effort === 'medium' || effort === 'high' ? effort : undefined
+export function codexReasoningEffort(effort: string | undefined): string | undefined {
+  if (effort === undefined || effort === 'default' || effort === 'off') return undefined
+  return effort.trim().length > 0 ? effort : undefined
 }
 
 /**
@@ -403,6 +440,11 @@ export const CODEX_APP_SERVER_CLIENT_INFO = { name: 'companion', version: '1.0.0
 export interface CodexAppServerArgsInput {
   /** App/integration MCP servers (already mapped via {@link mapCodexMcpServers}). */
   mcpServers?: Record<string, CodexMcpServerConfig>
+  /**
+   * Config overrides defining + selecting the confined permissions profile, from
+   * {@link buildCodexPermissionProfileOverrides}. Empty/absent leaves codex on its stock posture.
+   */
+  permissionProfile?: string[]
 }
 
 /**
@@ -414,10 +456,12 @@ export interface CodexAppServerArgsInput {
  * predictable product toolset, no ~20K-char context bloat); hosted web search is always on
  * (`web_search="live"`, a server-side tool decoupled from sandbox egress); app/integration MCP
  * servers are injected as `-c mcp_servers.*` overrides (auto-approved) so the model gets our tools on
- * top of Codex's coding tools. Sandbox posture, model, reasoning effort, and network egress are set
- * per JSON-RPC request (`thread/start` / `turn/start`), NOT here.
+ * top of Codex's coding tools. Sandbox WRITE posture, model, reasoning effort, and network egress are
+ * set per JSON-RPC request (`thread/start` / `turn/start`), NOT here - but a run's READ confinement
+ * is a config-layer permissions PROFILE, so it must be passed here, at spawn (see
+ * {@link buildCodexPermissionProfileOverrides}).
  *
- * @param input - The app/integration MCP servers to inject (if any).
+ * @param input - The app/integration MCP servers and the confined permissions profile (if any).
  * @returns The `codex` argv (without the binary); the prompt is sent over JSON-RPC.
  */
 export function buildCodexAppServerArgs(input: CodexAppServerArgsInput): string[] {
@@ -429,6 +473,9 @@ export function buildCodexAppServerArgs(input: CodexAppServerArgsInput): string[
     config.mcp_servers = input.mcpServers
   }
   for (const override of serializeCodexConfigOverrides(config)) args.push('-c', override)
+  // The profile's `filesystem` map is keyed by ABSOLUTE PATH, so it is pre-serialized as whole TOML
+  // inline tables rather than walked into dotted `-c` keys like the config above.
+  for (const override of input.permissionProfile ?? []) args.push('-c', override)
   return args
 }
 
@@ -442,6 +489,12 @@ export interface CodexThreadStartParamsInput {
   approvalPolicy: CodexPosture['approvalPolicy']
   /** Model id, or omit for Codex's default. */
   model?: string
+  /**
+   * Whether a confined permissions profile is active for this spawn (from
+   * {@link buildCodexPermissionProfileOverrides}). When true the legacy `sandbox` tier is OMITTED -
+   * see the JSDoc below; the tier is carried by the profile's `extends` instead.
+   */
+  permissionProfileActive?: boolean
 }
 
 /**
@@ -449,7 +502,14 @@ export interface CodexThreadStartParamsInput {
  * the non-interactive approval policy, the sandbox tier, and (optionally) the model. The per-turn
  * `turn/start` refines the sandbox with the network-egress flag.
  *
- * @param input - The cwd, sandbox tier, approval policy, and optional model.
+ * The legacy `sandbox` TIER IS OMITTED when a confined permissions profile is active, and this is
+ * load-bearing, not cosmetic: passing the legacy thread-level `sandbox` makes codex fall back to the
+ * legacy sandbox path and IGNORE the profile outright (`activePermissionProfile: null`), silently
+ * dropping the read-deny that keeps an unattended run out of the daemon's secrets. The profile's
+ * `extends` carries the same tier, and the per-turn `sandboxPolicy` (which coexists with the profile)
+ * still carries the writable roots + egress, so nothing is lost by omitting it.
+ *
+ * @param input - The cwd, sandbox tier, approval policy, optional model, and whether a profile is active.
  * @returns The `thread/start` params object.
  */
 export function buildCodexThreadStartParams(
@@ -458,7 +518,7 @@ export function buildCodexThreadStartParams(
   return {
     cwd: input.cwd,
     approvalPolicy: input.approvalPolicy,
-    sandbox: input.sandboxMode,
+    ...(input.permissionProfileActive ? {} : { sandbox: input.sandboxMode }),
     ...(input.model ? { model: input.model } : {})
   }
 }
@@ -486,8 +546,11 @@ export interface CodexTurnStartParamsInput {
   sandboxMode: CodexPosture['sandboxMode']
   /** Whether the sandbox may reach the network (OS-enforced egress). */
   networkAccessEnabled: boolean
-  /** Reasoning effort, or omit for Codex's native default. */
-  effort?: 'low' | 'medium' | 'high'
+  /**
+   * Reasoning effort from {@link codexReasoningEffort}, or omit for Codex's native default. A plain
+   * string because Codex's own `ReasoningEffort` is an open non-empty string advertised per model.
+   */
+  effort?: string
 }
 
 /**
@@ -516,6 +579,14 @@ export function buildCodexTurnStartParams(
  * `sandboxPolicy` object. `danger-full-access` is unrestricted; `workspace-write` grants the cwd as a
  * writable root; `read-only` grants no writes. `networkAccess` is the OS-enforced egress switch
  * (false blocks the sandbox from the network; hosted web search is unaffected).
+ *
+ * THIS POLICY CONTROLS WRITES AND EGRESS ONLY - IT DOES NOT RESTRICT READS. Codex's `SandboxPolicy`
+ * has no read-narrowing field (`workspaceWrite` carries exactly `writableRoots`, `networkAccess`,
+ * `excludeTmpdirEnvVar`, `excludeSlashTmp`), and BOTH the `workspace-write` and `read-only` tiers
+ * grant full-filesystem READ by design - verified against the app-server's own generated schema and
+ * empirically against `codex sandbox`. Confining a run's reads is therefore done SEPARATELY, by the
+ * permissions profile from {@link buildCodexPermissionProfileOverrides}, which is the only
+ * OS-enforced read-deny codex exposes to a per-spawn caller.
  */
 function toCodexSandboxPolicy(
   sandboxMode: CodexPosture['sandboxMode'],
@@ -527,10 +598,134 @@ function toCodexSandboxPolicy(
   return {
     type: writable ? 'workspaceWrite' : 'readOnly',
     writableRoots: writable ? [cwd] : [],
-    readOnlyAccess: { type: 'fullAccess' },
     networkAccess: networkAccessEnabled,
     excludeTmpdirEnvVar: false,
     excludeSlashTmp: false
+  }
+}
+
+/**
+ * The `[permissions.<id>]` profile the daemon defines and selects for a confined run. A run-scoped id
+ * (not one of codex's built-ins) so it can never collide with a profile the user defined in their own
+ * `~/.codex/config.toml`; the session-flag config layer we pass at spawn wins regardless.
+ */
+const CODEX_CONFINED_PROFILE = 'companion-confined'
+
+/** The codex built-in permission profile each abstract tier extends. */
+const CODEX_PROFILE_BASE: Record<CodexPosture['sandboxMode'], string> = {
+  'read-only': ':read-only',
+  'workspace-write': ':workspace',
+  'danger-full-access': ':danger-full-access'
+}
+
+/** Inputs for {@link buildCodexPermissionProfileOverrides}. */
+export interface CodexPermissionProfileInput {
+  /** Sandbox tier from {@link codexPosture}; selects the built-in profile to extend. */
+  sandboxMode: CodexPosture['sandboxMode']
+  /** Whether the sandbox may reach the network (OS-enforced on the profile too). */
+  networkAccessEnabled: boolean
+  /** Absolute paths whose reads are DENIED to the spawned CLI (the daemon's own secrets dir). */
+  denyReadPaths: string[]
+}
+
+/**
+ * Builds the `-c key=value` config overrides that define and select a codex permissions PROFILE for
+ * one confined spawn. This is the ONLY per-spawn, OS-enforced way to deny a codex run's reads: the
+ * sandbox tiers alone (`workspace-write`, `read-only`) both grant full-filesystem read, so without
+ * this an unattended run can read the daemon's own `secrets/` (its master key + encrypted device
+ * bearer). The profile extends the built-in matching the run's tier, restates the network posture,
+ * and maps each denied path to `"deny"`; seatbelt then refuses the read (`Operation not permitted`)
+ * while the work folder and the CLI's own `~/.codex` stay fully readable.
+ *
+ * The emitted `filesystem` map is rendered as ONE TOML inline table (its keys are absolute paths, so
+ * they must not be flattened into codex's dotted `-c` key path); {@link toCodexTomlValue} quotes them.
+ *
+ * Callers MUST also omit the legacy thread-level `sandbox` mode from `thread/start`
+ * ({@link buildCodexThreadStartParams} does): passing it makes codex ignore the profile entirely
+ * (`activePermissionProfile: null`) and the deny is silently lost. The per-turn `sandboxPolicy` is
+ * unaffected and coexists with the profile.
+ *
+ * @param input - The tier, the network posture, and the paths to deny.
+ * @returns The `key=value` overrides to pass after each `-c`, or `[]` when nothing is denied.
+ */
+export function buildCodexPermissionProfileOverrides(
+  input: CodexPermissionProfileInput
+): string[] {
+  if (input.denyReadPaths.length === 0) return []
+  const key = `permissions.${CODEX_CONFINED_PROFILE}`
+  const filesystem: Record<string, string> = {}
+  for (const path of input.denyReadPaths) filesystem[path] = 'deny'
+  return [
+    `${key}.extends=${toCodexTomlValue(CODEX_PROFILE_BASE[input.sandboxMode], `${key}.extends`)}`,
+    `${key}.network=${toCodexTomlValue({ enabled: input.networkAccessEnabled }, `${key}.network`)}`,
+    `${key}.filesystem=${toCodexTomlValue(filesystem, `${key}.filesystem`)}`,
+    `default_permissions=${toCodexTomlValue(CODEX_CONFINED_PROFILE, 'default_permissions')}`
+  ]
+}
+
+/**
+ * The Claude Agent SDK `settings` object that confines one unattended run's reads, keeping a
+ * prompt-injectable run out of the daemon's own `secrets/`. Two independent controls, each verified
+ * empirically against the real CLI (Claude Code 2.1.207 / agent-sdk 0.3.170):
+ *
+ * - `permissions.deny`, using Claude's absolute-path syntax (a `//`-prefixed path, so the rule for
+ *   `/a/b` is `Read(//a/b/**)`). A single `Read(...)` rule gates ALL of Claude's file-read tools -
+ *   Read, Grep AND Glob - plus the Bash commands Claude statically recognizes as reads (`cat`,
+ *   `grep`, `ls`): Claude routes every file read through the `Read` rule, and it resolves symlinks to
+ *   their real target BEFORE matching, so a symlink planted in the writable cwd cannot reach a denied
+ *   path. Per-tool `Grep(...)`/`Glob(...)` rules are deliberately NOT emitted - they gate a call's
+ *   other arguments, not its file path, so they are no-ops for path confinement (verified: a Grep run
+ *   under a `Grep(...)` path rule still read the file). This control is enforced by the CLI itself, so
+ *   it holds on every platform.
+ * - `sandbox` is the OS backstop for the Bash tool, which the permission rule only catches when it can
+ *   statically see the path: seatbelt (macOS) / bubblewrap (Linux) refuses the read syscall even for
+ *   an obfuscated command. `filesystem.denyRead` carries the denied paths; it does NOT cover the
+ *   Read/Grep/Glob tools (that is the permission rule's job, verified). `autoAllowBashIfSandboxed`
+ *   keeps the UNATTENDED daemon able to act headlessly (no approver to answer a prompt), safe because
+ *   the sandbox bounds the run; `allowUnsandboxedCommands: false` removes the model's
+ *   `dangerouslyDisableSandbox` escape hatch, which otherwise lets an obfuscated Bash read slip past
+ *   the sandbox (verified). The sandbox denies all egress by default, so a `network: 'on'` run reopens
+ *   it with `allowedDomains: ['*']`; a `network: 'off'` run leaves egress shut.
+ *
+ * PLATFORM COVERAGE (disclosed, not silently degraded): the sandbox is OS-enforced on macOS and on
+ * Linux with `bubblewrap`. `failIfUnavailable: false` is set EXPLICITLY so a dispatched run on a
+ * headless Linux host WITHOUT bubblewrap (the companion's primary target) does not hard-error; the
+ * sandbox degrades to a warning there and the Bash read-syscall deny is NOT OS-enforced. The
+ * permission `Read(...)` rules still fully cover the Read/Grep/Glob tools and statically-recognized
+ * Bash reads on that host; only a Bash read the static recognizer does not catch (an obfuscated path,
+ * or a reader like `python`/`dd` it does not classify) is unprotected where the sandbox is absent.
+ *
+ * @param denyReadPaths - Absolute paths whose reads are denied (the daemon's own secrets dir).
+ * @param networkEnabled - Whether the run may reach the network.
+ * @returns The `settings` object, or `undefined` when nothing is denied (leaves the run untouched).
+ */
+export function claudeConfinementSettings(
+  denyReadPaths: string[],
+  networkEnabled: boolean
+): Record<string, unknown> | undefined {
+  if (denyReadPaths.length === 0) return undefined
+  const deny: string[] = []
+  for (const path of denyReadPaths) {
+    // Claude's rule syntax addresses an absolute path with a leading `//`, so a plain `/a/b` must be
+    // written `Read(//a/b)`. Deny the directory itself and everything under it.
+    deny.push(`Read(/${path})`, `Read(/${path}/**)`)
+  }
+  return {
+    permissions: { deny },
+    sandbox: {
+      enabled: true,
+      // Both are load-bearing; see PLATFORM COVERAGE above. `failIfUnavailable: false` keeps a
+      // dispatched run from hard-erroring on a sandbox-less host; `allowUnsandboxedCommands: false`
+      // stops a prompt-injected Bash call from opting out of the sandbox via `dangerouslyDisableSandbox`.
+      failIfUnavailable: false,
+      autoAllowBashIfSandboxed: true,
+      allowUnsandboxedCommands: false,
+      filesystem: { denyRead: [...denyReadPaths] },
+      network: {
+        allowLocalBinding: true,
+        ...(networkEnabled ? { allowedDomains: ['*'] } : {})
+      }
+    }
   }
 }
 
@@ -591,6 +786,43 @@ export function extractCodexThreadId(result: unknown): string | undefined {
     return result.thread.id
   }
   return undefined
+}
+
+/**
+ * Reads the advertised models out of a `model/list` reply: `result.data[]`, each entry carrying
+ * `id`, `supportedReasoningEfforts[].reasoningEffort` and `defaultReasoningEffort`.
+ *
+ * Codex declares its own `ReasoningEffort` as an OPEN string ("a non-empty reasoning effort value
+ * advertised by the model"), and the set really does vary per model - `ultra` on gpt-5.6-sol, absent
+ * on gpt-5.5 - so this preserves whatever the installed CLI names rather than narrowing to a ladder
+ * this build happens to know. Read defensively throughout: the driver talks to whatever `codex` the
+ * buyer has installed, so an unexpected shape degrades to a skipped entry rather than throwing.
+ *
+ * @param result - The `model/list` reply's `result` (untyped JSON-RPC payload).
+ * @returns One entry per advertised model that named an id; `[]` for any unusable payload.
+ */
+export function extractCodexAdvertisedModels(result: unknown): AdvertisedModel[] {
+  if (!isRecord(result) || !Array.isArray(result.data)) return []
+  const models: AdvertisedModel[] = []
+  for (const entry of result.data) {
+    if (!isRecord(entry) || typeof entry.id !== 'string' || entry.id.length === 0) continue
+    const effortLevels: string[] = []
+    if (Array.isArray(entry.supportedReasoningEfforts)) {
+      for (const option of entry.supportedReasoningEfforts) {
+        if (!isRecord(option)) continue
+        const level = typeof option.reasoningEffort === 'string' ? option.reasoningEffort.trim() : ''
+        if (level.length > 0 && !effortLevels.includes(level)) effortLevels.push(level)
+      }
+    }
+    const defaultEffort =
+      typeof entry.defaultReasoningEffort === 'string' ? entry.defaultReasoningEffort.trim() : ''
+    models.push({
+      id: entry.id,
+      effortLevels,
+      ...(defaultEffort.length > 0 ? { defaultEffort } : {})
+    })
+  }
+  return models
 }
 
 /** Reads `result.turn.id` from a `turn/start` reply, or `undefined`. */

@@ -1,5 +1,6 @@
 import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
+import { BRAND } from './brand'
 
 /** Options for {@link acquireSingleInstanceLock}. */
 export interface LockOpts {
@@ -17,8 +18,8 @@ export interface InstanceLock {
   release(): void
 }
 
-/** The single-instance lock's PID file name (under the app-data root). */
-const PID_FILE = 'opencompanion.pid'
+/** The single-instance lock's PID file name (under the app-data root), brand-derived like the log/service names. */
+const PID_FILE = `${BRAND.binary}.pid`
 
 /** Default max ms to await the graceful drain before the process exits anyway. */
 export const DEFAULT_DRAIN_TIMEOUT_MS = 5000
@@ -64,8 +65,15 @@ export function isDaemonRunning(opts: DaemonLivenessOpts): boolean {
 /**
  * Acquires the daemon's single-instance lock via a PID file. Returns an {@link InstanceLock}
  * when this process wins, or `null` when another LIVE instance already holds it. A stale
- * lock (its recorded pid is dead) is reclaimed. This guarantees one daemon per machine, so
- * two companions never fight over the same daemon transport or work folders.
+ * lock (its recorded pid is dead) is reclaimed.
+ *
+ * Scope: one daemon per OS USER, NOT per machine. The PID file lives in the per-OS-user app-data root
+ * ({@link import('@opencompanion/core/runtime/paths').appDataDir}), so two OS users on one PC each hold their OWN lock and each
+ * run their own daemon. That is the correct boundary and the one the work-tree isolation design counts
+ * on: each user's daemon owns a separate app-data root, hence a separate `work/` tree, store, and
+ * secrets, and nothing is shared for two daemons to fight over. Reading it as per-machine would suggest
+ * a cross-user exclusion the PID file cannot provide, and would make the per-user work folders look
+ * redundant when they are exactly what keeps two users' runs apart.
  *
  * @param opts - The lock directory and liveness probe.
  * @returns The held lock, or `null` if another live instance holds it.

@@ -1,0 +1,8 @@
+{
+  "toolId": "claude-code",
+  "status": "failed",
+  "reason": "could not write the connection store",
+  "connections": [
+    { "toolId": "codex", "authHealth": "needs-reauth" }
+  ]
+}

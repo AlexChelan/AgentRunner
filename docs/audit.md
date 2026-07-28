@@ -11,5 +11,3 @@ instructions or code.
 opencompanion log                                        # newest 50 entries, pretty, oldest-first
 opencompanion log --json | jq .                          # raw JSONL for piping
 ```
-
-Full guide: [generatesaas.com/docs/opencompanion/audit](https://generatesaas.com/docs/opencompanion/audit).

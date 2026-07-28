@@ -6,17 +6,23 @@
 export type {
   WebToolManifestEntry,
   RunStart,
-  RunCancel,
+  RunImage,
   ToolResult,
   RunEventMsg,
   RunConversationMsg,
   ToolCall,
   AuthHealth,
   CliConnectionInfo,
+  CliModelInfo,
   ConnectInstruction,
   ConnectResultStatus,
   ConnectResultBody,
+  DisconnectInstruction,
+  DisconnectResultStatus,
+  DisconnectResultBody,
   ConnectResponse,
+  PollResponse,
+  EventsResponse,
   ConnectableToolId
 } from './messages'
 export {
@@ -27,16 +33,26 @@ export {
   McpServerSpecSchema,
   ReasoningEffortSchema,
   RunStartSchema,
-  RunCancelSchema,
+  RunImageSchema,
   ToolResultSchema,
   ToolCallSchema,
   RunConversationMsgSchema,
   AuthHealthSchema,
   CliConnectionInfoSchema,
+  CliModelInfoSchema,
+  MAX_REPORTED_CLI_CONNECTIONS,
+  toConnectionStatus,
+  MAX_REPORTED_CLI_MODELS,
   ConnectInstructionSchema,
   ConnectResultStatusSchema,
   ConnectResultBodySchema,
-  ConnectResponseSchema
+  DisconnectInstructionSchema,
+  DisconnectResultStatusSchema,
+  DisconnectResultBodySchema,
+  ConnectResponseSchema,
+  PollResponseSchema,
+  EventsResponseSchema,
+  RunEventEnvelopeSchema
 } from './messages'
 export type { McpServerSpec, PermissionMode, ReasoningEffort, RunEvent, TokenUsage } from './vocab'
 export { REASONING_EFFORTS, isReasoningEffort } from './vocab'

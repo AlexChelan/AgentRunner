@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import type { BackendSession } from '../src/backend-session'
+import type { BackendSession } from '@opencompanion/core/runtime/backend-session'
 import { createSessionSupervisor } from '../src/supervisor'
 
 /** A fake {@link BackendSession} that records its start/stop calls and reports a settable run count. */
@@ -63,7 +63,7 @@ describe('createSessionSupervisor', () => {
     const urls = ['https://a.example', 'https://b.example']
     const factory = fakeFactory()
     const supervisor = createSessionSupervisor({
-      listBackendUrls: () => [...urls],
+      listScopes: () => [...urls],
       makeSession: factory.makeSession,
       setTimer: setInterval,
       clearTimer: clearInterval
@@ -78,7 +78,7 @@ describe('createSessionSupervisor', () => {
     const urls = ['https://a.example', 'https://b.example']
     const factory = fakeFactory()
     const supervisor = createSessionSupervisor({
-      listBackendUrls: () => [...urls],
+      listScopes: () => [...urls],
       makeSession: factory.makeSession,
       setTimer: setInterval,
       clearTimer: clearInterval
@@ -95,7 +95,7 @@ describe('createSessionSupervisor', () => {
     const urls = ['https://a.example']
     const factory = fakeFactory()
     const supervisor = createSessionSupervisor({
-      listBackendUrls: () => [...urls],
+      listScopes: () => [...urls],
       makeSession: factory.makeSession,
       intervalMs: 1000,
       setTimer: setInterval,
@@ -114,7 +114,7 @@ describe('createSessionSupervisor', () => {
     const urls = ['https://a.example', 'https://b.example']
     const factory = fakeFactory()
     const supervisor = createSessionSupervisor({
-      listBackendUrls: () => [...urls],
+      listScopes: () => [...urls],
       makeSession: factory.makeSession,
       setTimer: setInterval,
       clearTimer: clearInterval
@@ -133,7 +133,7 @@ describe('createSessionSupervisor', () => {
     const factory = fakeFactory()
     factory.nullFor.add('https://corrupt.example')
     const supervisor = createSessionSupervisor({
-      listBackendUrls: () => [...urls],
+      listScopes: () => [...urls],
       makeSession: factory.makeSession,
       setTimer: setInterval,
       clearTimer: clearInterval
@@ -158,7 +158,7 @@ describe('createSessionSupervisor', () => {
     factory.throwStartFor.add('https://boom.example')
     const lines: string[] = []
     const supervisor = createSessionSupervisor({
-      listBackendUrls: () => [...urls],
+      listScopes: () => [...urls],
       makeSession: factory.makeSession,
       write: (line) => void lines.push(line),
       setTimer: setInterval,
@@ -180,7 +180,7 @@ describe('createSessionSupervisor', () => {
   it('a filter restricts serving to exactly that one backend', () => {
     const factory = fakeFactory()
     const supervisor = createSessionSupervisor({
-      listBackendUrls: () => ['https://a.example', 'https://b.example', 'https://c.example'],
+      listScopes: () => ['https://a.example', 'https://b.example', 'https://c.example'],
       makeSession: factory.makeSession,
       filter: 'https://b.example',
       setTimer: setInterval,
@@ -190,11 +190,30 @@ describe('createSessionSupervisor', () => {
     expect(supervisor.running()).toEqual(['https://b.example'])
   })
 
+  it('a filter serves EVERY account paired to that backend, not just one', () => {
+    // `serve --url` pins a BACKEND. With two SaaS logins on it, serving only one would leave the other
+    // account's dispatched runs unclaimed forever, with nothing saying why.
+    const factory = fakeFactory()
+    const supervisor = createSessionSupervisor({
+      listScopes: () => [
+        'https://b.example|user-a',
+        'https://b.example|user-b',
+        'https://a.example|user-a'
+      ],
+      makeSession: factory.makeSession,
+      filter: 'https://b.example',
+      setTimer: setInterval,
+      clearTimer: clearInterval
+    })
+    supervisor.reconcile()
+    expect(supervisor.running().sort()).toEqual(['https://b.example|user-a', 'https://b.example|user-b'])
+  })
+
   it('a filter that is unpaired serves nothing and writes one error line', () => {
     const factory = fakeFactory()
     const lines: string[] = []
     const supervisor = createSessionSupervisor({
-      listBackendUrls: () => ['https://a.example'],
+      listScopes: () => ['https://a.example'],
       makeSession: factory.makeSession,
       filter: 'https://absent.example',
       write: (line) => void lines.push(line),
@@ -214,7 +233,7 @@ describe('createSessionSupervisor', () => {
     const urls = ['https://a.example']
     let throwNow = false
     const supervisor = createSessionSupervisor({
-      listBackendUrls: () => {
+      listScopes: () => {
         if (throwNow) throw new Error('store read boom')
         return [...urls]
       },
@@ -244,7 +263,7 @@ describe('createSessionSupervisor', () => {
     const urls = ['https://a.example', 'https://b.example']
     const factory = fakeFactory()
     const supervisor = createSessionSupervisor({
-      listBackendUrls: () => [...urls],
+      listScopes: () => [...urls],
       makeSession: factory.makeSession,
       intervalMs: 1000,
       setTimer: setInterval,
