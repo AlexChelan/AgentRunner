@@ -1,5 +1,5 @@
 import { messageOf } from '@opencompanion/core/runtime/error-message'
-import type { UpdateState } from '@opencompanion/core/runtime/poll-client'
+import type { UpdateState } from '@opencompanion/core/runtime/stream-client'
 import { checkLatest, flipCurrent, hasReleaseBase, pruneVersions, stageVersion, type UpdaterDeps } from './updater'
 
 /** The default full-check cadence (ms): every six hours. */

@@ -455,7 +455,12 @@ describe('runPairWithToken (non-interactive pairing with a pre-authorized bearer
 
   it('verifies the bearer against the session endpoint then stores it on a valid session', async () => {
     const h = harness()
-    const fetchFn = vi.fn(async () => res(true, 200, { session: { id: 's1' }, user: { id: 'u1' } }))
+    // Typed from the REAL `FetchFn`, so `mock.calls` carries the url + init the assertions below read.
+    // An untyped `vi.fn` declares no parameters, and indexing its calls is a type error rather than a
+    // check of anything.
+    const fetchFn = vi.fn<FetchFn>(async () =>
+      res(true, 200, { session: { id: 's1' }, user: { id: 'u1' } })
+    )
     const result = await runPairWithToken(
       { backendUrl: BACKEND, token: 'PRE_AUTH_BEARER' },
       { state: h.state, secrets: h.secrets, fetchFn, write: h.write }
@@ -517,7 +522,7 @@ describe('runPairWithToken (non-interactive pairing with a pre-authorized bearer
     const VARIANT = 'https://Buyer.Example:443/api/'
     const CANONICAL = 'https://buyer.example/api'
     const canonicalScope = accountScope(CANONICAL, USER)
-    const fetchFn = vi.fn(async () => res(true, 200, { user: { id: USER } }))
+    const fetchFn = vi.fn<FetchFn>(async () => res(true, 200, { user: { id: USER } }))
     const result = await runPairWithToken(
       { backendUrl: VARIANT, token: 'VARIANT_BEARER' },
       { state: h.state, secrets: h.secrets, fetchFn, write: h.write }

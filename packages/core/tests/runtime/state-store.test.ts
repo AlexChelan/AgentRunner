@@ -1,7 +1,8 @@
-import { existsSync, mkdtempSync, statSync } from 'node:fs'
+import { existsSync, mkdtempSync, readFileSync, statSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { describe, expect, it } from 'vitest'
+import type { PermissionMode } from '@opencompanion/protocol'
 import { brand } from '../../src/runtime/brand'
 import { LOCAL_SCOPE } from '../../src/runtime/local/scope'
 import { createStateStore } from '../../src/runtime/storage/state-store'
@@ -12,6 +13,27 @@ function freshDir(): string {
 }
 
 const BACKEND = 'https://buyer.example'
+
+/**
+ * Writes a ceiling the RETIRED `policy set` command left on disk, the way an upgrading install has one:
+ * straight into the document, under a key this build never writes.
+ *
+ * @param dir - The app-data dir the store lives in.
+ * @param scope - The scope the ceiling was stored under.
+ * @param permissionMode - The rung the user chose.
+ * @param network - The egress half the user chose (defaults to the permissive `on`).
+ */
+function seedRetiredCeiling(
+  dir: string,
+  scope: string,
+  permissionMode: PermissionMode,
+  network: 'on' | 'off' = 'on'
+): void {
+  const file = join(dir, `${brand().binary}-state.json`)
+  const document = existsSync(file) ? JSON.parse(readFileSync(file, 'utf8')) : {}
+  document.policyCeilings = { ...document.policyCeilings, [scope]: { permissionMode, network } }
+  writeFileSync(file, JSON.stringify(document))
+}
 
 describe('state store', () => {
   it('generates a stable device id once and reuses it', () => {
@@ -81,34 +103,6 @@ describe('state store', () => {
     expect(createStateStore({ cwd: dir }).getConnection(BACKEND, 'codex')).toBeNull()
   })
 
-  it('returns the full stock-parity default ceiling when unset (auto-edit + network on)', () => {
-    const store = createStateStore({ cwd: freshDir() })
-    expect(store.getPolicyCeiling(BACKEND)).toEqual({
-      permissionMode: 'auto-edit',
-      network: 'on'
-    })
-  })
-
-  it('sets and reads back a policy ceiling for a paired backend (a fresh read sees it)', () => {
-    const dir = freshDir()
-    const store = createStateStore({ cwd: dir })
-    store.upsertPairedBackend(BACKEND, { backendUrl: BACKEND, deviceId: 'd1', userId: 'u1' })
-    store.setPolicyCeiling(BACKEND, { permissionMode: 'full', network: 'on' })
-    expect(store.getPolicyCeiling(BACKEND)).toEqual({ permissionMode: 'full', network: 'on' })
-    // A fresh store re-reads the file, so the daemon's per-call fresh read picks up the new ceiling.
-    expect(createStateStore({ cwd: dir }).getPolicyCeiling(BACKEND)).toEqual({
-      permissionMode: 'full',
-      network: 'on'
-    })
-  })
-
-  it('refuses to set a policy ceiling for a backend that is not paired', () => {
-    const store = createStateStore({ cwd: freshDir() })
-    expect(() =>
-      store.setPolicyCeiling('https://unpaired.example', { permissionMode: 'full', network: 'on' })
-    ).toThrow()
-  })
-
   it('returns the allow-all default origin policy when unset (deny lives in the backend grant)', () => {
     const store = createStateStore({ cwd: freshDir() })
     expect(store.getOriginPolicy(BACKEND)).toEqual({ denySchedule: false, denyDispatch: false })
@@ -155,58 +149,86 @@ describe('state store', () => {
     expect(store.getOriginPolicy(BACKEND)).toEqual({ denySchedule: false, denyDispatch: true })
   })
 
-  it('grants no folder by default (the terminal stays in its confined work folder)', () => {
-    expect(createStateStore({ cwd: freshDir() }).listGrantedFolders(BACKEND)).toEqual([])
+  // The terminal approval setting is the ONE permission a user still owns, and a terminal session is
+  // their own CLI running with inherited stdio in a folder they named. Every case below is a posture a
+  // silent change would cost them.
+  it('defaults terminal approvals per scope: prompts kept when paired, bypassed on the local scope', () => {
+    const store = createStateStore({ cwd: freshDir() })
+    expect(store.getTerminalApproval(BACKEND)).toBe('prompt')
+    expect(store.getTerminalApproval(LOCAL_SCOPE)).toBe('bypass')
   })
 
-  it('adds, lists, and removes a granted folder (a fresh read sees it)', () => {
+  it('persists a chosen terminal approval across store instances (a session reads a fresh store)', () => {
     const dir = freshDir()
+    createStateStore({ cwd: dir }).setTerminalApproval(LOCAL_SCOPE, 'prompt')
+    expect(createStateStore({ cwd: dir }).getTerminalApproval(LOCAL_SCOPE)).toBe('prompt')
+  })
+
+  // THE UPGRADE REGRESSION. Auto-update is on by default, so a user who had turned their CLI's approval
+  // prompts back on with the retired `policy set --permission-mode` must not wake up to a daemon that
+  // spawns their CLI with the prompts off and nothing to say so.
+  it('honors a ceiling the retired `policy` command stored, so an upgrade cannot drop the prompts', () => {
+    const dir = freshDir()
+    seedRetiredCeiling(dir, LOCAL_SCOPE, 'auto-edit')
+    // Without the fallback this scope would take its `bypass` default and the prompts would be gone.
+    expect(createStateStore({ cwd: dir }).getTerminalApproval(LOCAL_SCOPE)).toBe('prompt')
+  })
+
+  it('reads a retired `full` ceiling as the bypass the user chose', () => {
+    const dir = freshDir()
+    seedRetiredCeiling(dir, LOCAL_SCOPE, 'full')
+    expect(createStateStore({ cwd: dir }).getTerminalApproval(LOCAL_SCOPE)).toBe('bypass')
+  })
+
+  it('lets a choice made on this build override the retired ceiling', () => {
+    const dir = freshDir()
+    seedRetiredCeiling(dir, LOCAL_SCOPE, 'auto-edit')
+    createStateStore({ cwd: dir }).setTerminalApproval(LOCAL_SCOPE, 'bypass')
+    expect(createStateStore({ cwd: dir }).getTerminalApproval(LOCAL_SCOPE)).toBe('bypass')
+  })
+
+  // THE OTHER HALF OF THE SAME RETIRED RECORD. The permission half survives (as the approval above, and
+  // as a structural floor no stored value could have been stricter than); the EGRESS half does not, and
+  // this build has no setting that could carry it. A user who denied egress must therefore be TOLD,
+  // which they can only be if the store can still answer that they denied it.
+  it('reports a retired egress denial, so an upgrade cannot drop it without saying so', () => {
+    const dir = freshDir()
+    seedRetiredCeiling(dir, BACKEND, 'read-only', 'off')
+    expect(createStateStore({ cwd: dir }).hasRetiredEgressDenial(BACKEND)).toBe(true)
+  })
+
+  it('reports no egress denial for a retired ceiling that permitted egress', () => {
+    const dir = freshDir()
+    seedRetiredCeiling(dir, BACKEND, 'read-only', 'on')
+    expect(createStateStore({ cwd: dir }).hasRetiredEgressDenial(BACKEND)).toBe(false)
+  })
+
+  it('reports no egress denial for a scope that never carried a ceiling', () => {
+    expect(createStateStore({ cwd: freshDir() }).hasRetiredEgressDenial(BACKEND)).toBe(false)
+  })
+
+  it('forgets a retired egress denial with the pairing it belonged to', () => {
+    const dir = freshDir()
+    seedRetiredCeiling(dir, BACKEND, 'read-only', 'off')
     const store = createStateStore({ cwd: dir })
     store.upsertPairedBackend(BACKEND, { backendUrl: BACKEND, deviceId: 'd1', userId: 'u1' })
-    expect(store.addGrantedFolder(BACKEND, '/Users/dev/acme')).toBe(true)
-    // The same folder twice is not a second grant.
-    expect(store.addGrantedFolder(BACKEND, '/Users/dev/acme')).toBe(false)
-    // A fresh store re-reads the file, so a `terminal` session started after the grant sees it.
-    expect(createStateStore({ cwd: dir }).listGrantedFolders(BACKEND)).toEqual(['/Users/dev/acme'])
-    expect(store.removeGrantedFolder(BACKEND, '/Users/dev/acme')).toBe(true)
-    expect(store.removeGrantedFolder(BACKEND, '/Users/dev/acme')).toBe(false)
-    expect(createStateStore({ cwd: dir }).listGrantedFolders(BACKEND)).toEqual([])
-  })
-
-  it('keeps grants PER BACKEND (granting one backend a folder never grants another)', () => {
-    const store = createStateStore({ cwd: freshDir() })
-    const other = 'https://other.example'
-    store.upsertPairedBackend(BACKEND, { backendUrl: BACKEND, deviceId: 'd1', userId: 'u1' })
-    store.upsertPairedBackend(other, { backendUrl: other, deviceId: 'd2', userId: 'u1' })
-    store.addGrantedFolder(BACKEND, '/Users/dev/acme')
-    expect(store.listGrantedFolders(other)).toEqual([])
-  })
-
-  it('refuses to grant a folder to a backend that is not paired', () => {
-    const store = createStateStore({ cwd: freshDir() })
-    expect(() => store.addGrantedFolder('https://unpaired.example', '/Users/dev/acme')).toThrow()
-  })
-
-  it('clears a backend granted folders when the backend is removed', () => {
-    const store = createStateStore({ cwd: freshDir() })
-    store.upsertPairedBackend(BACKEND, { backendUrl: BACKEND, deviceId: 'd1', userId: 'u1' })
-    store.addGrantedFolder(BACKEND, '/Users/dev/acme')
     store.removePairedBackend(BACKEND)
-    // Unpairing leaves no grant a re-pair could silently inherit.
-    expect(store.listGrantedFolders(BACKEND)).toEqual([])
+    expect(createStateStore({ cwd: dir }).hasRetiredEgressDenial(BACKEND)).toBe(false)
   })
 
-  it('carries granted folders through a pairing-substrate snapshot/replace round-trip (migration-safe)', () => {
-    const dir = freshDir()
-    const store = createStateStore({ cwd: dir })
+  it('refuses to set terminal approvals for a backend that is not paired', () => {
+    const store = createStateStore({ cwd: freshDir() })
+    expect(() => store.setTerminalApproval('https://unpaired.example', 'bypass')).toThrow()
+  })
+
+  it('carries terminal approvals through a pairing-substrate snapshot/replace round-trip (migration-safe)', () => {
+    const store = createStateStore({ cwd: freshDir() })
     store.upsertPairedBackend(BACKEND, { backendUrl: BACKEND, deviceId: 'd1', userId: 'u1' })
-    store.addGrantedFolder(BACKEND, '/Users/dev/acme')
+    store.setTerminalApproval(BACKEND, 'bypass')
     const snapshot = store.snapshotPairingState()
-    expect(snapshot.grantedFolders[BACKEND]).toEqual(['/Users/dev/acme'])
-    // Re-persisting the snapshot (what the canonicalization migration does) keeps the grant: a grant
-    // left behind on a raw key would silently refuse every `--cwd` the user had already allowed.
+    expect(snapshot.terminalApprovals[BACKEND]).toBe('bypass')
     store.replacePairingState(snapshot)
-    expect(store.listGrantedFolders(BACKEND)).toEqual(['/Users/dev/acme'])
+    expect(store.getTerminalApproval(BACKEND)).toBe('bypass')
   })
 
   it('defaults auto-update to on when unset', () => {
@@ -265,10 +287,9 @@ describe('state store', () => {
     store.replacePairingState({
       backends: {},
       connections: {},
-      policyCeilings: {},
       originPolicies: {},
-      mcpServers: {},
-      grantedFolders: {}
+      terminalApprovals: {},
+      mcpServers: {}
     })
     expect(store.getAppScoped()).toBe(true)
     expect(createStateStore({ cwd: dir }).getAppScoped()).toBe(true)
@@ -278,18 +299,17 @@ describe('state store', () => {
     const store = createStateStore({ cwd: freshDir() })
     store.upsertPairedBackend(BACKEND, { backendUrl: BACKEND, deviceId: 'd1', userId: 'u1' })
     store.upsertConnection(BACKEND, { toolId: 'codex', source: 'reused', authHealth: 'healthy' })
-    store.setPolicyCeiling(BACKEND, { permissionMode: 'read-only', network: 'off' })
     store.setOriginPolicy(BACKEND, { denySchedule: true, denyDispatch: true })
+    store.setTerminalApproval(BACKEND, 'bypass')
     store.upsertMcpServer(BACKEND, 'linear', { type: 'stdio', command: 'linear-mcp' })
-    store.addGrantedFolder(BACKEND, '/Users/dev/acme')
     store.removePairedBackend(BACKEND)
     expect(store.getPairedBackend(BACKEND)).toBeNull()
     expect(store.listConnections(BACKEND)).toHaveLength(0)
-    expect(store.listGrantedFolders(BACKEND)).toEqual([])
-    // Unpairing must leave NO residue a re-pair could inherit: the ceiling and origin policy fall back
-    // to their defaults, and the user's local MCP servers for that backend are gone.
-    expect(store.getPolicyCeiling(BACKEND)).toEqual({ permissionMode: 'auto-edit', network: 'on' })
+    // Unpairing must leave NO residue a re-pair could inherit: the origin policy and the terminal
+    // approvals fall back to their defaults, and the user's local MCP servers for that backend are gone.
+    // A stale `bypass` here would silently spawn the NEXT pairing's sessions with the prompts off.
     expect(store.getOriginPolicy(BACKEND)).toEqual({ denySchedule: false, denyDispatch: false })
+    expect(store.getTerminalApproval(BACKEND)).toBe('prompt')
     expect(store.listMcpServers(BACKEND)).toEqual({})
   })
 
@@ -339,42 +359,24 @@ describe('state store', () => {
     ).toThrow()
   })
 
-  it('allows the four per-backend writes under the local pseudo-scope with no pairing', () => {
+  it('allows the per-backend writes under the local pseudo-scope with no pairing', () => {
     const store = createStateStore({ cwd: freshDir() })
-    // LOCAL mode has no paired backend, yet the local user still configures policy, MCP servers, and
-    // folder grants for their purely-local sessions - so the integrity guard makes an exception for
-    // this ONE key. Every read then sees exactly what was written under the local scope.
-    store.setPolicyCeiling(LOCAL_SCOPE, { permissionMode: 'read-only', network: 'off' })
+    // LOCAL mode has no paired backend, yet the local user still configures an origin policy and MCP
+    // servers for their purely-local sessions - so the integrity guard makes an exception for this ONE
+    // key. Every read then sees exactly what was written under the local scope.
     store.setOriginPolicy(LOCAL_SCOPE, { denySchedule: true, denyDispatch: false })
     store.upsertMcpServer(LOCAL_SCOPE, 'linear', { type: 'stdio', command: 'linear-mcp' })
-    expect(store.addGrantedFolder(LOCAL_SCOPE, '/Users/dev/acme')).toBe(true)
-    expect(store.getPolicyCeiling(LOCAL_SCOPE)).toEqual({ permissionMode: 'read-only', network: 'off' })
     expect(store.getOriginPolicy(LOCAL_SCOPE)).toEqual({ denySchedule: true, denyDispatch: false })
     expect(store.listMcpServers(LOCAL_SCOPE)).toEqual({ linear: { type: 'stdio', command: 'linear-mcp' } })
-    expect(store.listGrantedFolders(LOCAL_SCOPE)).toEqual(['/Users/dev/acme'])
   })
 
-  it('defaults the LOCAL scope ceiling to `full` (bypass) but keeps paired backends at the cautious default', () => {
-    const store = createStateStore({ cwd: freshDir() })
-    // The desktop's own machine bypasses approval prompts by default (the user is present / owns the CLI);
-    // a paired REMOTE backend keeps the cautious unattended default so its dispatched runs are never silently
-    // bypassed. Both are only defaults - an explicit `setPolicyCeiling` still wins.
-    expect(store.getPolicyCeiling(LOCAL_SCOPE)).toEqual({ permissionMode: 'full', network: 'on' })
-    expect(store.getPolicyCeiling(BACKEND)).toEqual({ permissionMode: 'auto-edit', network: 'on' })
-    // Re-enabling prompts locally overrides the default, and the override is what reads back.
-    store.setPolicyCeiling(LOCAL_SCOPE, { permissionMode: 'auto-edit', network: 'on' })
-    expect(store.getPolicyCeiling(LOCAL_SCOPE)).toEqual({ permissionMode: 'auto-edit', network: 'on' })
-  })
-
-  it('still refuses the four per-backend writes for any OTHER unpaired key (the integrity guard survives)', () => {
+  it('still refuses the per-backend writes for any OTHER unpaired key (the integrity guard survives)', () => {
     const store = createStateStore({ cwd: freshDir() })
     const unpaired = 'https://unpaired.example'
     // The local exception is exactly one key; a real backend URL with no pairing still fails closed so
     // no orphan config can accumulate under a URL that has no pairing to be read for.
-    expect(() => store.setPolicyCeiling(unpaired, { permissionMode: 'full', network: 'on' })).toThrow()
     expect(() => store.setOriginPolicy(unpaired, { denySchedule: true, denyDispatch: true })).toThrow()
     expect(() => store.upsertMcpServer(unpaired, 'linear', { type: 'stdio', command: 'linear-mcp' })).toThrow()
-    expect(() => store.addGrantedFolder(unpaired, '/Users/dev/acme')).toThrow()
   })
 
   it('names the config file from the brand, not a baked-in literal', () => {

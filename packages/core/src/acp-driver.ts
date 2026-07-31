@@ -303,11 +303,27 @@ function mapAcpMcpServers(
  * falling back to the first option when no kind matches, so a run never blocks on an
  * unanswered prompt (this is a non-interactive product run).
  *
+ * A FLOORED run refuses EVERY request, whatever its mode and whatever options are offered. It does
+ * not classify the request first: the ACP frames the agent sends carry no field we can trust to tell
+ * a file read from anything else, and a floored run has no legitimate need for a permission-gated
+ * capability in the first place. Its own app tools are unaffected in practice - the captured Hermes
+ * and OpenCode frames deliver an `mcp__<server>__<tool>` call as a `session/update` tool_call, never
+ * as a permission request.
+ *
+ * READ THE CAVEAT ON {@link makeAcpDriver} BEFORE TREATING THIS AS CONTAINMENT. It only fires if the
+ * agent ASKS, and nothing obliges it to.
+ *
  * @param options - The permission options offered by the agent.
  * @param mode - The run's permission mode.
+ * @param floored - Whether the run is capability-floored (refuse everything).
  * @returns The chosen option id, or `undefined` to cancel the request.
  */
-function choosePermissionOption(options: unknown, mode: PermissionMode): string | undefined {
+function choosePermissionOption(
+  options: unknown,
+  mode: PermissionMode,
+  floored = false
+): string | undefined {
+  if (floored) return undefined
   if (!Array.isArray(options)) return undefined
   const parsed = options.filter(isRecord)
   const idOf = (o: Record<string, unknown>): string | undefined =>
@@ -334,6 +350,16 @@ function choosePermissionOption(options: unknown, mode: PermissionMode): string 
  * requests non-interactively, maps a `cancelled`/aborted run to a silent return, and recovers a
  * genuinely hung run via the shared inactivity watchdog. Provider auth is the agent's own (no
  * BYOK env var is injected). The child env is the shared allowlist with the node dir on PATH.
+ *
+ * A FLOORED RUN IS NOT CONTAINED ON THIS PATH, and no comment here or test elsewhere should be read
+ * as saying otherwise. This driver's only levers are the fixed {@link AcpDriverConfig.binaryArgs}, the
+ * cwd, the child env, and the ANSWERS it gives to `session/request_permission`. There is NO
+ * tool-restriction mechanism: verified 2026-07-29 against the installed CLIs, `opencode acp` accepts
+ * only `--cwd`/`--port`/`--hostname`/logging flags, and `hermes acp` only `--accept-hooks`/`--check`/
+ * `--setup`/`--version` (its `-t/--toolsets` flag is documented as applying to `-z/--oneshot` and
+ * `--tui`, not to `acp`). So a floored run's refusal only fires if the agent ASKS first. An agent that
+ * treats reads as un-gated never sends the request, our refusal never runs, and the run reads whatever
+ * it likes. Whether each agent asks is settled by the adversarial suite, not by this code.
  *
  * @param spawnFn - The injected process spawner (defaults to `cross-spawn` in production).
  * @param config - The per-tool ACP configuration (launch args, MCP forwarding, mode mapping).
@@ -468,7 +494,11 @@ export function makeAcpDriver(spawnFn: SpawnFn, config: AcpDriverConfig): Agenti
           if (!incoming) continue
           if (incoming.kind === 'agentRequest') {
             if (incoming.method === 'session/request_permission') {
-              const optionId = choosePermissionOption(incoming.params.options, p.permissionMode)
+              const optionId = choosePermissionOption(
+                incoming.params.options,
+                p.permissionMode,
+                p.floored
+              )
               writeMessage({
                 jsonrpc: '2.0',
                 id: incoming.id,

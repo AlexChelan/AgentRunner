@@ -20,7 +20,9 @@ import { createDisconnectRunner } from './disconnect-runner'
 import { createExecutor } from './executor'
 import { readBearer } from './pair'
 import { managedCliDir } from './paths'
-import { createPollClient, type HttpClient, type PollClient, type UpdateState } from './poll-client'
+import { retiredEgressNotice } from './policies'
+import { defaultStreamOpener, type StreamOpener } from './backend-http'
+import { createStreamClient, type HttpClient, type StreamClient, type UpdateState } from './stream-client'
 import type { SecretStore } from './storage/secret-store'
 import { type CliConnection, type StateStore } from './storage/state-store'
 import { createToolSerializer } from './tool-serializer'
@@ -49,6 +51,13 @@ export interface BackendSession {
   stop(): Promise<void>
   /** The number of this backend's runs currently in flight (for idle-gating the daemon's self-update). */
   activeRunCount(): number
+  /**
+   * Tells THIS backend how many run slots the machine has free, so it stops pushing runs the daemon
+   * would only refuse (and re-arms it once one frees). Called by the host on EVERY running session when
+   * a run settles in ANY of them - the cap is machine-global, so a slot freed in one scope is a slot
+   * freed for all of them, and a scope that never hears about it stays pinned at its last report.
+   */
+  reportCapacity(): Promise<void>
 }
 
 /** Injected dependencies for {@link createBackendSession}. */
@@ -80,6 +89,11 @@ export interface BackendSessionDeps {
   audit: AuditLog
   /** The HTTP client the poll client uses (injectable for tests; defaults to a `fetch` wrapper). */
   http?: HttpClient
+  /**
+   * Opens the held stream. Defaults to the real `fetch`-backed opener; injected by tests so a session
+   * under test never reaches for a network it was not given.
+   */
+  openStream?: StreamOpener
   /** The companion build version (reported to the backend for presence). */
   version?: string
   /** This machine's host name (reported to the backend for presence so the app can label the device). */
@@ -92,6 +106,14 @@ export interface BackendSessionDeps {
    * Omitted = this session's own executor count (a standalone session with no co-hosted scopes).
    */
   totalActiveRuns?: () => number
+  /**
+   * Fired when one of THIS session's runs settles, so a co-hosting daemon can re-report capacity on
+   * every scope it serves rather than only this one. It is the counterpart of
+   * {@link BackendSessionDeps.totalActiveRuns}: whatever a host counts into that aggregate must also
+   * settle through here, or the scopes that never learn a slot freed stay pinned at zero capacity.
+   * Omitted = this session reports its own freed capacity (a standalone session has nobody to notify).
+   */
+  onRunSettled?: () => void
   /** Sink for this session's diagnostic lines (defaults to `process.stdout.write`). */
   write?: (line: string) => void
   /** Builds an auth-health monitor (injectable for tests; defaults to {@link createAuthHealthMonitor}). */
@@ -131,6 +153,20 @@ export function toConnectionRef(conn: CliConnection | null): ConnectionRef | nul
  * poll client could not authenticate, so the caller logs + skips it rather than spinning forever, and
  * a reconciling supervisor retries it on a later pass (a re-pair repairs the bearer).
  *
+ * Every store-backed setting - the origin policy, the ceiling, the concurrent-run cap - is read
+ * through a FRESH store on each use rather than captured once, so a change made by a separate
+ * `limits set` process applies on the next run without restarting the daemon.
+ *
+ * The real STREAM TRANSPORT is wired here, at the daemon's composition root, so the client itself
+ * never reaches for the network a caller did not give it. It stays injectable for the same reason one
+ * level up: a session under test must not open a socket either.
+ *
+ * BUILDING A SESSION IS ALSO WHEN A RETIRED SETTING GETS ITS SAY. A scope the retired `policy` command
+ * denied network egress carries a clamp this build cannot honor and has nothing to migrate into (see
+ * {@link retiredEgressNotice}), so the notice goes to this session's diagnostic sink here rather than
+ * the setting being dropped in silence. Once per session build - a daemon boot, or a supervisor
+ * reconciling this pairing back - which is what keeps it a notice rather than a log flood.
+ *
  * @param deps - The app-data root, account scope + backend URL, shared registry + audit, stores, and
  *   optional overrides.
  * @returns The backend session, or `null` when the pairing's bearer is missing.
@@ -146,6 +182,8 @@ export function createBackendSession(deps: BackendSessionDeps): BackendSession |
     write(`Missing credentials for ${backendUrl}. Run '${brand().binary} pair' again.\n`)
     return null
   }
+
+  if (readState().hasRetiredEgressDenial(scope)) write(retiredEgressNotice(scope))
 
   const managedDir = managedCliDir(deps.appDataRoot)
   const managedDirs = managedCliBinDirs(managedDir)
@@ -166,10 +204,6 @@ export function createBackendSession(deps: BackendSessionDeps): BackendSession |
     log: write,
     sessionManager,
     getConnection: (_productId, connectionId) => toConnectionRef(readState().getConnection(scope, connectionId)),
-    // Read the ceiling through a FRESH store (like every other connection-driven callback) so it is
-    // never served from a stale first-read snapshot.
-    getCeiling: () => readState().getPolicyCeiling(scope),
-    // Same fresh-store read for the device origin policy, so a `policy set` applies on the next run.
     getOriginPolicy: () => readState().getOriginPolicy(scope),
     resolveBinary: (name) => resolveToolBinary(name, { managedDirs }),
     // Branded server name: a consuming coding CLI shows it to the user (e.g. in `/mcp`).
@@ -212,7 +246,7 @@ export function createBackendSession(deps: BackendSessionDeps): BackendSession |
     return { authenticated: allAuthenticated, mode: 'subscription' }
   }
 
-  let client: PollClient | null = null
+  let client: StreamClient | null = null
   // Reports each connected CLI's REAL model catalog on the connections snapshot, so the web picker can
   // offer what this device actually reaches instead of the fixed list the backend has to guess. Probed
   // once per CLI (never per poll - see the reporter); a catalog that lands AFTER the connect body was
@@ -277,7 +311,8 @@ export function createBackendSession(deps: BackendSessionDeps): BackendSession |
     serializer: toolSerializer,
     log: write
   })
-  client = createPollClient({
+  client = createStreamClient({
+    openStream: deps.openStream ?? defaultStreamOpener(),
     backendUrl,
     bearer,
     deviceId,
@@ -291,6 +326,7 @@ export function createBackendSession(deps: BackendSessionDeps): BackendSession |
     // separate `limits set` process is picked up within one poll without restarting the daemon.
     getMaxConcurrentRuns: () => readState().getMaxConcurrentRuns(),
     ...(deps.totalActiveRuns ? { totalActiveRuns: deps.totalActiveRuns } : {}),
+    ...(deps.onRunSettled ? { onRunSettled: deps.onRunSettled } : {}),
     ...(deps.hostname !== undefined ? { hostname: deps.hostname } : {}),
     ...(deps.updateState ? { updateState: deps.updateState } : {}),
     ...(deps.http ? { http: deps.http } : {}),
@@ -318,6 +354,9 @@ export function createBackendSession(deps: BackendSessionDeps): BackendSession |
     },
     activeRunCount(): number {
       return executor.activeRunCount()
+    },
+    async reportCapacity(): Promise<void> {
+      await client?.reportCapacity()
     }
   }
 }

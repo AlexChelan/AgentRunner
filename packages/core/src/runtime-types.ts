@@ -34,6 +34,18 @@ export type RuntimeRunRequest = RunRequest & {
   /** SDK session/thread id to resume so a follow-up turn continues the conversation. */
   conversationId?: string
   /**
+   * Whether this run is CAPABILITY-FLOORED: dispatched by a paired web backend, so it may run model
+   * inference and call the backend's own manifest tools, and nothing else - no file read, write or
+   * search, no shell, no local MCP server. From a web app's view the companion is a model provider
+   * that happens to bill the user's subscription, and providers have no filesystem.
+   *
+   * INTERNAL AND ONE-WAY. It is not a wire field and not a {@link RunPolicy} field: `buildRun` sets it
+   * from the run's SCOPE, so no backend can send, clear or clamp it, and no stored ceiling can raise a
+   * floored run. Absent means the on-device LOCAL leg (the desktop app's own chats and the companion's
+   * local mode), which keeps full capability because the user is sitting in front of it.
+   */
+  floored?: boolean
+  /**
    * Whether the run may reach the network. `"off"` is OS-enforced ONLY by adapters that can
    * actually cut egress: Codex (`networkAccessEnabled: false`). Claude Code and OpenCode cannot
    * enforce it (the Claude Agent SDK has no single egress switch - restriction is permission-rule

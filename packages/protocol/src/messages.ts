@@ -612,7 +612,7 @@ export const DisconnectResultBodySchema = z.object({
  * recording a new `tests/version-baseline.json`, and bumping this constant additionally requires freezing
  * a new `tests/fixtures/v<N>/` directory - that guard fails otherwise.
  */
-export const COMPANION_PROTOCOL_VERSION = 3
+export const COMPANION_PROTOCOL_VERSION = 4
 
 /**
  * The `/connect` handshake response the backend returns to a pairing daemon. It carries the
@@ -625,17 +625,8 @@ export const COMPANION_PROTOCOL_VERSION = 3
 export interface ConnectResponse {
   /** The daemon's resolved companion id (`<userId>:<deviceId>`). */
   companionId?: string
-  /** The short-lived HMAC wire token that authenticates every subsequent poll/POST. */
+  /** The short-lived HMAC wire token that authenticates every subsequent request. */
   wireToken: string
-  /**
-   * The poll cadence (ms) the backend wants the daemon to use. Kept a plain `z.number()` on the schema -
-   * NOT `.int().positive()` - and that looseness is DELIBERATE: this schema gates the handshake itself,
-   * so a merely sloppy cadence (a fractional `2500.5` from a third-party backend, which
-   * `docs/backend-integration.md` actively invites) would become a fatal refusal to connect at all.
-   * Rule 1: a value is never a gate. The CONSUMER clamps it (`clampPollIntervalMs` in the daemon's
-   * poll client), and that clamp - not this schema - is the contract.
-   */
-  pollIntervalMs?: number
   /** The wire protocol version the backend speaks; absent from a pre-versioning backend. */
   protocolVersion?: number
 }
@@ -644,16 +635,17 @@ export interface ConnectResponse {
 export const ConnectResponseSchema = z.object({
   companionId: z.string().optional(),
   wireToken: z.string().min(1),
-  pollIntervalMs: z.number().optional(),
   protocolVersion: z.number().int().positive().optional()
 }) satisfies z.ZodType<ConnectResponse>
 
 /**
- * The `/poll` response the backend returns to a polling daemon: the queued runs to execute, the
- * runIds to cancel, the CLI-connect instructions, and - optionally - a refreshed wire token and poll
- * cadence. The single wire contract both ends import: the backend types its response literal with
- * this interface and the daemon validates the body with {@link PollResponseSchema}, so the two ends
- * can never drift on the envelope's field names.
+ * The batch of work the backend hands a daemon: the queued runs to execute, the runIds to cancel, the
+ * CLI-connect instructions, and optionally a refreshed wire token.
+ *
+ * There is no poll cadence field: the daemon HOLDS a stream rather than polling, so there is no
+ * interval for the backend to advertise. The adaptive three-tier cadence that field carried is gone
+ * with it - a held connection delivers on the sweep interval regardless of how busy a device is,
+ * which is both faster than the old 1s hot tier and free when idle.
  */
 export interface PollResponse {
   /** The queued runs to execute, oldest-first. */
@@ -671,11 +663,6 @@ export interface PollResponse {
    * the SAME field on the other route and has always been `.min(1)`.
    */
   wireToken?: string
-  /**
-   * The poll cadence (ms) the backend wants the daemon to use. Loose on the schema for the same reason
-   * as {@link ConnectResponse.pollIntervalMs}: the consumer's clamp is the contract, not this schema.
-   */
-  pollIntervalMs?: number
 }
 
 /**
@@ -689,8 +676,7 @@ export const PollResponseSchema = z.object({
   cancel: z.array(z.string().min(1)).optional(),
   connects: z.array(z.unknown()).optional(),
   disconnects: z.array(z.unknown()).optional(),
-  wireToken: z.string().min(1).optional(),
-  pollIntervalMs: z.number().optional()
+  wireToken: z.string().min(1).optional()
 })
 
 /**

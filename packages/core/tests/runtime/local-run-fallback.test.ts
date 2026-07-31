@@ -17,6 +17,8 @@ function makeStart(overrides: Partial<RunStart> = {}): RunStart {
     userId: 'local',
     connectionId: 'codex',
     input: 'go',
+    // Required by `RunStart`; a local chat composes no web tools, so it is empty rather than absent.
+    webToolManifest: [],
     modelId: 'gpt-5',
     ...overrides
   }

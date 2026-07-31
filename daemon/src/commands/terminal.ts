@@ -76,8 +76,7 @@ function resolveTerminalCli(argv: string[], state: StateStore, scope: string): T
  * the PURELY-LOCAL session. It pairs with nothing, calls nothing, and composes the CLI's instructions
  * from the on-device app config the app staged (the same document a local runtime boots from). The
  * product is the config's, so the session shares one confined work folder with the local chat runs; the
- * CLI, the local MCP servers, the ceiling and the folder grants all come from the LOCAL scope's own
- * records. A missing or invalid `--app-config` refuses before anything is opened.
+ * CLI and the local MCP servers come from the LOCAL scope's own records. A missing or invalid `--app-config` refuses before anything is opened.
  *
  * @param argv - The process arguments (`terminal` is `argv[0]`).
  * @param stores - The already-opened app-data root + state/secret stores.
@@ -121,11 +120,10 @@ async function cmdLocalTerminal(argv: string[], stores: ReturnType<typeof openSt
     appDataRoot,
     config,
     cli,
-    ceiling: state.getPolicyCeiling(LOCAL_SCOPE),
+    approval: state.getTerminalApproval(LOCAL_SCOPE),
     audit: openAuditLog(appDataRoot),
     localMcpServers,
     mcpEnv: collectMcpEnv(secrets, LOCAL_SCOPE, localMcpServers),
-    grantedRoots: state.listGrantedFolders(LOCAL_SCOPE),
     write: ui.line,
     ...(requestedCwd ? { requestedCwd } : {}),
     ...(modelId ? { modelId } : {})
@@ -142,9 +140,12 @@ async function cmdLocalTerminal(argv: string[], stores: ReturnType<typeof openSt
  * `<productId>` names the workspace the session runs in (defaulting to the backend's own `companion`
  * product); `--url` picks the backend when several are paired and `--user` picks the account when one
  * backend carries two SaaS logins; `--cli` picks the CLI when several are
- * connected; `--model` pins the model; `--cwd` runs the session in one of the user's OWN folders instead,
- * which is honored only inside a root they granted with `policy grant-folder add` (see
- * `runTerminalSession`).
+ * connected; `--model` pins the model; `--cwd` runs the session in any folder the user names - the
+ * typing is the consent, and no backend can contribute a path (see `runTerminalSession`).
+ *
+ * Whether the CLI keeps its own approval prompts is the SCOPE's setting, read fresh here so an
+ * `approvals set` between sessions applies with no restart. A paired scope keeps them unless the user
+ * turned them off; the local scope bypasses them unless the user turned them on.
  *
  * @param argv - The process arguments (`terminal` is `argv[0]`).
  */
@@ -155,7 +156,7 @@ export async function cmdTerminal(argv: string[]): Promise<void> {
     return
   }
   const { appDataRoot, state, secrets } = stores
-  // The SCOPE keys the credentials, the ceiling, the grants and the MCP servers; the URL it addresses is
+  // The SCOPE keys the credentials and the MCP servers; the URL it addresses is
   // only what the session dials and names. Both are strings, so this is the line that keeps them apart.
   const scope = await resolveCommandScope(argv, state)
   if (scope === undefined) return
@@ -188,13 +189,10 @@ export async function cmdTerminal(argv: string[]): Promise<void> {
     version: daemonVersion(),
     productId: positionalArg(argv) ?? DEFAULT_PRODUCT_ID,
     cli,
-    ceiling: state.getPolicyCeiling(scope),
+    approval: state.getTerminalApproval(scope),
     audit: openAuditLog(appDataRoot),
     localMcpServers,
     mcpEnv: collectMcpEnv(secrets, scope, localMcpServers),
-    // The folders the USER granted this backend, read fresh from the local store (a grant added between
-    // sessions applies with no restart) - the only list a `--cwd` is ever checked against.
-    grantedRoots: state.listGrantedFolders(scope),
     write: ui.line,
     ...(requestedCwd ? { requestedCwd } : {}),
     connections: state

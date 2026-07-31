@@ -5,10 +5,10 @@ import { flagValue, openStores, positionalArg } from './shared'
 /**
  * The fixed footer `limits show` prints under the current cap. Load-bearing reassurance: the cap is a
  * LOCAL resource limit (never sent to any backend), and the daemon re-reads it through a fresh store on
- * every poll, so a `limits set` takes effect within one poll with no restart.
+ * before every run, so a `limits set` takes effect on the next run with no restart.
  */
 const LIMITS_NOTE =
-  'A local resource cap, never sent to any backend. The daemon re-reads it every poll, so a change applies within a poll - no restart.'
+  'A local resource cap, never sent to any backend. The daemon re-reads it before every run, so a change applies to the next run - no restart.'
 
 /**
  * Runs `limits` / `limits show`: prints the current maximum number of dispatched runs that may execute
@@ -48,7 +48,7 @@ function cmdLimitsSet(argv: string[]): void {
     return
   }
   state.setMaxConcurrentRuns(value)
-  ui.outro(`Max concurrent runs: ${state.getMaxConcurrentRuns()}. The daemon applies it within one poll - no restart.`)
+  ui.outro(`Max concurrent runs: ${state.getMaxConcurrentRuns()}. The daemon applies it to the next run - no restart.`)
   process.exit(0)
 }
 

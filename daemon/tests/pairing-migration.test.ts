@@ -2,7 +2,6 @@ import { mkdtempSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { describe, expect, it, vi } from 'vitest'
-import type { RunPolicy } from '@opencompanion/protocol'
 import { accountScope } from '@opencompanion/core/runtime/account-scope'
 import { canonicalizeBackendUrl } from '@opencompanion/core/runtime/backend-url'
 import { LOCAL_SCOPE } from '@opencompanion/core/runtime/local/scope'
@@ -17,9 +16,6 @@ import { createStateStore, type StateStore } from '@opencompanion/core/runtime/s
 const VARIANT_A = 'https://App.com/api' // uppercase host -> canonical differs
 const VARIANT_B = 'https://app.com/api/' // trailing slash -> canonical differs
 const CANONICAL = 'https://app.com/api'
-
-/** A read-only, network-off ceiling that is distinct from the stock default (auto-edit / network on). */
-const LOCKED_CEILING: RunPolicy = { permissionMode: 'read-only', network: 'off' }
 
 /** Real (temp-backed) state + secret stores under the OS temp root. */
 function harness(): { state: StateStore; secrets: SecretStore } {
@@ -39,9 +35,8 @@ describe('migratePairingKeys', () => {
     state.upsertPairedBackend(VARIANT_A, { backendUrl: VARIANT_A, deviceId: 'dev-a', userId: 'u1' })
     state.upsertConnection(VARIANT_A, { toolId: 'claude-code', source: 'reused', authHealth: 'healthy' })
     secrets.set(bearerKey(VARIANT_A), 'BEARER_A')
-    // Loser (second): the ceiling + bearer B.
+    // Loser (second): bearer B.
     state.upsertPairedBackend(VARIANT_B, { backendUrl: VARIANT_B, deviceId: 'dev-b', userId: 'u1' })
-    state.setPolicyCeiling(VARIANT_B, LOCKED_CEILING)
     secrets.set(bearerKey(VARIANT_B), 'BEARER_B')
 
     await migratePairingKeys(state, secrets)
@@ -53,8 +48,6 @@ describe('migratePairingKeys', () => {
     expect(backends[0]?.deviceId).toBe('dev-a')
     // The winner's connections are carried, keyed under the canonical URL.
     expect(state.getConnection(CANONICAL, 'claude-code')?.authHealth).toBe('healthy')
-    // The loser's ceiling gap-fills (the winner had none), preserved under the canonical URL.
-    expect(state.getPolicyCeiling(CANONICAL)).toEqual(LOCKED_CEILING)
     // The winner's bearer is moved to the canonical secret key; both raw-keyed secrets are gone.
     expect(readBearer(CANONICAL, secrets)).toBe('BEARER_A')
     expect(secrets.get(bearerKey(VARIANT_A))).toBeNull()
@@ -86,25 +79,6 @@ describe('migratePairingKeys', () => {
     // the raw key would silently drop the servers from every terminal session after the migration.
     expect(state.listMcpServers(CANONICAL)).toEqual({ linear: { type: 'stdio', command: 'linear-mcp' } })
     expect(state.listMcpServers(VARIANT_B)).toEqual({})
-  })
-
-  it("re-keys a backend's granted folders under the canonical URL, merging both variants", async () => {
-    const { state, secrets } = harness()
-    state.upsertPairedBackend(VARIANT_A, { backendUrl: VARIANT_A, deviceId: 'dev-a', userId: 'u1' })
-    state.addGrantedFolder(VARIANT_A, '/Users/dev/acme')
-    state.upsertPairedBackend(VARIANT_B, { backendUrl: VARIANT_B, deviceId: 'dev-b', userId: 'u1' })
-    state.addGrantedFolder(VARIANT_B, '/Users/dev/beta')
-    // The same folder granted under both variants is ONE grant, not two.
-    state.addGrantedFolder(VARIANT_B, '/Users/dev/acme')
-    secrets.set(bearerKey(VARIANT_A), 'BEARER_A')
-
-    await migratePairingKeys(state, secrets)
-
-    // Both variants' grants belong to the same physical backend, so they union onto the canonical key.
-    // Stranding one on a raw key would silently refuse a `--cwd` the user had already allowed.
-    expect(state.listGrantedFolders(CANONICAL)).toEqual(['/Users/dev/acme', '/Users/dev/beta'])
-    expect(state.listGrantedFolders(VARIANT_A)).toEqual([])
-    expect(state.listGrantedFolders(VARIANT_B)).toEqual([])
   })
 
   it('re-keys a single variant record and moves its bearer to the canonical key', async () => {
@@ -147,12 +121,10 @@ describe('migratePairingKeys', () => {
     state.upsertPairedBackend(VARIANT_A, { backendUrl: VARIANT_A, deviceId: 'dev-a', userId: 'u1' })
     secrets.set(bearerKey(VARIANT_A), 'BEARER_A')
     // LOCAL-scope records with NO paired backend for the 'local' key (the relaxed store now permits
-    // this): a connection, an MCP server, a policy ceiling, an origin policy, and a granted folder.
+    // this): a connection, an MCP server, and an origin policy.
     state.upsertConnection(LOCAL_SCOPE, { toolId: 'claude-code', source: 'reused', authHealth: 'healthy' })
     state.upsertMcpServer(LOCAL_SCOPE, 'linear', { type: 'stdio', command: 'npx', envKeys: ['LINEAR_KEY'] })
-    state.setPolicyCeiling(LOCAL_SCOPE, LOCKED_CEILING)
     state.setOriginPolicy(LOCAL_SCOPE, { denySchedule: true, denyDispatch: false })
-    state.addGrantedFolder(LOCAL_SCOPE, '/Users/dev/local-project')
     // A local-scope MCP secret that must be left exactly where it is: the migration re-keys secrets only
     // along the raw-backend loop, never the local scope.
     writeMcpEnv(secrets, LOCAL_SCOPE, 'linear', { LINEAR_KEY: 'lin_local_secret' })
@@ -172,9 +144,7 @@ describe('migratePairingKeys', () => {
     expect(state.listMcpServers(LOCAL_SCOPE)).toEqual({
       linear: { type: 'stdio', command: 'npx', envKeys: ['LINEAR_KEY'] }
     })
-    expect(state.getPolicyCeiling(LOCAL_SCOPE)).toEqual(LOCKED_CEILING)
     expect(state.getOriginPolicy(LOCAL_SCOPE)).toEqual({ denySchedule: true, denyDispatch: false })
-    expect(state.listGrantedFolders(LOCAL_SCOPE)).toEqual(['/Users/dev/local-project'])
     // The local-scope MCP secret is untouched (never re-keyed or deleted by the migration).
     expect(readMcpEnv(secrets, LOCAL_SCOPE, 'linear')).toEqual({ LINEAR_KEY: 'lin_local_secret' })
   })
@@ -182,7 +152,6 @@ describe('migratePairingKeys', () => {
   it('is idempotent: an already-canonical store is left untouched and never touches secrets', async () => {
     const { state } = harness()
     state.upsertPairedBackend(CANONICAL, { backendUrl: CANONICAL, deviceId: 'dev-c', userId: 'u1' })
-    state.setPolicyCeiling(CANONICAL, LOCKED_CEILING)
     // A secret store that fails loudly if the migration touches it - proves the early return is total.
     const untouchable: SecretStore = {
       get: vi.fn(() => {
@@ -196,7 +165,6 @@ describe('migratePairingKeys', () => {
 
     expect(state.listPairedBackends()).toHaveLength(1)
     expect(state.getPairedBackend(CANONICAL)?.deviceId).toBe('dev-c')
-    expect(state.getPolicyCeiling(CANONICAL)).toEqual(LOCKED_CEILING)
     expect(untouchable.set).not.toHaveBeenCalled()
     expect(untouchable.delete).not.toHaveBeenCalled()
   })

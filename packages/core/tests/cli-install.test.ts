@@ -115,7 +115,10 @@ describe('installCli - Claude Code (raw binary + checksum)', () => {
   /** Build deps that serve the latest version, manifest, and the raw binary. */
   function claudeDeps(
     override: Partial<{ checksum: string; bytes: Uint8Array }> = {}
-  ): { deps: InstallDeps; calls: Array<{ url: string; headers?: Record<string, string> }> } {
+  ): {
+    deps: InstallDeps
+    calls: Array<{ url: string; headers?: Record<string, string>; signal?: AbortSignal }>
+  } {
     const { fetchFn, calls } = makeFetch([
       { match: '/latest', body: { text: '1.2.3\n' } },
       {

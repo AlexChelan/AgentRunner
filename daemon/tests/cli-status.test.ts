@@ -18,6 +18,60 @@ describe('cli routing - status + status --json', () => {
     expect(out.stdout.length).toBeGreaterThan(0)
   })
 
+  // THE DISCLOSURE. This is the surface where the product proves its safety story, so the claim has to
+  // be there in words a user can read - not implied by the absence of a setting.
+  it('"status" states plainly what a paired app can and cannot do', async () => {
+    const solo = tempAppData('disclose')
+    pairBackend(solo, { backendUrl: 'https://disclose.example', deviceId: 'dd' })
+    await run(['status'])
+
+    expect(out.stdout).toContain('run your coding CLI and use your AI subscription')
+    expect(out.stdout).toContain('cannot read, write or search any file')
+    expect(out.stdout).toContain('cannot run a shell')
+    expect(out.stdout).toContain('cannot reach the MCP servers you configured locally')
+  })
+
+  it('"status" discloses the floor even when nothing is paired yet', async () => {
+    // A user deciding WHETHER to pair is exactly who needs to read the guarantee.
+    tempAppData('disclose-empty')
+    await run(['status'])
+
+    expect(out.stdout).toContain('cannot read, write or search any file')
+  })
+
+  it('"status" names a connected CLI the floor cannot be enforced for', async () => {
+    const solo = tempAppData('disclose-acp')
+    const state = createStateStore({ cwd: solo })
+    state.upsertPairedBackend('https://acp.example', {
+      backendUrl: 'https://acp.example',
+      deviceId: 'da',
+      userId: 'u1'
+    })
+    state.upsertConnection('https://acp.example', {
+      toolId: 'opencode',
+      source: 'reused',
+      authHealth: 'healthy'
+    })
+    await run(['status'])
+
+    // Named, with what was OBSERVED rather than what is theoretically possible, and with the CLIs that
+    // do hold the guarantee. A claim that quietly stops being true is worse than one never made, and
+    // "may be able to read files" reads as boilerplate where "read ~/.ssh in testing" does not.
+    expect(out.stdout).toContain('OpenCode: NOT CONFINED for app-dispatched work')
+    expect(out.stdout).toContain('~/.ssh')
+    expect(out.stdout).toContain('Claude Code and Codex are confined')
+  })
+
+  it('"status" adds no reduced-containment line for a contained CLI', async () => {
+    const solo = tempAppData('disclose-claude')
+    const state = createStateStore({ cwd: solo })
+    state.upsertConnection('local', { toolId: 'claude-code', source: 'reused', authHealth: 'healthy' })
+    await run(['status'])
+
+    expect(out.stdout).not.toContain('REFUSED')
+    expect(out.stdout).not.toContain('reduced containment')
+  })
+
   it('"status --json" prints a machine-readable status (plain JSON, no ANSI) with the exact shape', async () => {
     const solo = tempAppData('statusjson')
     const state = createStateStore({ cwd: solo })
@@ -43,21 +97,18 @@ describe('cli routing - status + status --json', () => {
           // the two coincide; `userId` is absent for exactly the same reason.
           scope: 'https://sj.example',
           connections: [],
-          grantedFolders: [],
-          ceiling: { permissionMode: 'auto-edit', network: 'on' }
+          terminalApproval: 'prompt'
         }
       ],
       // The LOCAL scope rides BESIDE the pairings, always present (a machine that never paired still has
-      // one) and never inside `pairedBackends` - it is not a pairing. Its ceiling defaults to `full`
-      // (approval prompts bypassed): the local scope is the user's own machine, unlike the cautious
-      // `auto-edit` default a paired REMOTE backend keeps above.
+      // one) and never inside `pairedBackends` - it is not a pairing. It bypasses the CLI's approval
+      // prompts by default because it IS the user's own machine, where a paired scope keeps them.
       local: {
         backendUrl: 'local',
         // The local pseudo-scope is its own key, and belongs to no SaaS user, so it carries no `userId`.
         scope: 'local',
         connections: [],
-        grantedFolders: [],
-        ceiling: { permissionMode: 'full', network: 'on' }
+        terminalApproval: 'bypass'
       }
     })
     // No ANSI escape sequences leak into the machine-readable output.
@@ -77,18 +128,15 @@ describe('cli routing - status + status --json', () => {
     expect(parsed.version.length).toBeGreaterThan(0)
   })
 
-  it('"status --json" reports each backend\'s connected CLIs, granted folders, and ceiling', async () => {
-    // The supervising app builds its terminal surface from THIS document: which CLIs it may offer, which
-    // folders a session may run in, and the ceiling that decides whether the CLI keeps its approval
-    // prompts. All three are per-backend, so they ride each pairing rather than the top level.
+  it('"status --json" reports each backend\'s connected CLIs and terminal approvals', async () => {
+    // The supervising app builds its terminal surface from THIS document: which CLIs it may offer, and
+    // whether the CLI keeps its own approval prompts. Both are per-backend, so they ride each pairing.
     const solo = tempAppData('statusjson-terminal')
     const state = createStateStore({ cwd: solo })
     const url = 'https://term.example'
     state.upsertPairedBackend(url, { backendUrl: url, deviceId: 'dt', userId: 'u1' })
     state.upsertConnection(url, { toolId: 'claude-code', source: 'reused', authHealth: 'healthy' })
     state.upsertConnection(url, { toolId: 'codex', source: 'reused', authHealth: 'needs-reauth' })
-    state.addGrantedFolder(url, solo)
-    state.setPolicyCeiling(url, { permissionMode: 'full', network: 'on' })
     await run(['status', '--json'])
     const [backend] = JSON.parse(out.stdout).pairedBackends
     expect(backend).toEqual({
@@ -98,20 +146,34 @@ describe('cli routing - status + status --json', () => {
         { toolId: 'claude-code', authHealth: 'healthy' },
         { toolId: 'codex', authHealth: 'needs-reauth' }
       ],
-      grantedFolders: [solo],
-      ceiling: { permissionMode: 'full', network: 'on' }
+      // A paired scope keeps the CLI's own approval prompts unless the user turned them off.
+      terminalApproval: 'prompt'
     })
   })
 
-  it('"status --json" reports the LOCAL scope\'s own CLIs, granted folders, and ceiling', async () => {
+  // The regression this pins: a field that always reports the same constant. An app renders it as the
+  // user's current posture and offers a toggle against it, so a hardcoded value is a UI that lies.
+  it('"status --json" reports the approval setting the USER chose, per scope', async () => {
+    const solo = tempAppData('statusjson-approval')
+    const state = createStateStore({ cwd: solo })
+    const url = 'https://appr.example'
+    state.upsertPairedBackend(url, { backendUrl: url, deviceId: 'da', userId: 'u1' })
+    state.setTerminalApproval(url, 'bypass')
+    state.setTerminalApproval('local', 'prompt')
+    await run(['status', '--json'])
+
+    const parsed = JSON.parse(out.stdout)
+    expect(parsed.pairedBackends[0].terminalApproval).toBe('bypass')
+    expect(parsed.local.terminalApproval).toBe('prompt')
+  })
+
+  it('"status --json" reports the LOCAL scope\'s own CLIs and terminal approvals', async () => {
     // A desktop app driving a purely-local daemon pairs with NOTHING, so `pairedBackends` is empty for it
-    // and every terminal control it renders - which CLIs to offer, which granted folders to list, whether
-    // the CLI keeps its approval prompts - would have nothing behind it. It reads them from here instead.
+    // and every terminal control it renders - which CLIs to offer, whether the CLI keeps its approval
+    // prompts - would have nothing behind it. It reads them from here instead.
     const solo = tempAppData('statusjson-local')
     const state = createStateStore({ cwd: solo })
     state.upsertConnection('local', { toolId: 'claude-code', source: 'reused', authHealth: 'healthy' })
-    state.addGrantedFolder('local', solo)
-    state.setPolicyCeiling('local', { permissionMode: 'full', network: 'on' })
 
     await run(['status', '--json'])
 
@@ -122,8 +184,7 @@ describe('cli routing - status + status --json', () => {
       backendUrl: 'local',
       scope: 'local',
       connections: [{ toolId: 'claude-code', authHealth: 'healthy' }],
-      grantedFolders: [solo],
-      ceiling: { permissionMode: 'full', network: 'on' }
+      terminalApproval: 'bypass'
     })
   })
 

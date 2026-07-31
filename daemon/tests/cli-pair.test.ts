@@ -81,7 +81,7 @@ describe('cli routing - pair / unpair / backends', () => {
     expect(out.stdout).toContain(`${BRAND.binary} pair`)
   })
 
-  it('"backends" lists each pairing with device id, connected CLI count, ceiling, and daemon state', async () => {
+  it('"backends" lists each pairing with device id, connected CLI count, and daemon state', async () => {
     const solo = tempAppData('backends')
     const state = createStateStore({ cwd: solo })
     state.upsertPairedBackend('https://bk.example', { backendUrl: 'https://bk.example', deviceId: 'dev-123', userId: 'u1' })
@@ -90,7 +90,6 @@ describe('cli routing - pair / unpair / backends', () => {
     expect(out.stdout).toContain('https://bk.example')
     expect(out.stdout).toContain('dev-123')
     expect(out.stdout).toContain('1') // one connected CLI
-    expect(out.stdout).toContain('auto-edit') // the default ceiling permission mode
     expect(out.stdout).toContain('daemon running: no')
   })
 

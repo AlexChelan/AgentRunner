@@ -54,6 +54,82 @@ export type HttpClient = (
   init: { method: string; headers: Record<string, string>; body?: string }
 ) => Promise<HttpResponse>
 
+/** An open held stream: its status, and the text chunks arriving on it until the server closes. */
+export interface StreamResponse {
+  /** The HTTP status. Anything but 200 means no stream was opened. */
+  status: number
+  /** A server-named cooldown from a 429, in ms, when the refusal carried one. */
+  retryAfterMs?: number
+  /** The text chunks as they arrive. Ends when the server closes or the connection drops. */
+  chunks: AsyncIterable<string>
+}
+
+/**
+ * Opens a held response and yields its body as it arrives, injectable for tests.
+ *
+ * Separate from {@link HttpClient} because that contract is request/response: it exposes `json()` and
+ * nothing else, so it cannot express a body that is still arriving. The daemon holds one of these open
+ * for as long as it is paired, which is the whole transport - so it needs its own seam rather than a
+ * flag on the request one.
+ */
+export type StreamOpener = (
+  url: string,
+  init: { headers: Record<string, string>; signal?: AbortSignal }
+) => Promise<StreamResponse>
+
+/**
+ * Wraps the global `fetch` as a {@link StreamOpener}, decoding the body as UTF-8 text.
+ *
+ * A refusal carries its server-named cooldown through, exactly as {@link defaultHttp} does for the
+ * request path: the reconnect loop falls back to a conservative default when none is named, so an
+ * opener that dropped the header would park a device for that default on every 429 - minutes offline
+ * for a backend that asked for seconds, and its unattended runs routed to the paid cloud fallback
+ * meanwhile.
+ */
+export function defaultStreamOpener(): StreamOpener {
+  return async (url, init) => {
+    const res = await fetch(url, { method: 'GET', headers: init.headers, ...(init.signal ? { signal: init.signal } : {}) })
+    const retryAfterMs = parseRetryAfterMs(res.headers.get('retry-after'))
+    if (res.status !== 200 || !res.body) {
+      return {
+        status: res.status,
+        ...(retryAfterMs !== undefined ? { retryAfterMs } : {}),
+        chunks: emptyChunks()
+      }
+    }
+    return { status: res.status, chunks: decodeChunks(res.body) }
+  }
+}
+
+/** An already-finished chunk stream, for a response that carried no body to read. */
+async function* emptyChunks(): AsyncIterable<string> {
+  // Intentionally yields nothing.
+}
+
+/**
+ * Decodes a byte stream to text chunks, with `stream: true` so a multi-byte character split across a
+ * chunk boundary is reassembled rather than replaced with a substitution character.
+ *
+ * The body is CANCELLED when the read ends, not merely unlocked. Releasing the lock ends this read and
+ * leaves the response - and its socket - open, so a consumer that breaks out early (shutdown, a decoder
+ * that gave up on a malformed frame) would leave the connection held with nobody draining it. The
+ * cancel is swallowed because on an already-errored body it rejects, and a teardown must not throw over
+ * a stream that is finished either way.
+ */
+async function* decodeChunks(body: ReadableStream<Uint8Array>): AsyncIterable<string> {
+  const reader = body.getReader()
+  const decoder = new TextDecoder()
+  try {
+    for (;;) {
+      const { value, done } = await reader.read()
+      if (done) break
+      if (value) yield decoder.decode(value, { stream: true })
+    }
+  } finally {
+    await reader.cancel().catch(() => undefined)
+  }
+}
+
 /** Parses a `Retry-After` delta-seconds header to ms, or undefined when absent or not a number. */
 function parseRetryAfterMs(header: string | null): number | undefined {
   if (!header) return undefined

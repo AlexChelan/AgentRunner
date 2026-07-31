@@ -1,5 +1,19 @@
 import { jsonSchema, tool, type ToolSet } from '../index'
 import type { ToolCall, WebToolManifestEntry } from '@opencompanion/protocol'
+import { brand } from './brand'
+
+/**
+ * The `mcpServers` key a dispatched run's web-tool set is served under, and therefore the server
+ * segment of every `mcp__<server>__<tool>` name the model sees. Read through this ONE helper by both
+ * the executor (which serves the set) and the capability floor (which allow-lists the names), so the
+ * two can never drift into an allow-list naming a server nothing is served under - which would refuse
+ * every app tool on every dispatched run.
+ *
+ * @returns The loopback web-tools MCP server name.
+ */
+export function webToolServerName(): string {
+  return brand().binary
+}
 
 /**
  * Turns the serializable web-tool manifest into an in-process {@link ToolSet} whose every `execute`

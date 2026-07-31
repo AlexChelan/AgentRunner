@@ -19,6 +19,7 @@ import {
   extractTextDelta,
   extractThinkingDelta,
   extractToolUses,
+  flooredClaudeToolBase,
   mapCodexMcpServers,
   mapMcpServers,
   newCodexAppServerTurnState,
@@ -51,6 +52,36 @@ describe('claudePermissionOptions', () => {
   it('maps auto-edit to acceptEdits and full to bypassPermissions', () => {
     expect(claudePermissionOptions('auto-edit')).toEqual({ permissionMode: 'acceptEdits' })
     expect(claudePermissionOptions('full')).toEqual({ permissionMode: 'bypassPermissions' })
+  })
+
+  it('contributes NO allow-list of its own to a floored run, at every mode', () => {
+    // The leak this closes: `read-only` contributes `['Read','Glob','Grep']`, which the driver appends
+    // to the run's own allow-list. A floored run must contribute nothing, whatever mode it carries.
+    for (const mode of ['read-only', 'auto-edit', 'full'] as const) {
+      const opts = claudePermissionOptions(mode, true)
+      expect(opts.allowedTools).toEqual([])
+      expect(opts.permissionMode).toBe('dontAsk')
+      for (const denied of ['Read', 'Glob', 'Grep', 'Bash']) {
+        expect(opts.disallowedTools).toContain(denied)
+      }
+    }
+  })
+
+  it('never lets a floored run bypass permissions, even at a full mode', () => {
+    // `bypassPermissions` would make the allow-list advisory. A floored run can never reach it.
+    expect(claudePermissionOptions('full', true).permissionMode).not.toBe('bypassPermissions')
+  })
+})
+
+describe('flooredClaudeToolBase', () => {
+  it('loads no built-in tool at all when the allow-list is MCP-only', () => {
+    expect(flooredClaudeToolBase(['mcp__opencompanion__lookup'])).toEqual([])
+  })
+
+  it('loads exactly the built-ins the floor named (the web tools on a network-on run)', () => {
+    expect(
+      flooredClaudeToolBase(['mcp__opencompanion__lookup', 'WebSearch', 'WebFetch'])
+    ).toEqual(['WebSearch', 'WebFetch'])
   })
 })
 
@@ -731,6 +762,57 @@ describe('buildCodexPermissionProfileOverrides (secrets read-deny)', () => {
     // Every override rides a `-c` flag so codex loads it into the session config layer.
     for (const o of overrides) expect(args).toContain(o)
     expect(args).toContain('default_permissions="companion-confined"')
+  })
+
+  it('denies the WHOLE filesystem for a floored run, subsuming the per-path denies', () => {
+    // Codex has no per-tool disable and its shell is a core tool, so a root deny is the only way to
+    // express "this run touches no file". Verified against codex-cli 0.145.0: seatbelt killed the
+    // read, the model answered BLOCKED, and the run still authenticated.
+    const overrides = buildCodexPermissionProfileOverrides({
+      sandboxMode: 'workspace-write',
+      networkAccessEnabled: false,
+      denyReadPaths: [SECRETS],
+      floored: true
+    })
+    expect(overrides).toContain('permissions.companion-confined.filesystem={"/" = "deny"}')
+    // The tier is forced to read-only regardless of the posture the mode mapped to...
+    expect(overrides).toContain('permissions.companion-confined.extends=":read-only"')
+    // ...and the per-path list is dropped: a root deny already covers every one of them.
+    expect(overrides.some((o) => o.includes(SECRETS))).toBe(false)
+    expect(overrides).toContain('default_permissions="companion-confined"')
+  })
+
+  it('emits the floored profile even when there is no per-path deny list', () => {
+    // The floor cannot depend on `denyReadPaths` being non-empty: an empty list used to mean "emit
+    // nothing", which would leave a floored run on codex's stock posture with the whole disk readable.
+    const overrides = buildCodexPermissionProfileOverrides({
+      sandboxMode: 'read-only',
+      networkAccessEnabled: false,
+      denyReadPaths: [],
+      floored: true
+    })
+    expect(overrides).toContain('permissions.companion-confined.filesystem={"/" = "deny"}')
+    expect(overrides).toContain('default_permissions="companion-confined"')
+  })
+
+  it('a floored profile is always non-empty, so thread/start omits the legacy sandbox tier', () => {
+    // Load-bearing chain: `confined` in the driver is `permissionProfile.length > 0`, and passing the
+    // legacy thread-level `sandbox` makes codex ignore the profile outright (activePermissionProfile:
+    // null), silently dropping the root deny. A floored run must never take that branch.
+    const overrides = buildCodexPermissionProfileOverrides({
+      sandboxMode: 'read-only',
+      networkAccessEnabled: false,
+      denyReadPaths: [],
+      floored: true
+    })
+    expect(overrides.length).toBeGreaterThan(0)
+    const params = buildCodexThreadStartParams({
+      cwd: join(tmpdir(), 'work'),
+      sandboxMode: 'read-only',
+      approvalPolicy: 'never',
+      permissionProfileActive: overrides.length > 0
+    })
+    expect('sandbox' in params).toBe(false)
   })
 })
 

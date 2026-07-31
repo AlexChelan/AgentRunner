@@ -75,20 +75,23 @@ describe('auth health monitor', () => {
   })
 
   it('runs the probe on the slow interval timer', async () => {
-    let tick: (() => void) | null = null
+    // Held on an object rather than a `let`: TypeScript narrows a `let` to its initializer when the
+    // only assignment happens inside a callback it cannot prove has run, which makes the call below a
+    // call on `never`. A property read is re-widened each time, which is what this test needs.
+    const timer: { tick: (() => void) | null } = { tick: null }
     const probe = vi.fn(async () => status(true))
     const monitor = createAuthHealthMonitor({
       probe,
       report: () => {},
       setTimer: (fn) => {
-        tick = fn
+        timer.tick = fn
         return { clear: () => {} }
       }
     })
     monitor.start()
     await vi.waitFor(() => expect(probe).toHaveBeenCalledTimes(1))
-    expect(tick).not.toBeNull()
-    tick?.()
+    expect(timer.tick).not.toBeNull()
+    timer.tick?.()
     expect(probe).toHaveBeenCalledTimes(2)
     monitor.stop()
   })

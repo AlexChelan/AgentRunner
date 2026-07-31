@@ -27,7 +27,8 @@ import {
 } from './backend-http'
 import { backendKey } from './backend-key'
 import { brand } from './brand'
-import { grantingRoot, resolveExistingFolder } from './folder-grants'
+import { resolveExistingFolder } from './folder-grants'
+import { terminalSessionPolicy, type TerminalApproval } from './policies'
 import type { LocalAppConfig } from './local/app-config'
 import { LOCAL_SCOPE, scopeFlag } from './local/scope'
 import { composeLocalSystemPrompt } from './local/system-prompt'
@@ -77,10 +78,9 @@ function pairedScope(scope: string, backendUrl: string): SessionScope {
 }
 
 /**
- * The scope of a session composed ON THIS DEVICE. Its key IS {@link LOCAL_SCOPE}, so the policy ceiling,
- * the folder grants, the local MCP servers, the work tree and the audit stamps all land in the same
- * per-backend stores the paired daemon uses, under the `local` pseudo-key - never in a second, parallel
- * set of local-only stores.
+ * The scope of a session composed ON THIS DEVICE. Its key IS {@link LOCAL_SCOPE}, so the local MCP
+ * servers, the work tree and the audit stamps all land in the same per-backend stores the paired daemon
+ * uses, under the `local` pseudo-key - never in a second, parallel set of local-only stores.
  */
 const LOCAL_SESSION_SCOPE: SessionScope = {
   key: LOCAL_SCOPE,
@@ -105,7 +105,7 @@ export type { TerminalCliId }
  * - A TOOL NAME IS A PERMISSION RULE. Each manifest name becomes a key of the served `ToolSet` and is
  *   joined into `claude`'s single comma-separated `--allowedTools` value, which the CLI parses as a
  *   LIST of rules - so a backend answering with a tool named `list_users,Bash` would pre-approve `Bash`
- *   (unprompted shell) on the user's machine under a ceiling that promises native prompts stay on.
+ *   (unprompted shell) on the user's machine, beyond the app tools the user actually opted into.
  *   The name is therefore pinned to a plain identifier ({@link TERMINAL_TOOL_NAME_PATTERN}) and a spec
  *   that breaks it REFUSES the session, exactly like any other spec violation. (The argv builder drops
  *   such a name too - defense in depth - but the daemon does not want to open a session at all with a
@@ -182,7 +182,7 @@ export interface TerminalSessionDeps {
   appDataRoot: string
   /**
    * WHAT THIS SESSION KEYS ON: the account scope (backend URL PLUS the SaaS user). It picks the work
-   * tree and is what the caller read the ceiling, grants and MCP servers under. Never the bare URL,
+   * tree and is what the caller read the MCP servers under. Never the bare URL,
    * which two accounts on one backend share.
    */
   scope: string
@@ -197,22 +197,20 @@ export interface TerminalSessionDeps {
   /** The product the session is attributed to (its confined work folder). */
   productId: string
   /**
-   * A folder the USER asked the session to run in (`terminal --cwd <path>`), honored ONLY when its real
-   * path resolves inside one of {@link TerminalSessionDeps.grantedRoots}. Absent - the default - keeps
-   * the session in the product's confined work folder.
+   * A folder the session should run in (`terminal --cwd <path>`). Absent - the default - keeps the
+   * session in the product's confined work folder. It comes only from local argv: the terminal spec is
+   * parsed fail-closed and cannot carry a path, so no backend can name one. The daemon does not verify
+   * WHO chose it; that is the local caller's obligation (see {@link groundSession}).
    */
   requestedCwd?: string
-  /**
-   * The folder roots the user granted this backend at THIS machine (`policy grant-folder add`), read
-   * from the local store. Empty by default. Nothing on the wire contributes to this list: the terminal
-   * spec is parsed fail-closed and cannot carry a path, so a backend can neither grant a folder nor ask
-   * to run in one.
-   */
-  grantedRoots?: string[]
   /** The CLI the session drives. */
   cli: TerminalCliId
-  /** This backend's capability ceiling. It only ever CLAMPS the session (see {@link runTerminalSession}). */
-  ceiling: RunPolicy
+  /**
+   * Whether this session leaves the CLI its own approval prompts. REQUIRED rather than defaulted: an
+   * omitted field must never be able to mean `bypass`, so every caller has to have read the user's
+   * setting (`StateStore.getTerminalApproval`) and decided.
+   */
+  approval: TerminalApproval
   /** The local audit log. The session is recorded FAIL-CLOSED before the CLI is spawned. */
   audit: AuditLog
   /** A pinned model id, or `undefined` to let the CLI pick its own default. */
@@ -262,9 +260,9 @@ export interface TerminalSessionDeps {
  * its model instructed by the backend's composed prompt.
  *
  * The flow is ground -> `/connect` -> `POST /terminal-spec` -> serve -> audit -> spawn, and the order is
- * load-bearing. {@link groundSession} carries the controls this mode shares with the local one (the
- * egress-off refusal, the confined work folder, the `--cwd` grant check - all of them BEFORE the first
- * network call, so a typo can never fail only after the backend has minted a 12-hour wire token),
+ * load-bearing. {@link groundSession} carries the controls this mode shares with the local one (the CLI
+ * binary, the confined work folder, the `--cwd` resolution - all of them BEFORE the first network call,
+ * so a typo can never fail only after the backend has minted a 12-hour wire token),
  * {@link serveRecordAndSupervise} the fail-closed serve -> audit -> spawn seam, and {@link superviseCli}
  * the process model. What is TRUE ONLY HERE, because only this mode talks to a backend:
  *
@@ -284,17 +282,17 @@ export interface TerminalSessionDeps {
  *   the names are joined into `claude`'s comma-separated `--allowedTools`, which the CLI reads as a
  *   list of permission RULES, so a tool called `list_users,Bash` would otherwise auto-approve the CLI's
  *   shell on the user's machine. Such a spec refuses the session.
- * - THE CEILING ONLY CLAMPS. `bypassPermissions` is set ONLY under a `full` ceiling; `auto-edit` and
- *   `read-only` emit no bypass flag and the CLI keeps its native, interactive prompts. The unattended
- *   floor a dispatched run applies (there is no human to approve anything for it) is deliberately NOT
- *   applied here - a terminal HAS a human approver, so flooring would silently escalate the user's own
- *   clamp.
+ * - THE USER DECIDES WHETHER THEIR CLI STILL PROMPTS. {@link TerminalSessionDeps.approval} is what sets
+ *   `bypassPermissions`, and a paired scope keeps the prompts unless the user turned them off. The
+ *   unattended floor a dispatched run applies (there is no human to approve anything for it) is
+ *   deliberately NOT applied here - a terminal HAS a human approver, so flooring would silently escalate
+ *   the user's own clamp.
  *
  * ORIGIN POLICY does not apply: like a chat turn, this session is USER-INITIATED at this very machine's
  * keyboard, not something a backend pushed. The audit entry still records `detail.origin: 'terminal'`, so
  * `{binary} log` shows exactly why the CLI ran.
  *
- * @param deps - The backend + credentials, the CLI + product, the ceiling, the audit log, and the IO seams.
+ * @param deps - The backend + credentials, the CLI + product, the audit log, and the IO seams.
  */
 export async function runTerminalSession(deps: TerminalSessionDeps): Promise<void> {
   const write = deps.write
@@ -312,15 +310,13 @@ export async function runTerminalSession(deps: TerminalSessionDeps): Promise<voi
     appDataRoot: deps.appDataRoot,
     productId: deps.productId,
     cli: deps.cli,
-    ceiling: deps.ceiling,
-    grantedRoots: deps.grantedRoots ?? [],
     ...(deps.requestedCwd !== undefined ? { requestedCwd: deps.requestedCwd } : {}),
     resolveBinary,
     write,
     host
   })
   if (!ground) return
-  const { binary, binaryName, cwd, grantedRoot } = ground
+  const { binary, binaryName, cwd } = ground
 
   const base = companionBase(deps.backendUrl)
   const connected = await connectDevice({
@@ -439,12 +435,11 @@ export async function runTerminalSession(deps: TerminalSessionDeps): Promise<voi
     sessionId: spec.sessionId,
     productId: deps.productId,
     cli: deps.cli,
+    approval: deps.approval,
     instructions: spec.instructions,
-    ceiling: deps.ceiling,
     binary,
     binaryName,
     cwd,
-    ...(grantedRoot ? { grantedRoot } : {}),
     ...(deps.modelId ? { modelId: deps.modelId } : {}),
     mcpServers: deps.localMcpServers ?? {},
     mcpEnv: deps.mcpEnv ?? {},
@@ -470,11 +465,7 @@ interface SessionGroundInput {
   productId: string
   /** The CLI the session drives. */
   cli: TerminalCliId
-  /** The scope's capability ceiling. */
-  ceiling: RunPolicy
-  /** The folder roots the user granted THIS scope at THIS machine (the only list a `--cwd` is checked against). */
-  grantedRoots: string[]
-  /** A folder the USER asked the session to run in, honored only inside a granted root. */
+  /** A folder the USER asked the session to run in, from local argv only. */
   requestedCwd?: string
   /** Resolves a CLI binary by bare name. */
   resolveBinary: (name: string) => string | null
@@ -490,53 +481,37 @@ interface SessionGround {
   binary: string
   /** The CLI's bare binary name (named in the failure lines). */
   binaryName: string
-  /** The session's working directory (the confined work folder, or a granted folder). */
+  /** The session's working directory (the confined work folder, or the folder the user named). */
   cwd: string
-  /** The granted root a `--cwd` resolved inside, when one did (recorded in the audit entry). */
-  grantedRoot?: string
 }
 
 /**
- * Grounds a session on THIS MACHINE, before it composes anything: the egress-off refusal, the CLI binary,
- * the confined work folder, and the `--cwd` grant check. Shared by both modes, so a control cannot hold on
- * one path and be missing from the other. Every refusal writes its own line, exits non-zero, and returns
- * `null`.
+ * Grounds a session on THIS MACHINE, before it composes anything: the CLI binary, the confined work
+ * folder, and the `--cwd` resolution. Shared by both modes, so a control cannot hold on one path and be
+ * missing from the other. Every refusal writes its own line, exits non-zero, and returns `null`.
  *
- * - EGRESS-OFF REFUSES THE SESSION. The terminal argv builders have no sandbox flag that blocks the
- *   network (the headless drivers get one only on the adapters that can OS-enforce it), and `policy show`
- *   tells the user egress is off. Silently opening an ONLINE terminal under an air-gapped policy would
- *   break that promise, so the session is refused and the line names the exact command that lifts it.
  * - IT ALL HAPPENS BEFORE THE FIRST NETWORK CALL (the paired mode's, which is the only mode that has one).
  *   `productId` is user-typed and {@link resolveWorkFolder} REFUSES a crafted one (`..`, an absolute path,
  *   a separator); resolving it late would mean a typo throws only AFTER the backend had minted a 12-hour
  *   wire token and written the session's records - a session that can never open. A refused `--cwd` fails
  *   in the same place, for the same reason.
- * - THE CWD LEAVES THE WORK FOLDER ONLY THROUGH A LOCAL GRANT. A terminal exists to work on the user's OWN
- *   project, so `--cwd <path>` is honored - but only when the path's REAL location resolves inside a root
- *   the user granted at this machine (`policy grant-folder add`), which is the only writer of that list.
- *   The check is segment-relative and symlink-resolving (`@opencompanion/core`'s containment, the same one the
- *   coding toolset confines a model's file access with), so `..`, a sibling that merely shares the root's
- *   name, and a link inside the root that points out of it are all refused. Nothing outside this machine
- *   can widen it: the paired spec parse strips any path a backend tries to send, and the local mode reads
- *   its config from a file the app staged, which carries no path either.
+ * - A `--cwd` IS RESOLVED HERE, NOT AUTHORIZED HERE. What this function checks is exactly what
+ *   {@link resolveExistingFolder} checks and no more: that the path exists, is a directory, and
+ *   canonicalizes. There is no allowlist, no containment and no stored grant behind it, so the session
+ *   runs wherever its caller said - this function cannot tell a folder the user chose from one they did
+ *   not. What makes that safe sits UPSTREAM: no backend can name a path (the terminal spec is parsed
+ *   fail-closed against a schema that strips every key it does not declare), so a `--cwd` only ever
+ *   arrives from a LOCAL caller, and each local caller owns the consent for the folder it names - see
+ *   {@link resolveExistingFolder}, which is where those callers and their obligation are enumerated.
  * - THE WORK FOLDER STILL RESOLVES FIRST even when a `--cwd` overrides it, because `resolveWorkFolder` is
  *   what refuses a crafted `productId` - and that id rides the audit entry (and, when paired, the wire)
  *   whether or not the session runs in the folder it names.
  *
- * @param input - The scope, the product + CLI, the ceiling, the grants, and the IO seams.
+ * @param input - The scope, the product + CLI, and the IO seams.
  * @returns Where the session runs, or `null` once it has been refused and the process is exiting.
  */
 function groundSession(input: SessionGroundInput): SessionGround | null {
   const { scope, write, host } = input
-
-  if (input.ceiling.network === 'off') {
-    write(
-      `The policy for ${scope.label} pins network off, which a terminal session cannot enforce. ` +
-        `Run '${brand().binary} policy set ${scope.flag} --network on' to open one.\n`
-    )
-    host.exit(1)
-    return null
-  }
 
   const binaryName = CLI_INSTALL_SPECS[input.cli]?.binary ?? input.cli
   const binary = input.resolveBinary(binaryName)
@@ -575,16 +550,7 @@ function groundSession(input: SessionGroundInput): SessionGround | null {
     host.exit(1)
     return null
   }
-  const grantedRoot = grantingRoot(input.grantedRoots, requested)
-  if (grantedRoot === undefined) {
-    write(
-      `Refusing to open a terminal in ${requested}: it is not inside a folder you granted. ` +
-        `Run '${brand().binary} policy grant-folder add ${requested} ${scope.flag}' at this machine to allow it.\n`
-    )
-    host.exit(1)
-    return null
-  }
-  return { binary, binaryName, cwd: requested, grantedRoot }
+  return { binary, binaryName, cwd: requested }
 }
 
 /** The session facts the fail-closed `terminal` audit entry records. */
@@ -599,14 +565,12 @@ interface TerminalAuditInput {
   productId: string
   /** The CLI the session drives. */
   cli: TerminalCliId
+  /** Whether the session left the CLI its own approval prompts (recorded as the entry's policy). */
+  approval: TerminalApproval
   /** The composed instructions (hashed, never stored in the clear). */
   instructions: string
-  /** The ceiling the session runs under. */
-  ceiling: RunPolicy
   /** The session's working directory. */
   cwd: string
-  /** The granted root that allowed a cwd outside the work folder, when one did. */
-  grantedRoot?: string
   /** The pinned model, when the user named one. */
   modelId?: string
   /** The user's local MCP servers wired into the session. */
@@ -618,8 +582,9 @@ interface TerminalAuditInput {
  * refuses the session when it reports a failure, so an unlogged terminal is impossible (the same rule a
  * dispatched run's `dispatched` entry follows). The entry names the local MCP servers the session wired
  * up - a user reading their own trust log must be able to see that a session started `npx linear-mcp`
- * beside their app's tools, not just that a terminal opened - and the granting root beside the cwd, since
- * a log that says a session ran somewhere must also say what allowed it to.
+ * beside their app's tools, not just that a terminal opened - the folder it ran in, and the approval
+ * posture it ran under, since a log that cannot tell a bypassed session from a prompting one cannot
+ * answer the question a user opens it to ask.
  *
  * @param input - The session facts to record.
  * @returns Recorded, or the refusal line the caller prints before it tears the session down.
@@ -633,11 +598,10 @@ function recordTerminalSession(input: TerminalAuditInput): { ok: true } | { ok: 
       productId: input.productId,
       toolId: input.cli,
       promptSha256: createHash('sha256').update(input.instructions).digest('hex'),
-      policy: input.ceiling,
+      policy: terminalSessionPolicy(input.approval),
       detail: {
         origin: 'terminal',
         cwd: input.cwd,
-        ...(input.grantedRoot ? { grantedRoot: input.grantedRoot } : {}),
         ...(input.modelId ? { model: input.modelId } : {}),
         ...(input.mcpServerNames.length > 0 ? { mcpServers: input.mcpServerNames.join(', ') } : {})
       }
@@ -776,18 +740,16 @@ interface TerminalLaunchPlan {
   productId: string
   /** The CLI the session drives. */
   cli: TerminalCliId
+  /** Whether the session leaves the CLI its own approval prompts (the user's setting for this scope). */
+  approval: TerminalApproval
   /** The composed instructions (the CLI's system prompt; hashed into the audit entry). */
   instructions: string
-  /** The ceiling the session runs under. It only ever CLAMPS the bypass, never floors it up. */
-  ceiling: RunPolicy
   /** The resolved CLI binary path. */
   binary: string
   /** The CLI's bare binary name (named in the failure lines). */
   binaryName: string
-  /** The session's working directory (the confined work folder, or a granted folder). */
+  /** The session's working directory (the confined work folder, or the folder the user named). */
   cwd: string
-  /** The granted root a `--cwd` resolved inside, when one did (recorded in the audit entry). */
-  grantedRoot?: string
   /** A pinned model id, when the user named one on the command line. */
   modelId?: string
   /**
@@ -830,6 +792,11 @@ interface TerminalLaunchPlan {
  * each caller re-implements in step (and could let drift). Every early return here has already surfaced
  * its line, closed the served listener when one was open, and exited non-zero.
  *
+ * THE BYPASS IS THE USER'S OWN CALL. A terminal is a human sitting at their own CLI, so `bypass`
+ * spares them prompts they would answer `yes` to every time - but a session started under `prompt`
+ * gets no bypass flag at all, and the CLI keeps confirming each write and each shell command, which is
+ * the only thing holding an injected model to the folder the session started in.
+ *
  * @param plan - The fully-grounded, mode-resolved session facts and IO seams.
  */
 async function serveRecordAndSupervise(plan: TerminalLaunchPlan): Promise<void> {
@@ -862,10 +829,9 @@ async function serveRecordAndSupervise(plan: TerminalLaunchPlan): Promise<void> 
     sessionId: plan.sessionId,
     productId: plan.productId,
     cli: plan.cli,
+    approval: plan.approval,
     instructions: plan.instructions,
-    ceiling: plan.ceiling,
     cwd: plan.cwd,
-    ...(plan.grantedRoot ? { grantedRoot: plan.grantedRoot } : {}),
     ...(plan.modelId ? { modelId: plan.modelId } : {}),
     mcpServerNames: Object.keys(plan.mcpServers)
   })
@@ -883,9 +849,7 @@ async function serveRecordAndSupervise(plan: TerminalLaunchPlan): Promise<void> 
     instructions: plan.instructions,
     localToolNames: Object.keys(plan.tools),
     mcpServers: plan.mcpServers,
-    // CLAMP ONLY: a `full` ceiling runs the CLI with its own prompts bypassed; `auto-edit` and
-    // `read-only` keep them. The session is never floored UP - a human is sitting at this terminal.
-    bypassPermissions: plan.ceiling.permissionMode === 'full',
+    bypassPermissions: plan.approval === 'bypass',
     // The USER's pinned model, never a backend echo of it: the paired spec is parsed without a `model` at
     // all, so no wire string reaches argv as a flag NAME or a comma-separated rule list - what the wire
     // contributes rides as ONE non-splittable argv element (or a JSON-quoted TOML value), and the only
@@ -920,14 +884,15 @@ export interface LocalTerminalSessionDeps {
   config: LocalAppConfig
   /** The CLI the session drives. */
   cli: TerminalCliId
-  /** The LOCAL scope's capability ceiling. It only ever CLAMPS the session (see {@link runLocalTerminalSession}). */
-  ceiling: RunPolicy
+  /**
+   * Whether this session leaves the CLI its own approval prompts. REQUIRED for the same reason the
+   * paired session's is: an omitted field must never be able to mean `bypass`.
+   */
+  approval: TerminalApproval
   /** The local audit log. The session is recorded FAIL-CLOSED, stamped `backendUrl: 'local'`, before the spawn. */
   audit: AuditLog
-  /** A folder the USER asked the session to run in, honored only inside a root granted under `LOCAL_SCOPE`. */
+  /** A folder the USER asked the session to run in, from local argv only. */
   requestedCwd?: string
-  /** The folder roots the user granted the LOCAL scope (`policy grant-folder add --local`). Empty by default. */
-  grantedRoots?: string[]
   /** A pinned model id, or `undefined` to let the CLI pick its own default. */
   modelId?: string
   /**
@@ -971,12 +936,13 @@ export interface LocalTerminalSessionDeps {
  * Every control the paired session carries is carried here, against {@link LOCAL_SCOPE} instead of a
  * backend URL - none is dropped just because nothing is watching from the network:
  *
- * - THE CEILING ONLY CLAMPS. `getPolicyCeiling(LOCAL_SCOPE)` decides the bypass exactly as it does when
- *   paired: `bypassPermissions` under a `full` ceiling only; `auto-edit` and `read-only` keep the CLI's
- *   native prompts. It is never floored UP - a human is sitting at this terminal - and a `network: 'off'`
- *   ceiling REFUSES the session, because the argv builders cannot enforce egress-off on an interactive CLI.
- * - THE CWD LEAVES THE WORK FOLDER ONLY THROUGH A LOCAL GRANT, unchanged, under the local scope: the same
- *   symlink-resolving containment against the same store, written only by `policy grant-folder add --local`.
+ * - THE USER DECIDES WHETHER THEIR CLI STILL PROMPTS, exactly as when paired. This scope DEFAULTS to
+ *   bypassing them (a human is sitting at this terminal, and nobody waits on prompts they would answer
+ *   `yes` to every time), and the same setting turns them back on.
+ * - A `--cwd` IS RESOLVED EXACTLY AS WHEN PAIRED, and authorized no more strictly: the daemon checks only
+ *   that the folder exists, and relies on whichever local caller invoked it to have obtained the path
+ *   from the user (see {@link groundSession}). That caller is more often the desktop app here than a
+ *   human at a shell, which is precisely why the obligation is the caller's and is stated as one.
  * - AN UNLOGGED SESSION IS IMPOSSIBLE. The `terminal` entry is appended BEFORE the spawn and a refused
  *   append refuses the session; it is stamped `backendUrl: 'local'`, so `{binary} log` shows an on-device
  *   session for exactly what it is.
@@ -997,7 +963,7 @@ export interface LocalTerminalSessionDeps {
  * - THE SESSION SETS NO `denyReadPaths`. A dispatched run is unattended, so the daemon denies it the
  *   daemon's own `secrets/`; a terminal session HAS a human at the keyboard, driving their own CLI, and
  *   denying reads under them would be theatre (they can read those files with `cat` in the same terminal).
- *   The RESIDUAL is therefore real and has GROWN with this phase: under a `full` ceiling the CLI in this
+ *   The RESIDUAL is therefore real and has GROWN with this phase: under `bypass` the CLI in this
  *   session can read the daemon's `secrets/` (the master key, the MCP env values, the local drive token)
  *   AND its `localDataDir` - which now holds the chat transcripts and the per-device task overrides. Local
  *   CHAT denies both; this terminal does not. That is the Phase-1 precedent, restated with its bigger blast
@@ -1008,7 +974,7 @@ export interface LocalTerminalSessionDeps {
  * answers nothing (a `claude` session would show it as a failed server at every start). It carries no app
  * tools, no wire token, and no tool-call transport - there is nothing on this device for it to proxy to.
  *
- * @param deps - The on-device config, the CLI, the ceiling, the audit log, the local MCP servers, and the IO seams.
+ * @param deps - The on-device config, the CLI, the audit log, the local MCP servers, and the IO seams.
  */
 export async function runLocalTerminalSession(deps: LocalTerminalSessionDeps): Promise<void> {
   const write = deps.write
@@ -1027,15 +993,13 @@ export async function runLocalTerminalSession(deps: LocalTerminalSessionDeps): P
     // are composed under, so a terminal session and a chat share one confined work folder.
     productId: deps.config.productId,
     cli: deps.cli,
-    ceiling: deps.ceiling,
-    grantedRoots: deps.grantedRoots ?? [],
     ...(deps.requestedCwd !== undefined ? { requestedCwd: deps.requestedCwd } : {}),
     resolveBinary,
     write,
     host
   })
   if (!ground) return
-  const { binary, binaryName, cwd, grantedRoot } = ground
+  const { binary, binaryName, cwd } = ground
 
   // Composed HERE, from the file the app staged - there is no backend to ask, and nothing to wait for.
   const instructions = composeLocalSystemPrompt(deps.config) ?? ''
@@ -1049,12 +1013,11 @@ export async function runLocalTerminalSession(deps: LocalTerminalSessionDeps): P
     sessionId,
     productId: deps.config.productId,
     cli: deps.cli,
+    approval: deps.approval,
     instructions,
-    ceiling: deps.ceiling,
     binary,
     binaryName,
     cwd,
-    ...(grantedRoot ? { grantedRoot } : {}),
     ...(deps.modelId ? { modelId: deps.modelId } : {}),
     mcpServers: localMcpServers,
     // The env re-hydration that makes an env-backed MCP server work in a terminal (and not in local chat).

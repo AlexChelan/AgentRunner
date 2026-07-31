@@ -1,0 +1,11 @@
+{
+  "toolId": "claude-code",
+  "status": "connected",
+  "authHealth": "healthy",
+  "guidance": "Install the CLI from https://example.com/install",
+  "reason": "previous attempt timed out",
+  "connections": [
+    { "toolId": "claude-code", "authHealth": "healthy" },
+    { "toolId": "codex", "authHealth": "needs-reauth" }
+  ]
+}

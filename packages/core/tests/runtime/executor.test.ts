@@ -2,7 +2,7 @@ import { createHash } from 'node:crypto'
 import { mkdtempSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import type { ConnectionRef, RunEvent } from '../../src/index'
+import type { ConnectionRef, RunEvent, ToolSet } from '../../src/index'
 import { RunStartSchema, type RunStart } from '@opencompanion/protocol'
 import { describe, expect, it, vi } from 'vitest'
 import type { AuditEntry, AuditLog } from '../../src/runtime/audit-log'
@@ -70,7 +70,6 @@ function makeDeps(over: Partial<ExecutorDeps> = {}): ExecutorDeps {
     audit: recordingAudit().audit,
     sessionManager: fakeSession(() => {}).sm,
     getConnection: () => conn,
-    getCeiling: () => ({ permissionMode: 'read-only', network: 'off' }),
     getOriginPolicy: () => ({ denySchedule: false, denyDispatch: false }),
     resolveBinary: () => '/bin/codex',
     serveTools: async () => ({ spec: { type: 'http', url: 'x' }, close: async () => {} }),
@@ -204,7 +203,9 @@ describe('executor', () => {
     process.env.CODEX_HOME = mkdtempSync(join(tmpdir(), 'codex-real-'))
     try {
       const root = appDataRoot()
-      let captured: { codexHome?: string } | undefined
+      // Collected rather than reassigned: a `let` (or a reset to `undefined`) narrows to its last
+      // assignment, and the reads below then run against `never`. One entry per dispatch, in order.
+      const seen: { codexHome?: string }[] = []
       const capturingSm = {
         startRun: (
           req: { codexHome?: string },
@@ -214,7 +215,7 @@ describe('executor', () => {
           _owner?: object | null,
           onClose?: () => void
         ) => {
-          captured = req
+          seen.push(req)
           onEvent({ type: 'done' }, 'r1')
           onClose?.()
           return 'r1'
@@ -238,9 +239,8 @@ describe('executor', () => {
         })
       )
       codexExec.start(start(), drive)
-      expect(captured?.codexHome).toBe(codexHomeDir(root))
+      expect(seen[0]?.codexHome).toBe(codexHomeDir(root))
 
-      captured = undefined
       const claudeExec = createExecutor(
         makeDeps({
           appDataRoot: root,
@@ -249,7 +249,8 @@ describe('executor', () => {
         })
       )
       claudeExec.start(start({ connectionId: 'claude-code' }), drive)
-      expect(captured?.codexHome).toBeUndefined()
+      // The SECOND dispatch: Claude Code needs no isolated home, so it must carry none.
+      expect(seen[1]?.codexHome).toBeUndefined()
     } finally {
       if (saved === undefined) delete process.env.CODEX_HOME
       else process.env.CODEX_HOME = saved
@@ -263,7 +264,7 @@ describe('executor', () => {
       onEvent({ type: 'done' }, runId)
     })
     const exec = createExecutor(
-      makeDeps({ sessionManager: sm, getCeiling: () => ({ permissionMode: 'auto-edit', network: 'off' }) })
+      makeDeps({ sessionManager: sm })
     )
     exec.start(start({ runId: 'dispatch-perm' }), {
       onEvent: (m) => events.push(m.event),
@@ -276,13 +277,13 @@ describe('executor', () => {
     expect(events.map((e) => e.type)).toEqual(['done'])
   })
 
-  it('floors a clamped read-only mode UP to auto-edit under a permissive ceiling (unattended posture)', () => {
-    let seenReq: { permissionMode?: string } | undefined
+  it('drives a dispatched run at the floor even under the most permissive requested policy', () => {
+    let seenReq: { permissionMode?: string; allowedTools?: string[] } | undefined
     const { sm } = fakeSession(() => {})
     const smSpy = {
       ...sm,
       startRun: (
-        req: { permissionMode?: string },
+        req: { permissionMode?: string; allowedTools?: string[] },
         ctx: { runId: string },
         _r: unknown,
         onEvent: (e: RunEvent, id: string) => void
@@ -293,69 +294,105 @@ describe('executor', () => {
       }
     }
     const exec = createExecutor(
-      // A permissive (auto-edit) ceiling with an absent requested policy clamps to the unattended
-      // read-only floor; the executor then floors it up to auto-edit so the CLI can act.
-      makeDeps({ sessionManager: smSpy, getCeiling: () => ({ permissionMode: 'auto-edit', network: 'off' }) })
+      makeDeps({ sessionManager: smSpy })
     )
-    exec.start(start(), { onEvent: () => {}, onToolCall: async () => undefined, onClose: () => {} })
-    expect(seenReq?.permissionMode).toBe('auto-edit')
-  })
-
-  it('honors an explicit read-only CEILING: does NOT floor up (opt-in non-destructive companion) (D1)', () => {
-    let seenReq: { permissionMode?: string } | undefined
-    const { sm } = fakeSession(() => {})
-    const smSpy = {
-      ...sm,
-      startRun: (
-        req: { permissionMode?: string },
-        ctx: { runId: string },
-        _r: unknown,
-        onEvent: (e: RunEvent, id: string) => void
-      ) => {
-        seenReq = req
-        onEvent({ type: 'done' }, ctx.runId)
-        return ctx.runId
-      }
-    }
-    const exec = createExecutor(
-      // A read-only CEILING is a builder opting into a non-destructive companion: even a run that
-      // requests `full` clamps to read-only, and the floor must NOT raise it to auto-edit.
-      makeDeps({ sessionManager: smSpy, getCeiling: () => ({ permissionMode: 'read-only', network: 'off' }) })
-    )
-    exec.start(start({ policy: { permissionMode: 'full', network: 'off' } }), {
+    // The most permissive policy a backend can ask for. The floor is not clampable, so the request that
+    // actually reaches the session manager is still the bottom of the ladder, and its allow-list holds
+    // only the CLI's web tools - this dispatch carries no manifest tools, and egress is the one thing a
+    // run may still ask for.
+    exec.start(start({ policy: { permissionMode: 'full', network: 'on' } }), {
       onEvent: () => {},
       onToolCall: async () => undefined,
       onClose: () => {}
     })
     expect(seenReq?.permissionMode).toBe('read-only')
+    expect(seenReq?.allowedTools).toEqual(['WebSearch', 'WebFetch'])
   })
 
-  it('leaves a higher (full) permission mode unchanged (the floor never lowers)', () => {
-    let seenReq: { permissionMode?: string } | undefined
+  it('RUNS a CLI the floor cannot be enforced for, and records it as unconfined', () => {
+    // Ruled: a user keeps their preferred CLI, so opencode and Hermes are allowed on the dispatched
+    // path and DISCLOSED rather than refused. What must not happen is silence - the local audit log is
+    // the one record the user owns and no backend can rewrite, so a run the daemon could only ASK to
+    // stay in its work folder is marked `unconfined`. Without that mark, a run that could not leave the
+    // folder and one that merely was not seen to leave it are indistinguishable afterwards.
     const { sm } = fakeSession(() => {})
+    const started: unknown[] = []
+    // Mirrors the real `startRun`, which RETURNS the run id - a stub returning `undefined` is not a
+    // `SessionManager` and only compiled because this file was never typechecked.
     const smSpy = {
       ...sm,
-      startRun: (
-        req: { permissionMode?: string },
-        ctx: { runId: string },
-        _r: unknown,
-        onEvent: (e: RunEvent, id: string) => void
-      ) => {
-        seenReq = req
-        onEvent({ type: 'done' }, ctx.runId)
-        return ctx.runId
+      startRun: (...args: unknown[]) => {
+        started.push(args)
+        return 'run-not-started'
       }
     }
+    const events: RunEvent[] = []
+    const { audit, appends } = recordingAudit()
     const exec = createExecutor(
-      makeDeps({ sessionManager: smSpy, getCeiling: () => ({ permissionMode: 'full', network: 'off' }) })
+      makeDeps({
+        sessionManager: smSpy,
+        audit,
+        getConnection: () => ({ id: 'oc', toolId: 'opencode', authMode: 'subscription' })
+      })
     )
-    // A full ceiling AND a full requested policy clamp to full; the floor must not lower it.
-    exec.start(start({ policy: { permissionMode: 'full', network: 'off' } }), {
+    exec.start(start({ connectionId: 'oc' }), {
+      onEvent: (m) => events.push(m.event),
+      onToolCall: async () => undefined,
+      onClose: () => {}
+    })
+
+    // It RUNS: the CLI is started and no error frame is emitted.
+    expect(started).toHaveLength(1)
+    expect(events.some((e) => e.type === 'error')).toBe(false)
+    // And it is audited as dispatched, carrying the mark that says the floor was asked for, not made.
+    expect(appends.map((e) => e.event)).toContain('dispatched')
+    expect(appends.find((e) => e.event === 'dispatched')?.detail?.unconfined).toBe('opencode')
+  })
+
+  it('does NOT mark a confinable CLI unconfined', () => {
+    // The mark has to discriminate, or it is decoration. Claude Code is genuinely confined, so its
+    // dispatched entry must carry no `unconfined` key at all - not an empty string, not "false".
+    const { sm } = fakeSession((onEvent, runId) => onEvent({ type: 'done' }, runId))
+    const { audit, appends } = recordingAudit()
+    const exec = createExecutor(makeDeps({ sessionManager: sm, audit }))
+    exec.start(start(), {
       onEvent: () => {},
       onToolCall: async () => undefined,
       onClose: () => {}
     })
-    expect(seenReq?.permissionMode).toBe('full')
+    expect(appends.find((e) => e.event === 'dispatched')?.detail?.unconfined).toBeUndefined()
+  })
+
+  it('still runs a confinable CLI (the refusal is per-tool, not a blanket stop)', () => {
+    const { sm } = fakeSession((onEvent, runId) => onEvent({ type: 'done' }, runId))
+    const events: RunEvent[] = []
+    const exec = createExecutor(makeDeps({ sessionManager: sm }))
+    exec.start(start(), {
+      onEvent: (m) => events.push(m.event),
+      onToolCall: async () => undefined,
+      onClose: () => {}
+    })
+    expect(events.map((e) => e.type)).toEqual(['done'])
+  })
+
+  it('lets the LOCAL leg keep an unconfinable CLI (the refusal is dispatched-only)', () => {
+    // The user's own machine is not the threat the refusal addresses: they are sitting in front of it,
+    // and their terminal, desktop chats and local mode must keep every CLI they connected.
+    const { sm } = fakeSession((onEvent, runId) => onEvent({ type: 'done' }, runId))
+    const events: RunEvent[] = []
+    const exec = createExecutor(
+      makeDeps({
+        sessionManager: sm,
+        backendKey: 'local',
+        getConnection: () => ({ id: 'oc', toolId: 'opencode', authMode: 'subscription' })
+      })
+    )
+    exec.start(start({ connectionId: 'oc' }), {
+      onEvent: (m) => events.push(m.event),
+      onToolCall: async () => undefined,
+      onClose: () => {}
+    })
+    expect(events.map((e) => e.type)).toEqual(['done'])
   })
 
   it('cleans up (onClose) on a terminal event', () => {
@@ -393,8 +430,7 @@ describe('executor', () => {
   })
 
   it('serves web tools over loopback MCP and proxies a manifest tool execute as a tool.call UP', async () => {
-    const serveTools = vi.fn(
-      async (tools: Record<string, { execute?: (a: unknown, o: unknown) => Promise<unknown> }>) => {
+    const serveTools = vi.fn(async (tools: ToolSet) => {
         // Drive the served tool's execute to assert it proxies a tool.call and resolves on result.
         const result = await tools.knowledge_search?.execute?.({ q: 'x' }, { toolCallId: 'local', messages: [] })
         proxied.push(result)
@@ -476,7 +512,9 @@ describe('executor', () => {
   it('honors a cancel that arrives while serveTools() is still pending: closes the handle, never starts, audits cancelled (I12)', async () => {
     let started = false
     let closed = false
-    let resolveServe: ((v: { spec: { type: 'http'; url: string }; close: () => Promise<void> }) => void) | null = null
+    const serve: {
+      resolve: ((v: { spec: { type: 'http'; url: string }; close: () => Promise<void> }) => void) | null
+    } = { resolve: null }
     const { sm } = fakeSession(() => {})
     const smSpy = {
       ...sm,
@@ -499,7 +537,7 @@ describe('executor', () => {
         // A serveTools that stays pending until we resolve it, so the cancel lands in the window.
         serveTools: () =>
           new Promise((resolve) => {
-            resolveServe = resolve
+            serve.resolve = resolve
           }),
         shouldServe: () => true
       })
@@ -513,7 +551,7 @@ describe('executor', () => {
     // Cancel BEFORE serveTools resolves (the run is not in the session manager yet).
     exec.cancel('pending-run')
     // Now serveTools resolves: the run must be closed (handle torn down) and NEVER started.
-    resolveServe?.({
+    serve.resolve?.({
       spec: { type: 'http', url: 'http://127.0.0.1:9/x/mcp' },
       close: async () => {
         closed = true
@@ -553,6 +591,47 @@ describe('executor', () => {
     // The terminal `done` reaped the run synchronously, so it is no longer counted.
     expect(exec.activeRunCount()).toBe(0)
   })
+
+  // Preparing a run is not free of failure: `buildRun` resolves the confined work folder and REFUSES a
+  // crafted productId, and the Codex isolation ahead of it does real mkdir/symlink/write work. The run
+  // is already counted as in flight by then, so a throw that never reached the close path pinned that
+  // slot for the life of the daemon - at the default cap of two, two such runs leave the device
+  // declining every later run with zero free slots and never reporting idle to the self-updater again.
+  it('releases the slot when preparing the run throws before the CLI is started', () => {
+    const { sm } = fakeSession(() => {})
+    const exec = createExecutor(makeDeps({ sessionManager: sm }))
+    const closed = vi.fn()
+    const events: RunEvent[] = []
+    exec.start(start({ runId: 'crafted-1', productId: '../escape' }), {
+      onEvent: (msg) => events.push(msg.event),
+      onToolCall: async () => undefined,
+      onClose: closed
+    })
+    expect(exec.activeRunCount()).toBe(0)
+    expect(closed).toHaveBeenCalledOnce()
+    // The caller learns the run is over, and BEFORE the close so a settle path reading the terminal
+    // event (the local schedule runner, the local fallback) still sees it.
+    expect(events.at(-1)?.type).toBe('error')
+  })
+
+  it('keeps taking work after a run failed to prepare, rather than pinning the cap', () => {
+    const { sm } = fakeSession(() => {})
+    const exec = createExecutor(makeDeps({ sessionManager: sm }))
+    for (const runId of ['crafted-1', 'crafted-2']) {
+      exec.start(start({ runId, productId: '../escape' }), {
+        onEvent: () => {},
+        onToolCall: async () => undefined,
+        onClose: () => {}
+      })
+    }
+    expect(exec.activeRunCount()).toBe(0)
+    exec.start(start({ runId: 'good-1' }), {
+      onEvent: () => {},
+      onToolCall: async () => undefined,
+      onClose: () => {}
+    })
+    expect(exec.activeRunCount()).toBe(1)
+  })
 })
 
 describe('executor audit', () => {
@@ -564,7 +643,7 @@ describe('executor audit', () => {
     })
     const { audit, appends } = recordingAudit((e) => order.push(`audit:${e.event}`))
     const exec = createExecutor(
-      makeDeps({ sessionManager: sm, audit, getCeiling: () => ({ permissionMode: 'auto-edit', network: 'off' }) })
+      makeDeps({ sessionManager: sm, audit })
     )
     exec.start(start({ runId: 'r-order', productId: 'prod-7' }), {
       onEvent: () => {},
@@ -583,8 +662,9 @@ describe('executor audit', () => {
       toolId: 'codex'
     })
     expect(dispatched?.promptSha256).toMatch(/^[0-9a-f]{64}$/)
-    // The audited policy is the posture the run ACTUALLY executes under (floored up to auto-edit).
-    expect(dispatched?.policy).toEqual({ permissionMode: 'auto-edit', network: 'off' })
+    // The audited policy is the posture the run ACTUALLY executes under: the dispatched floor, not
+    // whatever the dispatch asked for.
+    expect(dispatched?.policy).toEqual({ permissionMode: 'read-only', network: 'off' })
   })
 
   it("records a run's origin tag in the dispatched audit entry", () => {
@@ -745,7 +825,7 @@ describe('executor audit', () => {
     // The run is cancelled while `serveTools()` is still pending, and the serve THEN rejects (e.g. the
     // loopback listener failed to bind). The user's cancel must win over the serve failure: the run is
     // recorded as cancelled (not failed) and no `error` frame is surfaced.
-    let rejectServe: ((e: unknown) => void) | null = null
+    const serve: { reject: ((e: unknown) => void) | null } = { reject: null }
     const events: RunEvent[] = []
     const { sm, startedWith } = fakeSession(() => {})
     const { audit, appends } = recordingAudit()
@@ -755,7 +835,7 @@ describe('executor audit', () => {
         audit,
         serveTools: () =>
           new Promise((_resolve, reject) => {
-            rejectServe = reject
+            serve.reject = reject
           }),
         shouldServe: () => true
       })
@@ -769,7 +849,7 @@ describe('executor audit', () => {
     // Cancel BEFORE serveTools settles (the run is not in the session manager yet)...
     exec.cancel('cancel-then-reject')
     // ...then serveTools rejects. The cancel wins.
-    rejectServe?.(new Error('listen EADDRINUSE'))
+    serve.reject?.(new Error('listen EADDRINUSE'))
     for (let i = 0; i < 10; i++) await Promise.resolve()
     expect(startedWith).toHaveLength(0)
     expect(appends.map((e) => e.event)).toEqual(['dispatched', 'cancelled'])

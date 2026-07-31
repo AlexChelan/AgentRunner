@@ -2,13 +2,14 @@ import { realpathSync } from 'node:fs'
 import { argv as processArgv } from 'node:process'
 import { fileURLToPath } from 'node:url'
 import { BRAND } from './brand'
+import { cmdApprovals } from './commands/approvals'
 import { cmdBackends, cmdStatus } from './commands/backends'
 import { cmdConnect, cmdDisconnect } from './commands/connect'
 import { cmdLimits } from './commands/limits'
+import { cmdOrigin } from './commands/origin'
 import { cmdLog } from './commands/log'
 import { cmdMcp } from './commands/mcp'
 import { cmdPair, cmdUnpair } from './commands/pair'
-import { cmdPolicy } from './commands/policy'
 import { cmdServe } from './commands/serve'
 import { cmdService } from './commands/service'
 import { cmdSetup, cmdUninstall } from './commands/setup'
@@ -32,20 +33,18 @@ const USAGE =
   '                                               (--local: connect for purely-local use, no backend pairing)\n' +
   `  disconnect <claude-code|codex|opencode|hermes> [--local]  stop ${BRAND.name} driving a CLI (keeps it installed)\n` +
   '  status [--json]                              print pairing + per-CLI connection state (--json: machine-readable)\n' +
-  '  backends                                     list paired backends (device id, connected CLIs, ceiling, daemon state)\n' +
+  '  backends                                     list paired backends (device id, connected CLIs, daemon state)\n' +
   '  log [--url <backend>] [--json] [-n <count>]  print the local audit trail (oldest-first; --json for piping)\n' +
-  '  policy show [--url <backend>] [--local]      show each backend permission ceiling, network, confined work root, and granted folders\n' +
-  '  policy set (--url <backend> | --local) [--permission-mode <read-only|auto-edit|full>] [--network <on|off>]\n' +
-  '             [--schedule <allow|deny>] [--dispatch <allow|deny>]\n' +
-  '                                               clamp a backend ceiling and/or allow/deny scheduled and\n' +
-  '                                               app-dispatched runs (at least one flag; an unset field is kept)\n' +
-  '  policy grant-folder list [--url <backend>] [--local]   list the folders your terminal sessions may run in\n' +
-  '  policy grant-folder add <path> [--url <backend>] [--local]     let `terminal --cwd` run in one of YOUR folders\n' +
-  '  policy grant-folder remove <path> [--url <backend>] [--local]  revoke a folder grant\n' +
-  '                                               (grants are local, audited, and per backend; a backend can never add one)\n' +
-  '                                               (--local: manage records for purely-local use, no backend pairing)\n' +
+  '  origin [show] [--url <backend>] [--local]    whether this device accepts scheduled / app-dispatched work\n' +
+  '  origin set (--url <backend> | --local) [--schedule <allow|deny>] [--dispatch <allow|deny>]\n' +
+  '                                               refuse (or re-allow) a kind of work on THIS machine;\n' +
+  '                                               chat is always allowed and an omitted flag is kept\n' +
+  '  approvals [show] [--url <backend>] [--local]  whether a terminal session leaves your CLI its own approval prompts\n' +
+  '  approvals set (--url <backend> | --local) --mode <prompt|bypass>\n' +
+  '                                               prompt: the CLI asks before it writes files or runs commands;\n' +
+  '                                               bypass: it runs without asking (the default for --local)\n' +
   '  limits [show]                                show the max concurrent runs cap (a local resource limit; default 2)\n' +
-  '  limits set --max-concurrent-runs <n>         cap how many dispatched runs execute at once (applies within a poll, no restart)\n' +
+  '  limits set --max-concurrent-runs <n>         cap how many dispatched runs execute at once (applies to the next run, no restart)\n' +
   '  mcp list [--url <backend>] [--local]         list your own local MCP servers (a backend can never add one)\n' +
   '  mcp add <name> (--url <backend> | --local)   connect one of YOUR MCP servers to your terminal sessions\n' +
   '          (--http <url> | --command <bin> [--arg <a>]... [--env K=V]...)\n' +
@@ -53,7 +52,7 @@ const USAGE =
   '                                               (--local: your own MCP servers for purely-local use, no backend pairing)\n' +
   '  terminal [<productId>] [--url <backend>]     open your CLI as an interactive session wired to your product\n' +
   '           [--cli claude-code|codex] [--model <id>]  (its tools, your MCP servers, its work folder)\n' +
-  '           [--cwd <path>]                      run the session in one of YOUR folders instead (must be granted)\n' +
+  '           [--cwd <path>]                      run the session in one of YOUR folders instead\n' +
   '  terminal --local --app-config <path>         open that session with no backend at all - composed on this device\n' +
   '  serve [--url <backend>] [--if-paired]        pair + connect a CLI if needed, then run the daemon\n' +
   '                                               (--if-paired: run only when already paired, else print a hint and exit 0)\n' +
@@ -62,20 +61,41 @@ const USAGE =
   '  --version                                    print the installed version\n'
 
 /**
+ * Commands this build no longer has, and what a user who types one is told.
+ *
+ * A retired command that falls through to the usage banner reads as a typo, so someone who scripted
+ * `policy set --network off` to air-gap a pairing would re-run it, see a generic banner, and never
+ * learn that the setting is gone AND that egress is now permitted to a dispatched run that asks for it.
+ * That is a capability WIDENING landing silently on an existing install, which is the one class of
+ * change that has to name itself.
+ */
+const RETIRED_COMMANDS: Record<string, string> = {
+  policy:
+    `${BRAND.binary}: \`policy\` was removed. The per-backend capability ceiling it wrote is gone: a ` +
+    'dispatched run is now floored structurally - no files, no shell, no local MCP servers - whatever ' +
+    'any stored value said, so the permission half no longer had anything to clamp THERE.\n' +
+    `It still does for a TERMINAL session, and that control moved rather than going away: \`${BRAND.binary} ` +
+    'approvals set --mode prompt|bypass` decides whether your CLI keeps its own approval prompts, and a ' +
+    'ceiling you set with the old command is still honored until you choose again.\n' +
+    'The NETWORK half is a real change: `--network off` no longer air-gaps a pairing. A ' +
+    'dispatched run that ASKS for egress now gets it (so the CLI keeps its own web tools); one that ' +
+    'asks for nothing is still clamped off.\n' +
+    `Use \`${BRAND.binary} origin\` to refuse scheduled or app-dispatched work on this machine outright, ` +
+    `and \`${BRAND.binary} status\` to print what a paired app can and cannot do here.`
+}
+
+/**
  * The OpenCompanion headless CLI entry. `opencompanion setup` pairs, connects the CLIs, and installs the
  * always-on service in one step (what the installer runs); `opencompanion pair` runs the RFC-8628 device-authorization
  * grant against a buyer backend's Better Auth and stores the session bearer; `opencompanion connect`
  * detects / installs / logs in the user's subscription coding CLIs; `opencompanion disconnect <tool>` stops
  * the companion driving one CLI (leaving it installed + signed in); `opencompanion status` prints
  * the non-secret pairing + connection state; `opencompanion backends` lists each paired backend with its
- * device id, connected-CLI count, capability ceiling, and daemon state; `opencompanion policy show` prints
- * each backend's capability ceiling, network, confined work root, and granted folders, and `opencompanion policy set` clamps
- * a backend's ceiling (permission mode and/or network, auditing the change); `opencompanion policy grant-folder
- * list|add|remove` manages the folders a `terminal --cwd` may run in - the ONE way a session leaves its confined
- * work folder, so a grant is named by the user at this machine, stored per backend, and audited like any other
- * policy change (no backend can add, name, or widen one); `opencompanion limits show` prints
- * the local concurrent-run cap and `opencompanion limits set --max-concurrent-runs <n>` changes it (applied within a poll,
- * no restart); `opencompanion mcp list|add|remove` manages the user's OWN local MCP servers per backend -
+ * device id, connected-CLI count, and daemon state; `opencompanion approvals show|set` decides whether an
+ * interactive terminal session leaves the user's coding CLI its own approval prompts (per scope, `prompt`
+ * by default when paired and `bypass` for the purely-local scope); `opencompanion limits show` prints
+ * the local concurrent-run cap and `opencompanion limits set --max-concurrent-runs <n>` changes it (applied to the
+ * next run, no restart); `opencompanion mcp list|add|remove` manages the user's OWN local MCP servers per backend -
  * the servers a `terminal` session gets beside the app's tools, so a buyer's app can expose LOCAL data
  * (a private database, an internal service) to the CLI without any of it crossing the network; they come
  * ONLY from this local config (a backend can never add one - server-pushed MCP servers are always
@@ -88,8 +108,8 @@ const USAGE =
  * tools served over a loopback MCP, the user's local MCP servers beside them, the backend's composed
  * instructions as the system prompt, and the
  * product's confined work folder as the cwd (`[<productId>]` names the workspace, `--cli` picks the CLI,
- * `--model` pins the model, and `--cwd` runs it in a folder the user granted instead; the backend ceiling only
- * ever clamps the session, never raises it, and it is
+ * `--model` pins the model, and `--cwd` runs it in any folder the user names; the scope's `approvals`
+ * setting decides whether the CLI keeps its own prompts, and the session is
  * audited fail-closed before the CLI starts); `opencompanion
  * serve` pairs + connects a CLI on demand then boots the daemon (foreground) so it receives + executes dispatched runs; `opencompanion
  * service` manages the always-on per-user OS service; `opencompanion update` applies the latest release
@@ -97,7 +117,7 @@ const USAGE =
  * stdout and exits 0. Never throws to the top level: a failure prints a clear line and exits non-zero.
  *
  * TWO SaaS LOGINS CAN SHARE ONE MACHINE. Every per-pairing record - the bearer, the connected CLIs, the
- * ceiling, the folder grants, the local MCP servers and the confined work folder - is keyed by the
+ * terminal approvals, the local MCP servers and the confined work folder - is keyed by the
  * ACCOUNT the pairing belongs to, not by the backend URL alone, so a second login neither overwrites the
  * first's pairing nor runs inside its files. `--url` still names the backend; `--user <id>` names the
  * account when one backend carries two, and any command that would otherwise have to guess refuses and
@@ -154,8 +174,12 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
     cmdLog(argv)
     return
   }
-  if (command === 'policy') {
-    await cmdPolicy(argv)
+  if (command === 'origin') {
+    await cmdOrigin(argv)
+    return
+  }
+  if (command === 'approvals') {
+    await cmdApprovals(argv)
     return
   }
   if (command === 'limits') {
@@ -181,6 +205,12 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
   if (command === 'update') {
     await cmdUpdate(argv)
     return
+  }
+
+  const retired = RETIRED_COMMANDS[command ?? '']
+  if (retired) {
+    process.stderr.write(`${retired}\n`)
+    process.exit(1)
   }
 
   process.stderr.write(USAGE)

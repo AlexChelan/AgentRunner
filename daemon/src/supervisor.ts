@@ -15,6 +15,16 @@ export interface SessionSupervisor {
   running(): string[]
   /** The total runs in flight across every running session (zero = the daemon is idle). */
   activeRunCount(): number
+  /**
+   * Has EVERY running session re-report the machine's free run slots to its own backend.
+   *
+   * The concurrent-run cap is machine-global, so a run settling in one scope frees a slot for all of
+   * them - but each backend only ever sees its own runs end. Without the fan-out, a backend that was
+   * told "no capacity" while another scope was busy would never be told otherwise, and its queued work
+   * would wait for a reconnect. Fire-and-forget: a report is a wake, and the next settled run sends
+   * another.
+   */
+  reportCapacityFreed(): void
 }
 
 /** Injected dependencies for {@link createSessionSupervisor}. */
@@ -132,6 +142,9 @@ export function createSessionSupervisor(deps: SessionSupervisorDeps): SessionSup
     reconcile,
     running: () => [...sessions.keys()],
     activeRunCount: () => [...sessions.values()].reduce((total, session) => total + session.activeRunCount(), 0),
+    reportCapacityFreed: (): void => {
+      for (const session of sessions.values()) void session.reportCapacity()
+    },
     async stop(): Promise<void> {
       if (stopped) return
       stopped = true

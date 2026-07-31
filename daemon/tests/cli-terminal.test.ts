@@ -8,7 +8,6 @@ import {
   tempAppData,
   pairWithBearer,
   projectDir,
-  grantsOf,
   createStateStore,
   BRAND,
   childSpawn
@@ -124,31 +123,23 @@ describe('cli routing - terminal', () => {
   })
 
 
-  // FOLDER GRANTS. The daemon's terminal is confined to the product's work folder, which would delete
-  // the one thing people actually open a terminal for: their own project. A grant restores it WITHOUT
-  // handing the capability to the network - the folder is named by the user, at this machine, in a
-  // local command, and it is audited like any other policy change.
+  // A `--cwd` IS THE USER'S OWN CONSENT. The daemon's terminal defaults to the product's work folder,
+  // which would delete the one thing people actually open a terminal for: their own project. `--cwd`
+  // restores it, and it reaches the daemon only from local argv - the terminal spec a backend answers
+  // with is parsed against a four-key schema that strips every other key, so no backend can send a path.
 
   /** A real project folder on disk (canonical, so expectations match what the daemon resolves). */
   function projectDir(name: string): string {
     return realpathSync(mkdtempSync(join(tmpdir(), `companion-project-${name}-`)))
   }
 
-  /** The stored granted roots for a backend, read through a FRESH store (the daemon's own read). */
-  async function grantsOf(appDataRoot: string, backendUrl: string): Promise<string[]> {
-    return createStateStore({ cwd: appDataRoot }).listGrantedFolders(backendUrl)
-  }
-
-  // The end-to-end point of the grant: `terminal --cwd` runs the CLI in the user's OWN project, and
-  // ONLY inside a folder they granted at this machine. Nothing on the wire can widen this.
-  it('"terminal --cwd" runs in a granted folder and records the granted root in the audit entry', async () => {
-    const solo = tempAppData('cwdgrant')
-    const url = 'https://cwdgrant.example'
+  it('"terminal --cwd" runs in the user\'s own project and records the cwd in the audit entry', async () => {
+    const solo = tempAppData('cwdown')
+    const url = 'https://cwdown.example'
     const state = await pairWithBearer(solo, url)
     state.upsertConnection(url, { toolId: 'claude-code', source: 'reused', authHealth: 'healthy' })
     const project = projectDir('acme')
     mkdirSync(join(project, 'app', 'api'), { recursive: true })
-    await run(['policy', 'grant-folder', 'add', project, '--url', url])
 
     vi.stubGlobal('fetch', async (target: string) => {
       const body = target.endsWith('/connect')
@@ -159,41 +150,37 @@ describe('cli routing - terminal', () => {
         headers: { 'content-type': 'application/json' }
       })
     })
-    // A NESTED path inside the grant (the single-component work-folder check would have refused it).
+    // A NESTED path (the single-component work-folder check would have refused it), and no second
+    // command to allow it first - the regression here is the daemon demanding a stored grant.
     const nested = join(project, 'app', 'api')
     await run(['terminal', 'acme', '--url', url, '--cwd', nested])
 
     const [, , opts] = childSpawn.mock.calls[0] ?? []
     expect((opts as { cwd?: string } | undefined)?.cwd).toBe(nested)
+    expect(out.exitCode).not.toBe(1)
 
-    // The trust log must say WHERE the session ran and under WHICH grant it was allowed to.
+    // The trust log must still say WHERE the session ran.
     const { createAuditLog } = await import('@opencompanion/core/runtime/audit-log')
     const { auditDir } = await import('@opencompanion/core/runtime/paths')
     const entry = createAuditLog({ dir: auditDir(solo) })
       .read({ backendUrl: url })
       .find((e) => e.event === 'terminal')
     expect(entry?.detail?.cwd).toBe(nested)
-    expect(entry?.detail?.grantedRoot).toBe(project)
   })
 
-  it('"terminal --cwd" outside every grant refuses the session, naming the grant command', async () => {
-    const solo = tempAppData('cwddeny')
-    const url = 'https://cwddeny.example'
+  it('"terminal --cwd" still refuses a folder that does not exist', async () => {
+    const solo = tempAppData('cwdmissing')
+    const url = 'https://cwdmissing.example'
     const state = await pairWithBearer(solo, url)
     state.upsertConnection(url, { toolId: 'claude-code', source: 'reused', authHealth: 'healthy' })
-    const granted = projectDir('granted')
-    const other = projectDir('other')
-    await run(['policy', 'grant-folder', 'add', granted, '--url', url])
 
     const fetchSpy = vi.fn(async () => new Response('{}', { status: 200 }))
     vi.stubGlobal('fetch', fetchSpy)
-    await run(['terminal', 'acme', '--url', url, '--cwd', other])
+    await run(['terminal', 'acme', '--url', url, '--cwd', join(projectDir('gone'), 'nope')])
 
     expect(out.exitCode).toBe(1)
     expect(childSpawn).not.toHaveBeenCalled()
-    // Refused BEFORE any network call: no session is composed and no wire token is minted for a
-    // terminal that can never open.
+    // Refused BEFORE any network call: no wire token is minted for a terminal that can never open.
     expect(fetchSpy).not.toHaveBeenCalled()
-    expect(out.stdout + out.stderr).toContain(`${BRAND.binary} policy grant-folder add`)
   })
 })

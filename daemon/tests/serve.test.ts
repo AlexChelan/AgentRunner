@@ -9,8 +9,9 @@ import type { AuthHealthMonitor, AuthHealthMonitorDeps } from '@opencompanion/co
 import * as backendSessionModule from '@opencompanion/core/runtime/backend-session'
 import { BRAND } from '../src/brand'
 import { bearerKey } from '@opencompanion/core/runtime/pair'
-import type { HttpClient } from '@opencompanion/core/runtime/poll-client'
-import { createRecordingHttp, type RecordedRequest } from './support/fake-backend'
+import type { StreamOpener } from '@opencompanion/core/runtime/backend-http'
+import type { HttpClient } from '@opencompanion/core/runtime/stream-client'
+import { createRecordingHttp, streamFrom, type RecordedRequest } from './support/fake-backend'
 import { startDaemon, type ServeDeps } from '../src/serve'
 import * as autoUpdateModule from '../src/update/auto-update'
 import type { UpdaterDeps } from '../src/update/updater'
@@ -31,12 +32,12 @@ function fixtures(): { appDataRoot: string; state: StateStore; secrets: SecretSt
 }
 
 /** A recording fake HTTP client that scripts the transport responses by path. */
-function fakeHttp(): { http: HttpClient; calls: RecordedRequest[] } {
-  return createRecordingHttp((recorded) => {
+function fakeHttp(): { http: HttpClient; openStream: StreamOpener; calls: RecordedRequest[] } {
+  const recording = createRecordingHttp((recorded) => {
     if (recorded.url.endsWith('/connect')) {
       return {
         status: 200,
-        json: async () => ({ companionId: 'u1:d1', wireToken: 'wire-token', pollIntervalMs: 999_999 })
+        json: async () => ({ companionId: 'u1:d1', wireToken: 'wire-token' })
       }
     }
     if (recorded.url.includes('/poll')) {
@@ -44,6 +45,7 @@ function fakeHttp(): { http: HttpClient; calls: RecordedRequest[] } {
     }
     return { status: 200, json: async () => ({ cancel: [] }) }
   })
+  return { ...recording, openStream: streamFrom(recording.http) }
 }
 
 /** Wires a daemon over the fakes, pre-pairing the backend unless `pair` is false. */
@@ -62,9 +64,14 @@ function bootDeps(over: Partial<ServeDeps> & { pair?: boolean } = {}) {
     isAlive: () => false,
     registry: { getAdapters: () => [], getAdapter: () => undefined, requireAdapter: () => { throw new Error('x') } },
     http,
+    openStream: streamFrom(http),
     write: (line) => void lines.push(line),
     ...over
   }
+  // The stream must be built from the http fake that actually SURVIVES the overrides: a caller that
+  // scripts its own client would otherwise get this helper's default empty batch served to it, and the
+  // instruction it scripted would never arrive.
+  if (!over.openStream) deps.openStream = streamFrom(deps.http ?? http)
   return { deps, state, secrets, calls, lines }
 }
 
@@ -157,6 +164,7 @@ describe('startDaemon (serve)', () => {
       isAlive: () => false,
       registry: { getAdapters: () => [], getAdapter: () => undefined, requireAdapter: () => { throw new Error('x') } },
       http,
+      openStream: streamFrom(http),
       write: (line) => void lines.push(line)
     })
     expect(daemon).not.toBeNull()
@@ -186,6 +194,7 @@ describe('startDaemon (serve)', () => {
       isAlive: () => false,
       registry: { getAdapters: () => [], getAdapter: () => undefined, requireAdapter: () => { throw new Error('x') } },
       http,
+      openStream: streamFrom(http),
       write: () => undefined
     })
     expect(daemon).not.toBeNull()
@@ -212,6 +221,7 @@ describe('startDaemon (serve)', () => {
       isAlive: () => false,
       registry: { getAdapters: () => [], getAdapter: () => undefined, requireAdapter: () => { throw new Error('x') } },
       http,
+      openStream: streamFrom(http),
       write: () => undefined
     })
     expect(daemon).not.toBeNull()
@@ -240,6 +250,7 @@ describe('startDaemon (serve)', () => {
       isAlive: () => false,
       registry: { getAdapters: () => [], getAdapter: () => undefined, requireAdapter: () => { throw new Error('x') } },
       http,
+      openStream: streamFrom(http),
       write: (line) => void lines.push(line)
     })
     expect(daemon).not.toBeNull()
@@ -267,6 +278,7 @@ describe('startDaemon (serve)', () => {
       isAlive: () => false,
       registry,
       http,
+      openStream: streamFrom(http),
       write: (line) => void lines.push(line)
     })
     // The single filtered backend could not start a session, so the daemon refuses to boot (cmdServe
@@ -283,6 +295,7 @@ describe('startDaemon (serve)', () => {
       isAlive: () => true,
       registry,
       http,
+      openStream: streamFrom(http),
       write: () => undefined
     })
     expect(reboot).not.toBeNull()
@@ -356,6 +369,7 @@ describe('startDaemon (serve)', () => {
       isAlive: () => false,
       registry: { getAdapters: () => [], getAdapter: () => undefined, requireAdapter: () => { throw new Error('x') } },
       http,
+      openStream: streamFrom(http),
       write: () => undefined
     }
     const daemon = await startDaemon(deps)
@@ -370,8 +384,11 @@ describe('startDaemon (serve)', () => {
       source: 'reused',
       authHealth: 'healthy'
     })
-    // Advance past a full poll window; the daemon's fresh read must now report the new connection.
-    await vi.advanceTimersByTimeAsync(1100)
+    // Advance past the WHOLE reconnect window, not just its floor: the backoff is fully jittered, so
+    // the first retry lands anywhere in [1s, 2s] and a device that reconnected at the floor every time
+    // would be the fleet-wide lockstep the jitter exists to prevent. The daemon's fresh read must then
+    // report the new connection on whichever reconnect it made.
+    await vi.advanceTimersByTimeAsync(2100)
     const last = pollUrls[pollUrls.length - 1]!
     expect(JSON.parse(new URL(last).searchParams.get('connections') ?? '[]')).toEqual([
       { toolId: 'codex', authHealth: 'healthy' }
@@ -425,6 +442,7 @@ describe('startDaemon (serve)', () => {
       isAlive: () => false,
       registry,
       http,
+      openStream: streamFrom(http),
       makeAuthMonitor,
       write: () => undefined
     })
@@ -450,7 +468,7 @@ describe('startDaemon (serve)', () => {
       if (recorded.url.endsWith('/connect')) {
         return {
           status: 200,
-          json: async () => ({ companionId: 'u1:d1', wireToken: 'wire-token', pollIntervalMs: 999_999 })
+          json: async () => ({ companionId: 'u1:d1', wireToken: 'wire-token' })
         }
       }
       if (recorded.url.includes('/poll')) {
@@ -517,6 +535,7 @@ describe('startDaemon (serve)', () => {
       isAlive: () => false,
       registry: { getAdapters: () => [], getAdapter: () => undefined, requireAdapter: () => { throw new Error('x') } },
       http,
+      openStream: streamFrom(http),
       updater,
       // This test simulates an INSTALLED daemon; under vitest the process itself is a source run, so
       // the default isSourceBuild() gate would disable the loop and starve the presence badge.
@@ -596,7 +615,8 @@ describe('startDaemon (serve)', () => {
         backendUrl: sdeps.backendUrl,
         start: () => undefined,
         stop: async () => undefined,
-        activeRunCount: () => activeByBackend.get(sdeps.backendUrl) ?? 0
+        activeRunCount: () => activeByBackend.get(sdeps.backendUrl) ?? 0,
+        reportCapacity: async () => undefined
       }
     })
     const { http } = fakeHttp()
@@ -607,6 +627,7 @@ describe('startDaemon (serve)', () => {
       isAlive: () => false,
       registry: { getAdapters: () => [], getAdapter: () => undefined, requireAdapter: () => { throw new Error('x') } },
       http,
+      openStream: streamFrom(http),
       write: () => undefined
     })
     expect(daemon).not.toBeNull()
@@ -649,6 +670,7 @@ describe('startDaemon (serve)', () => {
       isAlive: () => false,
       registry,
       http,
+      openStream: streamFrom(http),
       makeAuthMonitor,
       write: () => undefined
     })
@@ -667,7 +689,13 @@ describe('startDaemon (serve)', () => {
 
 /** A fake backend session that never touches the network (composition tests only). */
 function fakeSession(backendUrl: string, activeRunCount: () => number = () => 0): backendSessionModule.BackendSession {
-  return { backendUrl, start: () => undefined, stop: async () => undefined, activeRunCount }
+  return {
+    backendUrl,
+    start: () => undefined,
+    stop: async () => undefined,
+    activeRunCount,
+    reportCapacity: async () => undefined
+  }
 }
 
 describe('startDaemon - shared run budget and presence', () => {

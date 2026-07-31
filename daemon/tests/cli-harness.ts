@@ -221,11 +221,6 @@ export function projectDir(name: string): string {
   return realpathSync(mkdtempSync(join(tmpdir(), `companion-project-${name}-`)))
 }
 
-/** The stored granted roots for a backend, read through a FRESH store (the daemon's own read). */
-export async function grantsOf(appDataRoot: string, backendUrl: string): Promise<string[]> {
-  return createStateStore({ cwd: appDataRoot }).listGrantedFolders(backendUrl)
-}
-
 /**
  * Reads a local MCP server's environment values straight out of the ENCRYPTED secret store (the only
  * place they may live), or `null` when the server has none stored.

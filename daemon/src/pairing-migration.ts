@@ -31,7 +31,7 @@ import type { PairingStateSnapshot, StateStore } from '@opencompanion/core/runti
  * order would be the lossy one: state canonicalized first, then a crash, and the next boot would take
  * the all-canonical early return with the secrets still stranded on their raw keys.
  *
- * @param state - The non-secret pairing state store (backends, connections, ceilings, origin policies,
+ * @param state - The non-secret pairing state store (backends, connections, origin policies,
  *   local MCP servers, granted folders).
  * @param secrets - The encrypted secret store holding the per-backend bearers and MCP credentials.
  */
@@ -48,10 +48,9 @@ export async function migratePairingKeys(state: StateStore, secrets: SecretStore
   const next: PairingStateSnapshot = {
     backends: {},
     connections: {},
-    policyCeilings: {},
     originPolicies: {},
+    terminalApprovals: {},
     mcpServers: {},
-    grantedFolders: {}
   }
   for (const rawUrl of rawUrls) {
     const canonical = canonicalizeBackendUrl(rawUrl)
@@ -69,13 +68,13 @@ export async function migratePairingKeys(state: StateStore, secrets: SecretStore
       }
       next.connections[canonical] = merged
     }
-    const ceiling = snapshot.policyCeilings[rawUrl]
-    if (ceiling !== undefined && next.policyCeilings[canonical] === undefined) {
-      next.policyCeilings[canonical] = ceiling
-    }
     const originPolicy = snapshot.originPolicies[rawUrl]
     if (originPolicy !== undefined && next.originPolicies[canonical] === undefined) {
       next.originPolicies[canonical] = originPolicy
+    }
+    const approval = snapshot.terminalApprovals[rawUrl]
+    if (approval !== undefined && next.terminalApprovals[canonical] === undefined) {
+      next.terminalApprovals[canonical] = approval
     }
     // The user's local MCP servers merge like connections (first-wins per server name), so a duplicate
     // variant's servers gap-fill rather than being dropped: leaving them on the raw key would silently
@@ -88,17 +87,6 @@ export async function migratePairingKeys(state: StateStore, secrets: SecretStore
       }
       next.mcpServers[canonical] = merged
     }
-    // The user's folder grants UNION across variants (deduped) rather than first-wins: both variants
-    // named the same physical backend, so every folder the user allowed it stays allowed. Dropping one
-    // would silently refuse a `terminal --cwd` that worked the day before.
-    const granted = snapshot.grantedFolders[rawUrl]
-    if (granted) {
-      const merged = next.grantedFolders[canonical] ?? []
-      for (const root of granted) {
-        if (!merged.includes(root)) merged.push(root)
-      }
-      next.grantedFolders[canonical] = merged
-    }
   }
 
   // Carry every NON-backend-keyed record through unchanged. The rebuild loop above visits only keys in
@@ -110,17 +98,14 @@ export async function migratePairingKeys(state: StateStore, secrets: SecretStore
   for (const [key, conns] of Object.entries(snapshot.connections)) {
     if (!backendKeys.has(key)) next.connections[key] = conns
   }
-  for (const [key, ceiling] of Object.entries(snapshot.policyCeilings)) {
-    if (!backendKeys.has(key)) next.policyCeilings[key] = ceiling
-  }
   for (const [key, policy] of Object.entries(snapshot.originPolicies)) {
     if (!backendKeys.has(key)) next.originPolicies[key] = policy
   }
+  for (const [key, approval] of Object.entries(snapshot.terminalApprovals)) {
+    if (!backendKeys.has(key)) next.terminalApprovals[key] = approval
+  }
   for (const [key, servers] of Object.entries(snapshot.mcpServers)) {
     if (!backendKeys.has(key)) next.mcpServers[key] = servers
-  }
-  for (const [key, granted] of Object.entries(snapshot.grantedFolders)) {
-    if (!backendKeys.has(key)) next.grantedFolders[key] = granted
   }
 
   // Move each migrated pairing's SECRETS to their canonical keys BEFORE persisting the state. Both the

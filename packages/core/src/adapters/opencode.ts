@@ -175,6 +175,10 @@ export function createOpenCodeAdapter(deps: OpenCodeAdapterDeps): RuntimeToolAda
             apiKey,
             binaryPath,
             permissionMode: req.permissionMode,
+            // A dispatched run's capability floor. On this ACP path it can only refuse the permission
+            // requests the agent chooses to send - the `acp` subcommand exposes no tool-restriction
+            // flag, so this is a best-effort refusal, not containment (see `makeAcpDriver`).
+            ...(req.floored ? { floored: true } : {}),
             mcpServers: req.mcpServers,
             ...(req.conversationId ? { resume: req.conversationId } : {}),
             signal

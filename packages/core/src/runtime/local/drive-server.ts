@@ -871,16 +871,26 @@ export async function startLocalDriveServer(deps: LocalDriveDeps): Promise<Local
       // The inode THIS server bound. A drain that finishes after a replacement runtime has bound the same
       // path must not delete the replacement's socket, which would leave a live runtime nothing can dial.
       const bound = inodeOf(socketPath)
+      // Set by the FIRST close, whether or not it unlinked anything. Node removes the socket path
+      // itself when a pipe server closes, so by the time the callback below runs the path is usually
+      // already gone and the inode check cannot be what marks this server done. It must not be: an
+      // inode NUMBER is reused once freed, so a replacement bound to the same path can be handed the
+      // very same dev+ino - and a late drain would then see its own identity at the path, delete a
+      // LIVE runtime's socket, and leave the app dialing ENOENT with a healthy process behind it.
+      let closed = false
       resolve({
         socketPath,
         token,
         close: () =>
           new Promise<void>((done) => {
             server.close(() => {
-              // Unlink on the way out too, so a restart never dials (or trips over) a dead inode - but only
-              // while the path still holds OUR inode.
-              if (isPosixSocket && bound !== null && sameInode(bound, inodeOf(socketPath))) {
-                rmSync(socketPath, { force: true })
+              if (!closed) {
+                closed = true
+                // A fallback for the case Node left the path behind, and only while it still holds OUR
+                // inode: a restart must never dial (or trip over) a dead inode.
+                if (isPosixSocket && bound !== null && sameInode(bound, inodeOf(socketPath))) {
+                  rmSync(socketPath, { force: true })
+                }
               }
               done()
             })

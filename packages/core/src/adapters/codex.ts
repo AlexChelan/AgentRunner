@@ -112,6 +112,9 @@ export function createCodexAdapter(deps: CodexAdapterDeps): RuntimeToolAdapter {
             apiKey,
             binaryPath,
             permissionMode: req.permissionMode,
+            // A dispatched run's capability floor, which the driver turns into a root filesystem deny
+            // on the permissions profile - OS-enforced wherever codex has a sandbox.
+            ...(req.floored ? { floored: true } : {}),
             effort: req.effort,
             mcpServers: req.mcpServers,
             // Thread the run's network posture into the driver's OS-enforced sandbox flag (I2);

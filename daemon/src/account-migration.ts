@@ -36,7 +36,7 @@ interface ResolvedPairing {
  *
  * A legacy pairing carries no user id, so the owner is asked of the backend that issued the bearer
  * ({@link resolveBearerUser}, the same read-only session check `pair` gates on). Each resolved pairing has
- * ALL six per-scope maps re-keyed together (backends, connections, policy ceilings, origin policies, local
+ * ALL per-scope maps re-keyed together (backends, connections, origin policies, local
  * MCP servers, granted folders) and its SECRETS copied to their scope-derived keys (the bearer, and the
  * environment values of each local MCP server the user added) - one map or secret left behind would
  * silently orphan that pairing's config, and an explicit ceiling that failed to move would re-open a
@@ -70,7 +70,7 @@ interface ResolvedPairing {
  * first shrinks that window to the microseconds between the read and the write, which is the same window
  * the predecessor URL-canonicalization migration has always had.
  *
- * @param state - The non-secret pairing state store (backends, connections, ceilings, origin policies,
+ * @param state - The non-secret pairing state store (backends, connections, origin policies,
  *   local MCP servers, granted folders).
  * @param secrets - The encrypted secret store holding the per-pairing bearers and MCP credentials.
  * @param fetchFn - The fetch used to resolve each legacy bearer's owner.
@@ -132,10 +132,9 @@ export async function migrateAccountScopes(
   const next: PairingStateSnapshot = {
     backends: {},
     connections: {},
-    policyCeilings: {},
     originPolicies: {},
+    terminalApprovals: {},
     mcpServers: {},
-    grantedFolders: {}
   }
   for (const [key, record] of Object.entries(current.backends)) {
     if (!moving.has(key)) next.backends[key] = record
@@ -143,17 +142,14 @@ export async function migrateAccountScopes(
   for (const [key, conns] of Object.entries(current.connections)) {
     if (!moving.has(key)) next.connections[key] = conns
   }
-  for (const [key, ceiling] of Object.entries(current.policyCeilings)) {
-    if (!moving.has(key)) next.policyCeilings[key] = ceiling
-  }
   for (const [key, policy] of Object.entries(current.originPolicies)) {
     if (!moving.has(key)) next.originPolicies[key] = policy
   }
+  for (const [key, approval] of Object.entries(current.terminalApprovals)) {
+    if (!moving.has(key)) next.terminalApprovals[key] = approval
+  }
   for (const [key, servers] of Object.entries(current.mcpServers)) {
     if (!moving.has(key)) next.mcpServers[key] = servers
-  }
-  for (const [key, granted] of Object.entries(current.grantedFolders)) {
-    if (!moving.has(key)) next.grantedFolders[key] = granted
   }
 
   // Re-key each resolved pairing onto its account scope. A record ALREADY at that scope wins: it is what a
@@ -175,16 +171,13 @@ export async function migrateAccountScopes(
       }
       next.connections[scope] = merged
     }
-    // An EXPLICIT ceiling only: a scope absent from the map uses the stock default, so moving one that was
-    // never set would be inventing a clamp, and losing one the user DID set would silently re-open a
-    // backend they deliberately clamped.
-    const ceiling = current.policyCeilings[legacyKey]
-    if (ceiling !== undefined && next.policyCeilings[scope] === undefined) {
-      next.policyCeilings[scope] = ceiling
-    }
     const originPolicy = current.originPolicies[legacyKey]
     if (originPolicy !== undefined && next.originPolicies[scope] === undefined) {
       next.originPolicies[scope] = originPolicy
+    }
+    const approval = current.terminalApprovals[legacyKey]
+    if (approval !== undefined && next.terminalApprovals[scope] === undefined) {
+      next.terminalApprovals[scope] = approval
     }
     const servers = current.mcpServers[legacyKey]
     if (servers) {
@@ -193,16 +186,6 @@ export async function migrateAccountScopes(
         if (!(name in merged)) merged[name] = spec
       }
       next.mcpServers[scope] = merged
-    }
-    // Folder grants UNION (deduped) rather than first-wins: both keys named the same account on the same
-    // backend, so every folder the user allowed it stays allowed.
-    const granted = current.grantedFolders[legacyKey]
-    if (granted) {
-      const merged = [...(next.grantedFolders[scope] ?? [])]
-      for (const root of granted) {
-        if (!merged.includes(root)) merged.push(root)
-      }
-      next.grantedFolders[scope] = merged
     }
   }
 

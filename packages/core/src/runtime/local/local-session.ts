@@ -13,6 +13,7 @@ import { toConnectionRef } from '../backend-session'
 import { brand } from '../brand'
 import { createExecutor, type RunHooks } from '../executor'
 import { managedCliDir } from '../paths'
+import { retiredEgressNotice } from '../policies'
 import type { SecretStore } from '../storage/secret-store'
 import type { StateStore } from '../storage/state-store'
 import type { LocalAppConfig } from './app-config'
@@ -164,12 +165,18 @@ export interface LocalSessionDeps {
  * key. Every dispatched run is audited fail-closed and confined to `work/local/<productId>/` with the
  * daemon's own `secrets/` denied to the CLI, exactly like a dispatched run.
  *
+ * The retired `policy set --local --network off` wrote its egress denial against this scope too, and it
+ * has no successor here either, so building the session states it ({@link retiredEgressNotice}) exactly
+ * as the paired session states it for its own scope.
+ *
  * @param deps - The app-data root, shared registry + audit, fresh-store reader, secret store, and config reader.
  * @returns The local session.
  */
 export function createLocalSession(deps: LocalSessionDeps): LocalSession {
   const write = deps.write ?? ((line): void => void process.stdout.write(line))
   const { appDataRoot, registry, readState } = deps
+
+  if (readState().hasRetiredEgressDenial(LOCAL_SCOPE)) write(retiredEgressNotice(LOCAL_SCOPE))
 
   const managedDirs = managedCliBinDirs(managedCliDir(appDataRoot))
   const sessionManager = createSessionManager({
@@ -194,7 +201,6 @@ export function createLocalSession(deps: LocalSessionDeps): LocalSession {
     log: write,
     sessionManager,
     getConnection: (_productId, connectionId) => toConnectionRef(readState().getConnection(LOCAL_SCOPE, connectionId)),
-    getCeiling: () => readState().getPolicyCeiling(LOCAL_SCOPE),
     getOriginPolicy: () => readState().getOriginPolicy(LOCAL_SCOPE),
     resolveBinary: (name) => resolveToolBinary(name, { managedDirs }),
     // Branded server name; never actually fires in local mode (an empty manifest -> `shouldServe` false).

@@ -26,6 +26,7 @@ import {
   claudeConfinementSettings,
   claudePermissionOptions,
   claudeReasoningOptions,
+  flooredClaudeToolBase,
   codexAppServerNotificationToMessages,
   codexPosture,
   codexReasoningEffort,
@@ -260,7 +261,7 @@ function claudePromptInput(
 
 function makeClaudeDriver(query: ClaudeQuery): ClaudeDriver {
   return async function* (p) {
-    const opts = claudePermissionOptions(p.permissionMode)
+    const opts = claudePermissionOptions(p.permissionMode, p.floored)
     const allowedTools = [...(opts.allowedTools ?? []), ...(p.allowedTools ?? [])]
     const disallowedTools = [...(opts.disallowedTools ?? []), ...(p.disallowedTools ?? [])]
     const confinement = claudeConfinementSettings(p.denyReadPaths ?? [], p.network !== 'off')
@@ -296,6 +297,7 @@ function makeClaudeDriver(query: ClaudeQuery): ClaudeDriver {
         : {}),
       ...(allowedTools.length > 0 ? { allowedTools } : {}),
       ...(disallowedTools.length > 0 ? { disallowedTools } : {}),
+      ...(p.floored ? { tools: flooredClaudeToolBase(allowedTools) } : {}),
       // A confined run (the unattended daemon) denies reads of the paths it passes - its own
       // `secrets/`. Claude needs BOTH halves and neither covers the other: the OS sandbox stops the
       // Bash tool, the permission rules stop Read/Grep/Glob. Absent for the interactive terminal.
@@ -422,7 +424,8 @@ function makeCodexDriver(spawnFn: SpawnFn): AgenticCliDriver {
     const permissionProfile = buildCodexPermissionProfileOverrides({
       sandboxMode: posture.sandboxMode,
       networkAccessEnabled: networkEnabled,
-      denyReadPaths: p.denyReadPaths ?? []
+      denyReadPaths: p.denyReadPaths ?? [],
+      ...(p.floored ? { floored: true } : {})
     })
     const confined = permissionProfile.length > 0
     const args = buildCodexAppServerArgs({

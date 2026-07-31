@@ -89,13 +89,18 @@ describe.each(FROZEN_VERSIONS)('a backend speaking v%i, decoded by this daemon',
     expect(accepted).toHaveLength(1)
   })
 
-  it("accepts that version's own frozen poll envelope, items passed through untouched", () => {
-    // The daemon validates this envelope on EVERY poll, so the frozen bytes are the hot path. The
-    // `unknown[]` items must survive verbatim - including a field this major has since retired, which
-    // the envelope has no business stripping (only the per-item parse decides that).
-    const frozen = fixture(version, 'poll-response.json')
+  it("accepts that version's own frozen envelope, items passed through untouched", () => {
+    // The frozen bytes are what an OLD backend really sent, so they are left exactly as recorded -
+    // rewriting history would be the one way to make this suite stop proving anything.
+    //
+    // `pollIntervalMs` was retired when the daemon stopped polling and started holding a stream. The
+    // envelope no longer declares it, so parsing drops it: an old backend's advertised cadence is
+    // simply ignored by a daemon that has no interval to set. Everything else - including the
+    // `unknown[]` items, which only the per-item parse may judge - must survive verbatim.
+    const frozen = fixture(version, 'poll-response.json') as Record<string, unknown>
     const parsed = PollResponseSchema.parse(frozen)
-    expect(parsed).toEqual(frozen)
+    const { pollIntervalMs: _retired, ...stillDeclared } = frozen
+    expect(parsed).toEqual(stillDeclared)
   })
 })
 
@@ -136,7 +141,6 @@ describe('rule 3: absent decodes to the previous behaviour', () => {
     const parsed = ConnectResponseSchema.parse(fixture(1, 'connect-response.bare.json'))
     expect(parsed).toEqual({ wireToken: parsed.wireToken })
     expect(parsed.protocolVersion).toBeUndefined()
-    expect(parsed.pollIntervalMs).toBeUndefined()
   })
 
   it('a minimal run.start decodes with every optional still absent', () => {

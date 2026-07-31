@@ -115,6 +115,10 @@ export function createClaudeCodeAdapter(deps: ClaudeAdapterDeps): RuntimeToolAda
             apiKey,
             binaryPath,
             permissionMode: req.permissionMode,
+            // A dispatched run's capability floor. Threaded as its own control rather than folded into
+            // the permission mode, because the floor is not a posture on the mode's ladder: it takes
+            // the filesystem and the shell away entirely, which no mode expresses.
+            ...(req.floored ? { floored: true } : {}),
             allowedTools: req.allowedTools,
             disallowedTools: req.disallowedTools,
             systemPrompt: req.systemPrompt,

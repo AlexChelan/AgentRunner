@@ -198,6 +198,82 @@ describe('claudeDriver', () => {
     expect(options.settingSources).toEqual([])
   })
 
+  it('hands a FLOORED run no file or shell tool, after the allow-list concatenation', async () => {
+    // THE test for the capability floor. It asserts the arrays the SDK actually receives, not what
+    // buildRun composed, because the leak this closes lived in the concatenation right here: the
+    // permission mapping used to contribute `['Read','Glob','Grep']` of its own, which was appended to
+    // the run's allow-list and handed a dispatched web run the filesystem.
+    const capture: { options?: unknown } = {}
+    const query = fakeQuery(
+      [{ type: 'result', subtype: 'success', session_id: 's', usage: { input_tokens: 0, output_tokens: 0 } }],
+      capture
+    )
+    const { claudeDriver } = makeDrivers({ query })
+    await drain(
+      claudeDriver(
+        claudeParams({
+          floored: true,
+          // The mode a floored run carries is irrelevant: `read-only` is the one that used to leak.
+          permissionMode: 'read-only',
+          allowedTools: ['mcp__opencompanion__lookup']
+        })
+      )
+    )
+    const options = capture.options as {
+      allowedTools?: string[]
+      disallowedTools?: string[]
+      tools?: string[]
+      permissionMode?: string
+    }
+    expect(options.allowedTools).toEqual(['mcp__opencompanion__lookup'])
+    for (const denied of ['Read', 'Glob', 'Grep', 'Bash', 'Write', 'Edit', 'NotebookEdit', 'Task']) {
+      expect(options.allowedTools).not.toContain(denied)
+      expect(options.disallowedTools).toContain(denied)
+    }
+    // No built-in tool is even LOADED, so the denylist above is a second line rather than the only one.
+    expect(options.tools).toEqual([])
+    expect(options.permissionMode).toBe('dontAsk')
+  })
+
+  it('loads the web tools as a floored run\'s only built-ins when egress is permitted', async () => {
+    const capture: { options?: unknown } = {}
+    const query = fakeQuery(
+      [{ type: 'result', subtype: 'success', session_id: 's', usage: { input_tokens: 0, output_tokens: 0 } }],
+      capture
+    )
+    const { claudeDriver } = makeDrivers({ query })
+    await drain(
+      claudeDriver(
+        claudeParams({
+          floored: true,
+          allowedTools: ['mcp__opencompanion__lookup', 'WebSearch', 'WebFetch']
+        })
+      )
+    )
+    const options = capture.options as { tools?: string[] }
+    expect(options.tools).toEqual(['WebSearch', 'WebFetch'])
+  })
+
+  it('leaves an UNFLOORED (local) run its normal tools and no tool-base override', async () => {
+    // The mirror of the floor test: the desktop app's own chats must keep every built-in they have
+    // today, so the floor can never silently swallow the local leg.
+    const capture: { options?: unknown } = {}
+    const query = fakeQuery(
+      [{ type: 'result', subtype: 'success', session_id: 's', usage: { input_tokens: 0, output_tokens: 0 } }],
+      capture
+    )
+    const { claudeDriver } = makeDrivers({ query })
+    await drain(claudeDriver(claudeParams({ permissionMode: 'auto-edit' })))
+    const options = capture.options as {
+      tools?: string[]
+      disallowedTools?: string[]
+      permissionMode?: string
+    }
+    expect(options.tools).toBeUndefined()
+    expect(options.disallowedTools).toBeUndefined()
+    expect(options.permissionMode).toBe('acceptEdits')
+  })
+
   it('passes the BYOK key through the child env as ANTHROPIC_API_KEY', async () => {
     const capture: { options?: unknown } = {}
     const query = fakeQuery(
@@ -379,6 +455,12 @@ function turnStartParams(child: FakeAppServer): Record<string, unknown> {
   return (req?.params ?? {}) as Record<string, unknown>
 }
 
+/** Reads the recorded `thread/start` request params (cwd, approval policy, and the legacy sandbox). */
+function threadStartParams(child: FakeAppServer): Record<string, unknown> {
+  const req = child.requests.find((r) => r.method === 'thread/start')
+  return (req?.params ?? {}) as Record<string, unknown>
+}
+
 describe('codexDriver', () => {
   it('runs the initialize -> thread -> turn handshake and streams conversation, text, and done', async () => {
     const child = new FakeAppServer({ threadId: 'thread-7', notifications: successNotifications() })
@@ -448,6 +530,29 @@ describe('codexDriver', () => {
     const { args } = callArgs()
     expect(args.slice(0, 5)).toEqual(['app-server', '--disable', 'plugins', '--disable', 'apps'])
     expect(args).toContain('web_search="live"')
+  })
+
+  it('spawns a FLOORED run with the whole filesystem denied, and no legacy sandbox tier', async () => {
+    // End to end for the codex leg of the floor: the root deny must reach the SPAWN argv (it is a
+    // config-layer profile, not part of the per-request sandbox policy), and `thread/start` must omit
+    // the legacy `sandbox` tier - passing it makes codex ignore the profile and lose the deny.
+    const child = new FakeAppServer({ notifications: successNotifications() })
+    const { spawnFn, callArgs } = fakeSpawn(child)
+    const { codexDriver } = makeDrivers({ spawnFn })
+    await drain(
+      codexDriver(
+        cliParams({
+          binaryPath: '/usr/local/bin/codex',
+          floored: true,
+          permissionMode: 'read-only',
+          network: 'off'
+        })
+      )
+    )
+    const { args } = callArgs()
+    expect(args).toContain('permissions.companion-confined.filesystem={"/" = "deny"}')
+    expect(args).toContain('default_permissions="companion-confined"')
+    expect('sandbox' in threadStartParams(child)).toBe(false)
   })
 
   it('blocks sandbox egress when network is off but keeps hosted web search live (server-side)', async () => {

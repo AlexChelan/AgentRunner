@@ -235,6 +235,10 @@ export function createHermesAdapter(deps: HermesAdapterDeps): RuntimeToolAdapter
             apiKey,
             binaryPath,
             permissionMode: req.permissionMode,
+            // A dispatched run's capability floor. On this ACP path it can only refuse the permission
+            // requests the agent chooses to send - the `acp` subcommand exposes no tool-restriction
+            // flag, so this is a best-effort refusal, not containment (see `makeAcpDriver`).
+            ...(req.floored ? { floored: true } : {}),
             effort: req.effort,
             mcpServers: req.mcpServers,
             ...(req.network ? { network: req.network } : {}),

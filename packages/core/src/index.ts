@@ -44,10 +44,7 @@ export type { RunToolOptions } from './exec'
 
 export { binaryCandidateDirs, isWindowsShimPath, resolveToolBinary } from './binaries'
 
-// Filesystem containment, shared by every host that admits a caller-supplied path: the coding
-// toolset's workspace confinement (its workspace-root containment composes these) and the companion
-// daemon's folder grants (`terminal --cwd` inside a root the user granted at their machine).
-export { isInside, isInsideGrantedRoot, realpathDeepest } from './path-containment'
+export { realpathDeepest } from './path-containment'
 
 export {
   captureLoginShellPath,

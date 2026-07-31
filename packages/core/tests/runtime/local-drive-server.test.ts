@@ -1,5 +1,5 @@
 import { request, type IncomingHttpHeaders } from 'node:http'
-import { existsSync, mkdtempSync, writeFileSync } from 'node:fs'
+import { existsSync, linkSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
@@ -100,7 +100,7 @@ async function start(over?: {
   schedules?: LocalScheduleStore
   scheduleRunner?: Pick<ScheduleRunner, 'runNow'>
   config?: () => LocalAppConfig
-  listConnections?: () => { toolId: string; authHealth: string }[]
+  listConnections?: () => { toolId: string; authHealth: string; images: boolean }[]
   detectCatalog?: () => Promise<CliCatalogEntry[]>
   connectCli?: (toolId: ConnectableToolId) => Promise<CliConnectResult>
   listToolModels?: (toolId: string) => Promise<{ id: string; name: string; recommended?: boolean }[]>
@@ -270,6 +270,26 @@ describe('startLocalDriveServer - socket ownership', () => {
     expect(res.status).toBe(200)
   })
 
+  it('a draining runtime does not unlink a replacement that REUSED its inode number', async () => {
+    // The case above only bites when the replacement is handed the SAME dev+ino the drained server
+    // recorded - an inode number is reused once freed, and ext4 does so readily while the overlayfs and
+    // tmpfs a container gets do not. That is why this reproduced only on CI. A hard link pins the
+    // condition on any filesystem: it keeps the original inode alive under a second name, so relinking
+    // it at the path after the first close puts the ORIGINAL inode back where the replacement's would
+    // be - byte for byte what `sameInode` sees during a real reuse.
+    const socketPath = socketFor()
+    const backup = `${socketPath}.bak`
+    const first = await start({ socketPath })
+    linkSync(socketPath, backup)
+    await first.handle.close()
+    linkSync(backup, socketPath)
+    rmSync(backup, { force: true })
+
+    // The LATE drain now sees its own inode number at the path. It must still not unlink: it already
+    // handed that responsibility over when it closed the first time.
+    await first.handle.close()
+    expect(existsSync(socketPath), 'the late drain deleted a path it no longer owns').toBe(true)
+  })
 })
 
 describe('startLocalDriveServer - auth discipline', () => {
@@ -380,8 +400,8 @@ describe('startLocalDriveServer - health and tools', () => {
 
   it('GET /v1/tools projects the connection list', async () => {
     const conns = [
-      { toolId: 'claude-code', authHealth: 'healthy' },
-      { toolId: 'codex', authHealth: 'unknown' }
+      { toolId: 'claude-code', authHealth: 'healthy', images: true },
+      { toolId: 'codex', authHealth: 'unknown', images: false }
     ]
     const { handle } = await start({ listConnections: () => conns })
     const res = await send(handle.socketPath, { method: 'GET', path: '/v1/tools', token: handle.token })
@@ -432,8 +452,22 @@ describe('startLocalDriveServer - health and tools', () => {
     // The Models tab reads the FULL catalog (all connectable CLIs with live install/auth/connected state)
     // from THIS route so a CLI installed + signed in but not yet connected locally is offered for connect.
     const catalog: CliCatalogEntry[] = [
-      { toolId: 'claude-code', displayName: 'Claude Code', installed: true, authenticated: true, connected: true },
-      { toolId: 'hermes', displayName: 'Hermes Agent', installed: true, authenticated: true, connected: false }
+      {
+        toolId: 'claude-code',
+        displayName: 'Claude Code',
+        installed: true,
+        authenticated: true,
+        connected: true,
+        images: true
+      },
+      {
+        toolId: 'hermes',
+        displayName: 'Hermes Agent',
+        installed: true,
+        authenticated: true,
+        connected: false,
+        images: false
+      }
     ]
     const { handle } = await start({ detectCatalog: async () => catalog })
     const res = await send(handle.socketPath, { method: 'GET', path: '/v1/tools/catalog', token: handle.token })

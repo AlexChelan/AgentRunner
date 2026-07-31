@@ -12,7 +12,8 @@ import { acquireSingleInstanceLock, drainThenExit, installShutdownHandlers } fro
 import { defaultFetch } from '@opencompanion/core/runtime/pair'
 import { migratePairingKeys } from './pairing-migration'
 import { auditDir, managedCliDir } from '@opencompanion/core/runtime/paths'
-import type { HttpClient, UpdateState } from '@opencompanion/core/runtime/poll-client'
+import type { StreamOpener } from '@opencompanion/core/runtime/backend-http'
+import type { HttpClient, UpdateState } from '@opencompanion/core/runtime/stream-client'
 import type { SecretStore } from '@opencompanion/core/runtime/storage/secret-store'
 import { createSessionSupervisor, type SessionSupervisor } from './supervisor'
 import { createStateStore, type StateStore } from '@opencompanion/core/runtime/storage/state-store'
@@ -36,6 +37,11 @@ export interface ServeDeps {
   secrets: SecretStore
   /** The HTTP client the poll clients use (injectable for tests; defaults to a `fetch` wrapper). */
   http?: HttpClient
+  /**
+   * Opens the held stream. Defaults to the real `fetch`-backed opener inside the session; injected by
+   * tests so a daemon under test never opens a socket.
+   */
+  openStream?: StreamOpener
   /** Liveness probe for the single-instance lock (defaults to `process.kill(pid, 0)`). */
   isAlive?: (pid: number) => boolean
   /** The companion build version (reported to the backend for presence). */
@@ -111,6 +117,18 @@ function scopeLogLabel(scope: string): string {
  * Graceful shutdown drains every session (cancel runs -> flush poll client) and releases the lock. State
  * lives in `conf`; secrets in the encrypted file store; binaries resolve from validated dirs plus the
  * managed-CLI dirs; web tools are served over loopback MCP.
+ *
+ * The SELF-UPDATE loop is started once the drain exists. It checks on boot and every ~6h, stages a
+ * newer release in the background, and applies it (flip + restart) ONLY when no run is in flight on
+ * ANY served scope, summing the shared budget for idleness. Applying it exits the process cleanly and
+ * the boot service (`Restart=always` / `KeepAlive`) relaunches the daemon, which then runs the flipped
+ * `current`. It uses the same timeout-guarded drain-then-exit the SIGTERM path uses, so a black-holed
+ * final flush can never wedge the daemon stopped-but-alive after a flip. SOURCE RUNS (tsx, version
+ * `0.0.0-dev`) never self-update: every published release compares newer than the dev fallback, so the
+ * loop would download the release and exit the dev process on start.
+ *
+ * The startup line is printed on every boot that got this far, EVEN with an empty served set, which a
+ * supervisor reads as "the daemon is up, its pairings are not serving yet".
  *
  * @param deps - The app-data root, stores, optional http/version/registry overrides, filter, and the
  *   optional backend-session factory.
@@ -226,12 +244,18 @@ export async function startDaemon(deps: ServeDeps): Promise<Daemon | null> {
           secrets: deps.secrets,
           audit,
           ...(deps.http ? { http: deps.http } : {}),
+          ...(deps.openStream ? { openStream: deps.openStream } : {}),
           version,
           hostname: machineName,
           updateState,
           // Every session's slots see every OTHER served scope's load too: one machine-global
           // concurrent-run budget across all served scopes, not a per-scope cap.
           totalActiveRuns,
+          // The other half of that budget: a run settling anywhere frees a slot everywhere, so every
+          // served scope re-reports its capacity - not just the one whose run ended. A backend told "no
+          // capacity" while a SIBLING scope was busy would otherwise never be told the slot came back,
+          // and its queued runs would wait for a reconnect.
+          onRunSettled: () => supervisor.reportCapacityFreed(),
           write: sessionWrite(scope),
           ...(deps.makeAuthMonitor ? { makeAuthMonitor: deps.makeAuthMonitor } : {})
         })
@@ -273,12 +297,6 @@ export async function startDaemon(deps: ServeDeps): Promise<Daemon | null> {
     }
   })
 
-  // Start the self-update loop once the drain exists: it checks on boot and every ~6h, stages a newer
-  // release in the background, and applies it (flip + restart) ONLY when no run is in flight on any served
-  // scope - summing the shared budget for idleness. Applying it exits the process cleanly; the
-  // boot service (Restart=always / KeepAlive) relaunches the daemon, which then runs the flipped `current`.
-  // Source runs (tsx, version 0.0.0-dev) never self-update: every published release compares newer than the
-  // dev fallback, so the loop would download the release and exit the dev process on start.
   if (deps.updater && (deps.isSourceRun ?? isSourceBuild)()) {
     write('source run (0.0.0-dev) - auto-update disabled\n')
   } else if (deps.updater) {
@@ -286,15 +304,11 @@ export async function startDaemon(deps: ServeDeps): Promise<Daemon | null> {
       updater: deps.updater,
       isIdle: () => totalActiveRuns() === 0,
       autoUpdateEnabled: () => readState().getAutoUpdate(),
-      // Same timeout-guarded drain-then-exit the SIGTERM path uses, so a black-holed final flush can
-      // never wedge the daemon stopped-but-alive after an update flip (the boot service relaunches it).
       requestShutdown: () => drainThenExit(drain),
       log: write
     })
   }
 
-  // The startup line, printed on every boot that got this far - even with an empty served set, which a
-  // supervisor reads as "the daemon is up, its pairings are not serving yet".
   const served = supervisor.running()
   write(`${BRAND.binary} daemon running (backends: ${served.join(', ')}; device ${deps.state.getDeviceId()}).\n`)
   return { stop: drain }

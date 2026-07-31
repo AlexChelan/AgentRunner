@@ -3,7 +3,6 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { describe, expect, it, vi } from 'vitest'
-import type { RunPolicy } from '@opencompanion/protocol'
 import { migrateAccountScopes } from '../src/account-migration'
 import { accountScope } from '@opencompanion/core/runtime/account-scope'
 import { backendKey } from '@opencompanion/core/runtime/backend-key'
@@ -17,9 +16,6 @@ import { createStateStore, type StateStore } from '@opencompanion/core/runtime/s
 
 /** A legacy install's bare-URL key: what every pre-upgrade record (and its bearer) is stored under. */
 const LEGACY = 'https://app.test/api'
-
-/** A read-only, network-off ceiling that is distinct from the stock default (auto-edit / network on). */
-const LOCKED_CEILING: RunPolicy = { permissionMode: 'read-only', network: 'off' }
 
 /**
  * The PRE-CHANGE bearer-key derivation, `'bearer-' + sha256(backendUrl).slice(0, 32)`. Defined here rather
@@ -87,27 +83,19 @@ describe('migrateAccountScopes', () => {
     const { state, secrets } = harness()
     seedLegacy(state, secrets, LEGACY, 'tok-a')
     state.upsertConnection(LEGACY, { toolId: 'claude-code', source: 'reused', authHealth: 'healthy' })
-    state.setPolicyCeiling(LEGACY, LOCKED_CEILING)
     state.setOriginPolicy(LEGACY, { denySchedule: true, denyDispatch: false })
     state.upsertMcpServer(LEGACY, 'linear', { type: 'stdio', command: 'linear-mcp' })
-    state.addGrantedFolder(LEGACY, '/Users/me/projects')
 
     await migrateAccountScopes(state, secrets, sessionFetchFor('user-a'))
 
     const scope = accountScope(LEGACY, 'user-a')
     expect(state.listConnections(scope)).toHaveLength(1)
-    // An EXPLICIT ceiling must survive: a scope absent from the map falls back to the stock permissive
-    // default, so losing this one would silently re-open a backend the user deliberately clamped.
-    expect(state.getPolicyCeiling(scope)).toEqual(LOCKED_CEILING)
     expect(state.getOriginPolicy(scope)).toEqual({ denySchedule: true, denyDispatch: false })
     expect(state.listMcpServers(scope)).toEqual({ linear: { type: 'stdio', command: 'linear-mcp' } })
-    expect(state.listGrantedFolders(scope)).toEqual(['/Users/me/projects'])
-    // Nothing was left stranded on the legacy key, ceiling included (it reads back as the stock default).
+    // Nothing was left stranded on the legacy key.
     expect(state.listConnections(LEGACY)).toHaveLength(0)
-    expect(state.getPolicyCeiling(LEGACY)).toEqual({ permissionMode: 'auto-edit', network: 'on' })
     expect(state.getOriginPolicy(LEGACY)).toEqual({ denySchedule: false, denyDispatch: false })
     expect(state.listMcpServers(LEGACY)).toEqual({})
-    expect(state.listGrantedFolders(LEGACY)).toEqual([])
   })
 
   // A local MCP server's environment values are a SECRET keyed per scope + server name, so the state
@@ -163,7 +151,6 @@ describe('migrateAccountScopes', () => {
     const { state } = harness()
     const scope = accountScope(LEGACY, 'user-a')
     state.upsertPairedBackend(scope, { backendUrl: LEGACY, deviceId: 'd1', userId: 'user-a' })
-    state.setPolicyCeiling(scope, LOCKED_CEILING)
     let calls = 0
     const fetchFn: FetchFn = async () => {
       calls++
@@ -182,7 +169,6 @@ describe('migrateAccountScopes', () => {
 
     expect(calls).toBe(0)
     expect(state.getPairedBackend(scope)).not.toBeNull()
-    expect(state.getPolicyCeiling(scope)).toEqual(LOCKED_CEILING)
     expect(untouchable.set).not.toHaveBeenCalled()
     expect(untouchable.delete).not.toHaveBeenCalled()
   })
@@ -193,11 +179,9 @@ describe('migrateAccountScopes', () => {
     // rebuild that visited only paired keys would DELETE the desktop app's entire local configuration.
     // A ceiling that differs from the local scope's OWN default (`full` / network on): asserting the
     // default back would pass even if the write-back had deleted the record.
-    state.setPolicyCeiling(LOCAL_SCOPE, LOCKED_CEILING)
     state.setOriginPolicy(LOCAL_SCOPE, { denySchedule: true, denyDispatch: false })
     state.upsertConnection(LOCAL_SCOPE, { toolId: 'codex', source: 'installed', authHealth: 'healthy' })
     state.upsertMcpServer(LOCAL_SCOPE, 'linear', { type: 'stdio', command: 'npx', envKeys: ['LINEAR_KEY'] })
-    state.addGrantedFolder(LOCAL_SCOPE, '/Users/me/local-project')
     writeMcpEnv(secrets, LOCAL_SCOPE, 'linear', { LINEAR_KEY: 'lin_local_secret' })
     // A legacy pairing that DOES migrate, so the full write-back actually runs.
     seedLegacy(state, secrets, LEGACY, 'tok-a')
@@ -205,13 +189,11 @@ describe('migrateAccountScopes', () => {
     await migrateAccountScopes(state, secrets, sessionFetchFor('user-a'))
 
     expect(state.getPairedBackend(accountScope(LEGACY, 'user-a'))).not.toBeNull()
-    expect(state.getPolicyCeiling(LOCAL_SCOPE)).toEqual(LOCKED_CEILING)
     expect(state.getOriginPolicy(LOCAL_SCOPE)).toEqual({ denySchedule: true, denyDispatch: false })
     expect(state.getConnection(LOCAL_SCOPE, 'codex')?.source).toBe('installed')
     expect(state.listMcpServers(LOCAL_SCOPE)).toEqual({
       linear: { type: 'stdio', command: 'npx', envKeys: ['LINEAR_KEY'] }
     })
-    expect(state.listGrantedFolders(LOCAL_SCOPE)).toEqual(['/Users/me/local-project'])
     expect(readMcpEnv(secrets, LOCAL_SCOPE, 'linear')).toEqual({ LINEAR_KEY: 'lin_local_secret' })
   })
 
@@ -379,7 +361,6 @@ describe('migrateAccountScopes', () => {
         deviceId: 'd1',
         userId: 'user-b'
       })
-      state.setPolicyCeiling(otherScope, LOCKED_CEILING)
       return { ok: true, status: 200, json: async () => ({ user: { id: 'user-a' } }) }
     }
 
@@ -389,7 +370,6 @@ describe('migrateAccountScopes', () => {
     expect(state.getPairedBackend(accountScope(LEGACY, 'user-a'))).not.toBeNull()
     // ...and so did the pairing that arrived mid-flight, with its ceiling intact.
     expect(state.getPairedBackend(otherScope)?.backendUrl).toBe(OTHER)
-    expect(state.getPolicyCeiling(otherScope)).toEqual(LOCKED_CEILING)
   })
 
   it('does not resurrect a legacy pairing that was REMOVED while the lookups ran', async () => {

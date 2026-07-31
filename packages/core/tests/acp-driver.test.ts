@@ -365,6 +365,45 @@ describe('makeAcpDriver', () => {
     })
   })
 
+  it('refuses a FLOORED run every permission ask, even one offering only allow options', async () => {
+    // A floored run is dispatched by a paired web app, so there is no capability behind a permission
+    // prompt it may legitimately have. `auto-edit` is the mode that would otherwise auto-ALLOW, so it
+    // is the one worth pinning: the floor has to outrank the mode, not sit alongside it.
+    const child = new FakeAcpAgent({ promptFrames: [PERMISSION_REQUEST_ALLOW_ONLY, MESSAGE_CHUNK] })
+    const { spawnFn } = fakeSpawn(child)
+    const driver = makeAcpDriver(spawnFn, HERMES_ACP_CONFIG)
+    await drain(driver(acpParams({ permissionMode: 'auto-edit', floored: true })))
+    expect(child.answers).toContainEqual({
+      jsonrpc: '2.0',
+      id: 99,
+      result: { outcome: { outcome: 'cancelled' } }
+    })
+  })
+
+  it('refuses a FLOORED run even when a reject option is on offer (never selects, always cancels)', async () => {
+    const child = new FakeAcpAgent({ promptFrames: [PERMISSION_REQUEST, MESSAGE_CHUNK] })
+    const { spawnFn } = fakeSpawn(child)
+    const driver = makeAcpDriver(spawnFn, HERMES_ACP_CONFIG)
+    await drain(driver(acpParams({ permissionMode: 'full', floored: true })))
+    expect(child.answers).toContainEqual({
+      jsonrpc: '2.0',
+      id: 99,
+      result: { outcome: { outcome: 'cancelled' } }
+    })
+  })
+
+  it('still auto-allows an UNFLOORED run, so the local leg keeps working', async () => {
+    const child = new FakeAcpAgent({ promptFrames: [PERMISSION_REQUEST, MESSAGE_CHUNK] })
+    const { spawnFn } = fakeSpawn(child)
+    const driver = makeAcpDriver(spawnFn, HERMES_ACP_CONFIG)
+    await drain(driver(acpParams({ permissionMode: 'auto-edit' })))
+    expect(child.answers).toContainEqual({
+      jsonrpc: '2.0',
+      id: 99,
+      result: { outcome: { outcome: 'selected', optionId: 'allow-once' } }
+    })
+  })
+
   it('ignores an intermediate in_progress tool update (a running tool is not reported finished)', async () => {
     const child = new FakeAcpAgent({
       promptFrames: [TOOL_CALL, TOOL_CALL_UPDATE_IN_PROGRESS, TOOL_CALL_UPDATE, MESSAGE_CHUNK]
@@ -881,6 +920,18 @@ describe('OPENCODE_ACP_CONFIG', () => {
     const { spawnFn } = fakeSpawn(child)
     const driver = makeAcpDriver(spawnFn, OPENCODE_ACP_CONFIG)
     await drain(driver(ocParams({ permissionMode: 'read-only' })))
+    expect(child.answers).toContainEqual({
+      jsonrpc: '2.0',
+      id: 77,
+      result: { outcome: { outcome: 'cancelled' } }
+    })
+  })
+
+  it('refuses a FLOORED opencode run every permission ask (the floor outranks the mode)', async () => {
+    const child = ocAgent({ promptFrames: [OC_PERMISSION_REQUEST, OC_MESSAGE_CHUNK] })
+    const { spawnFn } = fakeSpawn(child)
+    const driver = makeAcpDriver(spawnFn, OPENCODE_ACP_CONFIG)
+    await drain(driver(ocParams({ permissionMode: 'auto-edit', floored: true })))
     expect(child.answers).toContainEqual({
       jsonrpc: '2.0',
       id: 77,

@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { AdapterCapabilities, AgentRuntimeRegistry, RuntimeToolAdapter } from '../../src/index'
@@ -9,9 +9,12 @@ import type { AuthHealthMonitor } from '../../src/runtime/auth-health'
 import { accountScope } from '../../src/runtime/account-scope'
 import { backendKey } from '../../src/runtime/backend-key'
 import { createBackendSession } from '../../src/runtime/backend-session'
+import { brand } from '../../src/runtime/brand'
 import { bearerKey } from '../../src/runtime/pair'
-import type { HttpClient } from '../../src/runtime/poll-client'
-import { createRecordingHttp, type RecordedRequest } from './support/fake-backend'
+import { retiredEgressNotice } from '../../src/runtime/policies'
+import type { StreamOpener } from '../../src/runtime/backend-http'
+import type { HttpClient } from '../../src/runtime/stream-client'
+import { createRecordingHttp, streamFrom, type RecordedRequest } from './support/fake-backend'
 import { createFileSecretStore, type SecretStore } from '../../src/runtime/storage/secret-store'
 import { createStateStore, type StateStore } from '../../src/runtime/storage/state-store'
 
@@ -38,17 +41,37 @@ function fixtures(): {
 }
 
 /**
+ * Writes the egress-denying ceiling the RETIRED `policy set --network off` left on disk, the way an
+ * upgrading install carries one: straight into the document, under a key this build never writes.
+ *
+ * @param appDataRoot - The app-data root the state document lives in.
+ * @param scope - The scope the ceiling was stored under.
+ */
+function seedRetiredEgressDenial(appDataRoot: string, scope: string): void {
+  const file = join(appDataRoot, `${brand().binary}-state.json`)
+  const document = existsSync(file) ? JSON.parse(readFileSync(file, 'utf8')) : {}
+  document.policyCeilings = {
+    ...document.policyCeilings,
+    [scope]: { permissionMode: 'read-only', network: 'off' }
+  }
+  writeFileSync(file, JSON.stringify(document))
+}
+
+/**
  * A fake backend transport: records every request, hands out a wire token on connect, and delivers
  * exactly one dispatched run on the FIRST poll (empty thereafter). The run names an unconnected CLI
  * so the executor short-circuits to a terminal error after the poll client has already acked it - the
  * ack is what proves the run reached THIS backend. Headers are NOT recorded: the isolation assertions
  * serialize `calls`, so the recorded shape stays free of the per-backend bearer.
  */
-function fakeBackend(runId: string, connectionId = 'unconnected'): { http: HttpClient; calls: RecordedRequest[] } {
+function fakeBackend(
+  runId: string,
+  connectionId = 'unconnected'
+): { http: HttpClient; openStream: StreamOpener; calls: RecordedRequest[] } {
   let polled = false
-  return createRecordingHttp((recorded) => {
+  const recording = createRecordingHttp((recorded) => {
     if (recorded.url.endsWith('/connect')) {
-      return { status: 200, json: async () => ({ companionId: 'c', wireToken: `wt-${runId}`, pollIntervalMs: 1000 }) }
+      return { status: 200, json: async () => ({ companionId: 'c', wireToken: `wt-${runId}` }) }
     }
     if (recorded.url.includes('/poll')) {
       const first = !polled
@@ -57,6 +80,7 @@ function fakeBackend(runId: string, connectionId = 'unconnected'): { http: HttpC
     }
     return { status: 200, json: async () => ({ cancel: [] }) }
   }, { recordHeaders: false })
+  return { ...recording, openStream: streamFrom(recording.http) }
 }
 
 /**
@@ -130,6 +154,46 @@ describe('createBackendSession (multi-backend)', () => {
     expect(lines.join('')).toContain('Missing credentials')
   })
 
+  // THE UPGRADE REGRESSION. The retired `policy` command let a user deny a backend network egress. This
+  // build has no egress setting to migrate that into, and the run posture it replaced the ceiling with
+  // lets a run that ASKS for egress have it - so the clamp is genuinely gone. What must not also be gone
+  // is the user's knowledge of it.
+  it('says out loud that a retired egress denial is no longer enforced', () => {
+    const { appDataRoot, readState, secrets, audit } = fixtures()
+    seedRetiredEgressDenial(appDataRoot, BACKEND_A)
+    const lines: string[] = []
+    const session = createBackendSession({
+      appDataRoot,
+      scope: BACKEND_A,
+      backendUrl: BACKEND_A,
+      registry: EMPTY_REGISTRY,
+      readState,
+      secrets,
+      audit,
+      write: (line) => void lines.push(line),
+      makeAuthMonitor: stubMonitor
+    })
+    expect(session).not.toBeNull()
+    expect(lines.join('')).toContain(retiredEgressNotice(BACKEND_A))
+  })
+
+  it('stays quiet for a scope that never denied egress', () => {
+    const { appDataRoot, readState, secrets, audit } = fixtures()
+    const lines: string[] = []
+    createBackendSession({
+      appDataRoot,
+      scope: BACKEND_A,
+      backendUrl: BACKEND_A,
+      registry: EMPTY_REGISTRY,
+      readState,
+      secrets,
+      audit,
+      write: (line) => void lines.push(line),
+      makeAuthMonitor: stubMonitor
+    })
+    expect(lines.join('')).not.toContain('egress')
+  })
+
   it('two backends poll concurrently in one process; each acks its own run to its own backend', async () => {
     const { appDataRoot, readState, secrets, audit } = fixtures()
     const a = fakeBackend('run-a')
@@ -143,6 +207,7 @@ describe('createBackendSession (multi-backend)', () => {
       secrets,
       audit,
       http: a.http,
+      openStream: a.openStream,
       makeAuthMonitor: stubMonitor,
       write: () => undefined
     })
@@ -155,6 +220,7 @@ describe('createBackendSession (multi-backend)', () => {
       secrets,
       audit,
       http: b.http,
+      openStream: b.openStream,
       makeAuthMonitor: stubMonitor,
       write: () => undefined
     })
@@ -207,8 +273,8 @@ describe('createBackendSession (multi-backend)', () => {
     const a = fakeBackend('run-a')
     const b = fakeBackend('run-b', 'codex')
     const common = { appDataRoot, registry, readState, secrets, audit, makeAuthMonitor: stubMonitor, write: () => undefined }
-    const sessionA = createBackendSession({ ...common, scope: BACKEND_A, backendUrl: BACKEND_A, http: a.http })
-    const sessionB = createBackendSession({ ...common, scope: BACKEND_B, backendUrl: BACKEND_B, http: b.http })
+    const sessionA = createBackendSession({ ...common, scope: BACKEND_A, backendUrl: BACKEND_A, http: a.http, openStream: a.openStream })
+    const sessionB = createBackendSession({ ...common, scope: BACKEND_B, backendUrl: BACKEND_B, http: b.http, openStream: b.openStream })
     sessionA?.start()
     sessionB?.start()
     await vi.advanceTimersByTimeAsync(50)
@@ -220,7 +286,7 @@ describe('createBackendSession (multi-backend)', () => {
     // Stopping A cancels ONLY A's runs (its own session manager); B's in-flight run is untouched,
     // and B keeps polling.
     expect(cancels).toBe(0)
-    await vi.advanceTimersByTimeAsync(1100)
+    await vi.advanceTimersByTimeAsync(11_000)
     expect(pollCount(b.calls)).toBeGreaterThan(bPollsBeforeStop)
 
     await sessionB?.stop()
@@ -233,8 +299,8 @@ describe('createBackendSession (multi-backend)', () => {
     const a = fakeBackend('run-a')
     const b = fakeBackend('run-b')
     const common = { appDataRoot, registry: EMPTY_REGISTRY, readState, secrets, audit, makeAuthMonitor: stubMonitor, write: () => undefined }
-    const sessionA = createBackendSession({ ...common, scope: BACKEND_A, backendUrl: BACKEND_A, http: a.http })
-    const sessionB = createBackendSession({ ...common, scope: BACKEND_B, backendUrl: BACKEND_B, http: b.http })
+    const sessionA = createBackendSession({ ...common, scope: BACKEND_A, backendUrl: BACKEND_A, http: a.http, openStream: a.openStream })
+    const sessionB = createBackendSession({ ...common, scope: BACKEND_B, backendUrl: BACKEND_B, http: b.http, openStream: b.openStream })
     sessionA?.start()
     sessionB?.start()
     await vi.advanceTimersByTimeAsync(50)
@@ -242,8 +308,9 @@ describe('createBackendSession (multi-backend)', () => {
     const aAfterStop = pollCount(a.calls)
     const bAfterStop = pollCount(b.calls)
 
-    // Drive more poll cadence: A is stopped and must not poll again; B keeps polling.
-    await vi.advanceTimersByTimeAsync(1100)
+    // Drive a full poll cadence: A is stopped and must not poll again; B keeps polling. The daemon
+    // polls on its own fixed 10s interval now that the backend proposes no cadence.
+    await vi.advanceTimersByTimeAsync(11_000)
     expect(pollCount(a.calls)).toBe(aAfterStop)
     expect(pollCount(b.calls)).toBeGreaterThan(bAfterStop)
 
@@ -296,7 +363,7 @@ describe('two accounts on one backend', () => {
     expect(createBackendSession({ ...common, scope: b, backendUrl: SHARED })).toBeNull()
   })
 
-  it('gives each account its own connections, ceiling and folder grants under one backend url', () => {
+  it('gives each account its own connections under one backend url', () => {
     const { readState } = fixtures()
     const state = readState()
     const a = accountScope(SHARED, 'user-a')
@@ -305,12 +372,8 @@ describe('two accounts on one backend', () => {
     state.upsertPairedBackend(b, { backendUrl: SHARED, deviceId: 'd1', userId: 'user-b' })
 
     state.upsertConnection(a, { toolId: 'codex', source: 'reused', authHealth: 'healthy' })
-    state.setPolicyCeiling(a, { permissionMode: 'full', network: 'on' })
-    state.addGrantedFolder(a, join(tmpdir(), 'a-only'))
 
     // The second account sees NONE of it: this is the cross-account leak the account scope closes.
     expect(state.listConnections(b)).toEqual([])
-    expect(state.getPolicyCeiling(b)).toEqual({ permissionMode: 'auto-edit', network: 'on' })
-    expect(state.listGrantedFolders(b)).toEqual([])
   })
 })

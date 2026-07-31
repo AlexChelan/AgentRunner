@@ -5,6 +5,7 @@ import { brand } from '../brand'
 import { LOCAL_SCOPE } from '../local/scope'
 import type { LocalMcpSpec } from '../local-mcp-spec'
 import { DEFAULT_ORIGIN_POLICY, type OriginPolicy } from '../origin-policy'
+import { defaultTerminalApproval, type TerminalApproval } from '../policies'
 
 /**
  * A paired backend's durable record (the Better Auth bearer lives in the SecretStore, never
@@ -54,10 +55,44 @@ interface StateSchema {
   backends: Record<string, PairedBackend>
   /** Per-scope CLI connections, keyed `scope -> toolId -> record`. */
   connections: Record<string, Record<string, CliConnection>>
-  /** Per-scope capability ceiling (the unattended default when unset). */
-  policyCeilings: Record<string, RunPolicy>
   /** Per-scope device origin policy (the allow-all default when unset). */
   originPolicies: Record<string, OriginPolicy>
+  /**
+   * Per-scope TERMINAL approval setting: whether an interactive session leaves the user's coding CLI its
+   * own approval prompts. A scope absent from the map falls back to {@link StateSchema.policyCeilings}
+   * and then to {@link defaultTerminalApproval}, so this map carries only what the user chose on THIS
+   * build - which is what lets an explicit choice be told apart from a default.
+   */
+  terminalApprovals: Record<string, TerminalApproval>
+  /**
+   * The RETIRED per-scope capability ceiling, read-only and never written here.
+   *
+   * The build that wrote it clamped both dispatched runs and terminal sessions with it, on two axes. Each
+   * axis is accounted for HERE, because an upgrade that quietly discards half a user's security settings
+   * is the failure this map exists to prevent:
+   *
+   * - `permissionMode`, TERMINAL half: survives as {@link StateSchema.terminalApprovals}, which
+   *   {@link StateStore.getTerminalApproval} falls back to this map for. `conf` leaves an unknown on-disk
+   *   key alone, so the choice is still here to be honored.
+   * - `permissionMode`, DISPATCHED half: superseded by something strictly stronger. A dispatched run is
+   *   floored to the BOTTOM of the ladder plus a structural capability floor (no filesystem, no shell, no
+   *   local MCP), which no stored ceiling could have been stricter than, so nothing is lost by not
+   *   reading it.
+   * - `network`: NOT honored, and this build has no setting that could carry it - restoring one would be
+   *   the retired subsystem. So it is REPORTED instead, via
+   *   {@link StateStore.hasRetiredEgressDenial}, and a host says so out loud.
+   *
+   * Nothing writes it, so it survives untouched until its pairing is removed - which is deliberate: the
+   * egress notice must keep firing for as long as the setting it is about is on disk.
+   *
+   * It is the ONE per-scope map deliberately outside {@link PairingStateSnapshot}: a re-keying migration
+   * therefore leaves it on its legacy key, and both reads below miss. That fails in the safe direction -
+   * the scope lands on {@link defaultTerminalApproval}, which KEEPS the prompts for every paired scope,
+   * and an unreported egress denial is a notice not printed rather than a clamp not applied (there is no
+   * clamp either way) - and the local pseudo-scope, the one the retired command's `--local` form wrote,
+   * is never re-keyed at all.
+   */
+  policyCeilings: Record<string, RunPolicy>
   /**
    * Per-scope LOCAL MCP servers the USER added, keyed `scope -> serverName -> spec`. Write-only
    * by the local user (`mcp add`): no network path reaches this map, which is the whole point (see
@@ -65,14 +100,6 @@ interface StateSchema {
    * the values are secrets and live in the encrypted secret store (`../mcp-secrets`).
    */
   mcpServers: Record<string, Record<string, LocalMcpSpec>>
-  /**
-   * Per-scope FOLDER GRANTS: the canonical absolute roots a `terminal --cwd <path>` may run inside,
-   * keyed `scope -> roots`. Empty by default, so a user who grants nothing keeps every session in
-   * its confined work folder. Write-only by the local user (`policy grant-folder add`), exactly like
-   * {@link StateSchema.mcpServers}: no network path reaches this map, and the terminal spec is parsed
-   * fail-closed so a backend cannot even name a path.
-   */
-  grantedFolders: Record<string, string[]>
   /** Whether the daemon self-updates to the latest release (on by default). */
   autoUpdate: boolean
   /** How many dispatched runs may execute at once (a LOCAL resource cap, never wire/policy). Default 2. */
@@ -87,41 +114,9 @@ interface StateSchema {
 }
 
 /**
- * The default ceiling when a backend has no explicit policy: FULL stock-parity capability. The CLI runs
- * inside its confined work folder exactly as it would if the user ran it in a terminal themselves, and
- * the user clamps DOWN per backend with the `policy set` command whenever they want less - the daemon
- * only ever lowers a run, never raises it.
- *
- * `network: 'on'` because a coding CLI is normally online (it installs packages, reads docs, reaches its
- * provider); defaulting egress off would silently break stock behaviour for every run that did not
- * explicitly ask to be air-gapped. A user who wants an air-gapped backend clamps it with `--network off`.
- *
- * `auto-edit` (not `read-only`): the executor floors a dispatched run up to `auto-edit` and treats a
- * `read-only` ceiling as an EXPLICIT builder opt-in that suppresses that floor, so defaulting to
- * `read-only` would silently make every run read-only. Work-folder confinement stays always-on by
- * construction (the cwd IS the per-product work folder), independent of this ceiling.
- */
-const DEFAULT_CEILING: RunPolicy = { permissionMode: 'auto-edit', network: 'on' }
-
-/**
- * The default ceiling for the {@link import('../local/scope').LOCAL_SCOPE} pseudo-scope - the desktop app's
- * own machine, which pairs with no backend. It defaults to `full` (approval prompts BYPASSED) because every
- * local surface is the user's own: a terminal session is a human sitting at their own CLI, and local chat +
- * schedules run the CLI the user themselves signed in, confined to the product work folder. A fresh desktop
- * install therefore runs its coding CLIs without approval friction, which is what a single-user local tool
- * wants; the paired-backend default stays the cautious {@link DEFAULT_CEILING} (`auto-edit`) so an unattended
- * dispatched/scheduled run from a REMOTE backend is never silently bypassed.
- *
- * This is only the DEFAULT: the user re-enables prompts at any time with `policy set --local --permission-mode
- * auto-edit` (or the desktop's own toggle), and an explicit stored ceiling always wins over this default.
- */
-const DEFAULT_LOCAL_CEILING: RunPolicy = { permissionMode: 'full', network: 'on' }
-
-/**
  * The raw pairing substrate keyed by scope: the paired backends, their per-CLI connections,
- * their EXPLICIT capability ceilings and origin policies (a scope absent from `policyCeilings` uses the
- * stock default, so this map only carries ceilings the user set - which is what lets the migration tell
- * an explicit ceiling apart from the default), and their local MCP servers. EVERY per-scope map
+ * their EXPLICIT origin policies and terminal approvals (a scope absent from either map uses the stock
+ * default), and their local MCP servers. EVERY per-scope map this build WRITES
  * belongs here: one left out would keep its legacy raw key while the rest are re-keyed, silently
  * orphaning that pairing's config. Read via {@link StateStore.snapshotPairingState} and written back
  * atomically via {@link StateStore.replacePairingState}.
@@ -131,14 +126,12 @@ export interface PairingStateSnapshot {
   backends: Record<string, PairedBackend>
   /** Per-scope CLI connections, keyed `scope -> toolId -> record`. */
   connections: Record<string, Record<string, CliConnection>>
-  /** Per-scope EXPLICIT capability ceilings, keyed by scope (absent = the stock default). */
-  policyCeilings: Record<string, RunPolicy>
   /** Per-scope EXPLICIT device origin policies, keyed by scope (absent = the allow-all default). */
   originPolicies: Record<string, OriginPolicy>
+  /** Per-scope EXPLICIT terminal approval settings, keyed by scope (absent = the per-scope default). */
+  terminalApprovals: Record<string, TerminalApproval>
   /** Per-scope LOCAL MCP servers, keyed `scope -> serverName -> spec` (absent = none). */
   mcpServers: Record<string, Record<string, LocalMcpSpec>>
-  /** Per-scope granted folder roots, keyed by scope (absent = none granted). */
-  grantedFolders: Record<string, string[]>
 }
 
 /**
@@ -192,28 +185,50 @@ export interface StateStore {
   /** Removes a scope's CLI connection by tool id (no-op when absent). Returns whether one was removed. */
   removeConnection(scope: string, toolId: string): boolean
   /**
-   * Returns the policy ceiling for a scope when unset: the cautious {@link DEFAULT_CEILING} for a paired
-   * backend, and the bypassed {@link DEFAULT_LOCAL_CEILING} for the local pseudo-scope (the user's own machine).
-   */
-  getPolicyCeiling(scope: string): RunPolicy
-  /**
-   * Sets a scope's capability ceiling. A ceiling only exists for a paired scope, so this throws
-   * when the scope is not paired (the CLI guards this first and surfaces a friendly message) - with
-   * the sole exception of the {@link import('../local/scope').LOCAL_SCOPE} pseudo-scope, whose records
-   * the local user configures with no pairing. A live daemon needs no signal - its executor reads
-   * ceilings through fresh stores, so the next dispatched run picks the new ceiling up.
+   * Returns whether a scope's interactive terminal sessions leave the coding CLI its own approval
+   * prompts. An explicit choice wins; failing that a ceiling the RETIRED `policy` command stored is
+   * honored (`full` meant the prompts were bypassed, every other rung meant they stayed on), so an
+   * upgrade cannot quietly take a user's prompts away; failing both, the scope's
+   * {@link defaultTerminalApproval}.
    *
-   * @param scope - The paired account scope (or the local pseudo-scope) the ceiling applies to.
-   * @param policy - The new capability ceiling.
+   * @param scope - The account scope, or the local pseudo-scope.
+   * @returns The effective approval setting.
+   */
+  getTerminalApproval(scope: string): TerminalApproval
+  /**
+   * Sets whether a scope's terminal sessions leave the CLI its own approval prompts. It throws when the
+   * scope is not paired (the CLI guards this first and surfaces a friendly message) - with the sole
+   * exception of the {@link import('../local/scope').LOCAL_SCOPE} pseudo-scope, whose records the local
+   * user configures with no pairing. The next session reads it through a fresh store, so a change
+   * applies with no restart.
+   *
+   * @param scope - The paired account scope (or the local pseudo-scope) the setting applies to.
+   * @param approval - Whether the CLI keeps its own prompts.
    * @throws When the scope is not paired and is not the local pseudo-scope.
    */
-  setPolicyCeiling(scope: string, policy: RunPolicy): void
+  setTerminalApproval(scope: string, approval: TerminalApproval): void
+  /**
+   * Whether a scope carries a RETIRED egress denial (`network: 'off'`) that this build does not enforce.
+   *
+   * It is the one half of the retired ceiling ({@link StateSchema.policyCeilings}) with no successor: the
+   * permission half survives as a terminal approval and, for a dispatched run, as a structural floor that
+   * is stricter than any stored value could have been, but a per-scope egress clamp is exactly the
+   * subsystem this build retired and there is nothing left to migrate it into. A dispatched run now
+   * reaches the network when the RUN asks for it, so a user who denied a backend egress has lost that.
+   *
+   * Reporting it is what keeps the loss from being silent: a host reads this and tells the user (see
+   * {@link import('../policies').retiredEgressNotice}). It answers `false` for a scope that never carried
+   * a ceiling and for one whose ceiling permitted egress, so nothing is said to a user who chose nothing.
+   *
+   * @param scope - The account scope, or the local pseudo-scope.
+   * @returns `true` when a retired ceiling denied this scope network egress.
+   */
+  hasRetiredEgressDenial(scope: string): boolean
   /** Returns the device origin policy for a scope (the allow-all default when unset). */
   getOriginPolicy(scope: string): OriginPolicy
   /**
-   * Sets a scope's device origin policy (which derived run kinds this device refuses locally). Like
-   * {@link StateStore.setPolicyCeiling} a policy only exists for a paired scope, so this throws when
-   * the scope is not paired - except the {@link import('../local/scope').LOCAL_SCOPE} pseudo-scope,
+   * Sets a scope's device origin policy (which derived run kinds this device refuses locally). A policy
+   * only exists for a paired scope, so this throws when the scope is not paired - except the {@link import('../local/scope').LOCAL_SCOPE} pseudo-scope,
    * which is configurable with no pairing. A live daemon needs no signal - its executor reads the policy
    * through a fresh store per run, so the next dispatched run picks the new policy up. `chat` is never
    * deniable, so this policy governs only `schedule` and `dispatch`.
@@ -239,8 +254,8 @@ export interface StateStore {
    * cannot contribute one either. A server on a CLI's MCP surface is therefore always something the
    * user typed on this machine.
    *
-   * Like {@link StateStore.setPolicyCeiling} it throws for an unpaired scope (the CLI guards this
-   * first and surfaces a friendly message), so no orphan config can accumulate under a scope that has no
+   * It throws for an unpaired scope (the CLI guards this first and surfaces a friendly message), so no
+   * orphan config can accumulate under a scope that has no
    * pairing to be read for - except the {@link import('../local/scope').LOCAL_SCOPE} pseudo-scope, whose
    * servers the local user adds with no pairing.
    *
@@ -256,32 +271,6 @@ export interface StateStore {
   upsertMcpServer(scope: string, name: string, spec: LocalMcpSpec): void
   /** Removes one of a scope's local MCP servers (no-op when absent). Returns whether one was removed. */
   removeMcpServer(scope: string, name: string): boolean
-  /**
-   * Returns the folder roots this scope's `terminal --cwd` may run inside (empty when none granted -
-   * the default, which keeps every session in its confined work folder). Read by `terminal` through a
-   * fresh store, so a grant added between sessions is picked up with no restart.
-   */
-  listGrantedFolders(scope: string): string[]
-  /**
-   * Grants a folder root to a scope: a `terminal --cwd <path>` whose REAL path resolves inside this
-   * root may run there instead of the confined work folder.
-   *
-   * SECURITY: this is the ONLY writer of the map, and it is reachable only from the user's own `policy
-   * grant-folder add` command at this machine - never from a network path. A terminal spec is parsed
-   * fail-closed and carries no path at all, so a backend can neither grant a folder nor ask for one; a
-   * granted root is therefore always a folder the user themselves typed. Like
-   * {@link StateStore.setPolicyCeiling} it throws for an unpaired scope (the CLI guards this first and
-   * surfaces a friendly message), except the {@link import('../local/scope').LOCAL_SCOPE} pseudo-scope,
-   * whose grants the local user adds with no pairing.
-   *
-   * @param scope - The paired account scope (or the local pseudo-scope) the grant applies to.
-   * @param root - The CANONICAL absolute root (the command resolves and symlink-canonicalizes it first).
-   * @returns `true` when the grant was added, `false` when the root was already granted.
-   * @throws When the scope is not paired and is not the local pseudo-scope.
-   */
-  addGrantedFolder(scope: string, root: string): boolean
-  /** Revokes a scope's folder grant (no-op when absent). Returns whether one was removed. */
-  removeGrantedFolder(scope: string, root: string): boolean
   /** Whether the daemon self-updates to the latest release. Defaults to `true` when never set. */
   getAutoUpdate(): boolean
   /** Turns daemon self-update on or off. */
@@ -303,7 +292,7 @@ export interface StateStore {
   /** Records the daemon's current supervision mode (app-scoped vs boot-service). Local only, never wired. */
   setAppScoped(value: boolean): void
   /**
-   * Returns the raw pairing substrate (backends + connections + explicit ceilings + origin policies +
+   * Returns the raw pairing substrate (backends + connections + origin policies + terminal approvals +
    * local MCP servers) keyed by scope. The boot-time migrations read this to re-key every record;
    * everyday reads use the narrower accessors above.
    */
@@ -351,10 +340,10 @@ export function createStateStore(opts: StateStoreOpts): StateStore {
       deviceId: '',
       backends: {},
       connections: {},
-      policyCeilings: {},
       originPolicies: {},
+      terminalApprovals: {},
+      policyCeilings: {},
       mcpServers: {},
-      grantedFolders: {},
       autoUpdate: true,
       maxConcurrentRuns: 2,
       appScoped: false
@@ -385,10 +374,10 @@ export function createStateStore(opts: StateStoreOpts): StateStore {
       for (const field of [
         'backends',
         'connections',
-        'policyCeilings',
         'originPolicies',
-        'mcpServers',
-        'grantedFolders'
+        'terminalApprovals',
+        'policyCeilings',
+        'mcpServers'
       ] as const) {
         const all = { ...conf.get(field) }
         delete all[scope]
@@ -414,18 +403,21 @@ export function createStateStore(opts: StateStoreOpts): StateStore {
       conf.set('connections', { ...all, [scope]: rest })
       return true
     },
-    getPolicyCeiling(scope) {
-      const explicit = conf.get('policyCeilings')[scope]
+    getTerminalApproval(scope) {
+      const explicit = conf.get('terminalApprovals')[scope]
       if (explicit) return explicit
-      // No stored ceiling: the local pseudo-scope defaults to `full` (bypass) because it is the user's own
-      // machine; every paired scope keeps the cautious unattended default.
-      return scope === LOCAL_SCOPE ? DEFAULT_LOCAL_CEILING : DEFAULT_CEILING
+      const retired = conf.get('policyCeilings')[scope]
+      if (retired) return retired.permissionMode === 'full' ? 'bypass' : 'prompt'
+      return defaultTerminalApproval(scope)
     },
-    setPolicyCeiling(scope, policy) {
+    setTerminalApproval(scope, approval) {
       if (scope !== LOCAL_SCOPE && !conf.get('backends')[scope]) {
-        throw new Error(`Cannot set a policy ceiling for an unpaired backend: ${scope}`)
+        throw new Error(`Cannot set terminal approvals for an unpaired backend: ${scope}`)
       }
-      conf.set('policyCeilings', { ...conf.get('policyCeilings'), [scope]: policy })
+      conf.set('terminalApprovals', { ...conf.get('terminalApprovals'), [scope]: approval })
+    },
+    hasRetiredEgressDenial(scope) {
+      return conf.get('policyCeilings')[scope]?.network === 'off'
     },
     getOriginPolicy(scope) {
       return conf.get('originPolicies')[scope] ?? DEFAULT_ORIGIN_POLICY
@@ -455,26 +447,6 @@ export function createStateStore(opts: StateStoreOpts): StateStore {
       conf.set('mcpServers', { ...all, [scope]: rest })
       return true
     },
-    listGrantedFolders(scope) {
-      return [...(conf.get('grantedFolders')[scope] ?? [])]
-    },
-    addGrantedFolder(scope, root) {
-      if (scope !== LOCAL_SCOPE && !conf.get('backends')[scope]) {
-        throw new Error(`Cannot grant a folder for an unpaired backend: ${scope}`)
-      }
-      const all = conf.get('grantedFolders')
-      const current = all[scope] ?? []
-      if (current.includes(root)) return false
-      conf.set('grantedFolders', { ...all, [scope]: [...current, root] })
-      return true
-    },
-    removeGrantedFolder(scope, root) {
-      const all = conf.get('grantedFolders')
-      const current = all[scope]
-      if (!current || !current.includes(root)) return false
-      conf.set('grantedFolders', { ...all, [scope]: current.filter((entry) => entry !== root) })
-      return true
-    },
     getAutoUpdate() {
       return conf.get('autoUpdate')
     },
@@ -497,24 +469,24 @@ export function createStateStore(opts: StateStoreOpts): StateStore {
       return {
         backends: { ...conf.get('backends') },
         connections: { ...conf.get('connections') },
-        policyCeilings: { ...conf.get('policyCeilings') },
         originPolicies: { ...conf.get('originPolicies') },
-        mcpServers: { ...conf.get('mcpServers') },
-        grantedFolders: { ...conf.get('grantedFolders') }
+        terminalApprovals: { ...conf.get('terminalApprovals') },
+        mcpServers: { ...conf.get('mcpServers') }
       }
     },
     replacePairingState(next) {
       // A single full-document `conf.set` (one serialize + atomic file write) so a crash can never
       // leave the re-keyed maps persisted inconsistently. deviceId/autoUpdate/maxConcurrentRuns/
-      // appScoped are carried through unchanged; only the pairing substrate is replaced.
+      // appScoped are carried through unchanged, as is the retired `policyCeilings` map (nothing re-keys
+      // a value nothing writes); only the pairing substrate is replaced.
       conf.set({
         deviceId: conf.get('deviceId'),
         backends: next.backends,
         connections: next.connections,
-        policyCeilings: next.policyCeilings,
         originPolicies: next.originPolicies,
+        terminalApprovals: next.terminalApprovals,
+        policyCeilings: conf.get('policyCeilings'),
         mcpServers: next.mcpServers,
-        grantedFolders: next.grantedFolders,
         autoUpdate: conf.get('autoUpdate'),
         maxConcurrentRuns: conf.get('maxConcurrentRuns'),
         appScoped: conf.get('appScoped')

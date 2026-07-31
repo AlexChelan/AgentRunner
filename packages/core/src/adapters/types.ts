@@ -78,6 +78,12 @@ export interface ClaudeDriverParams {
   /** Resolved absolute path to the user's `claude` binary. */
   binaryPath: string
   permissionMode: PermissionMode
+  /**
+   * Whether the run is CAPABILITY-FLOORED (a paired web backend dispatched it). It replaces
+   * {@link permissionMode} rather than refining it: the run loads NO built-in tools beyond the ones its
+   * own allow-list names, and every file and shell built-in is denied outright.
+   */
+  floored?: boolean
   allowedTools?: string[]
   disallowedTools?: string[]
   systemPrompt?: string
@@ -127,6 +133,16 @@ export interface AgenticCliDriverParams {
   apiKey?: string
   binaryPath: string
   permissionMode: PermissionMode
+  /**
+   * Whether the run is CAPABILITY-FLOORED (a paired web backend dispatched it): it may run inference
+   * and call the backend's own manifest tools, and touch no file, shell or local MCP server.
+   *
+   * What each driver can actually DO with it differs, and the difference is honest rather than
+   * cosmetic. Codex turns it into an OS-enforced root filesystem deny on its permissions profile. The
+   * ACP drivers have no tool-restriction lever at all, so they can only refuse the permission requests
+   * the agent chooses to send - see the ACP driver's own note.
+   */
+  floored?: boolean
   /**
    * Reasoning effort; absent/`"default"` leaves the model's native behaviour. A plain string, not
    * the shipped ladder - a discovered level reaches the driver unnarrowed and the driver's own

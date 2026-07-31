@@ -14,13 +14,91 @@ export interface ClaudePermissionOptions {
 }
 
 /**
+ * Every built-in Claude Code tool a FLOORED run must never reach: the file tools, the shell tools, and
+ * the tools that can execute or delegate their way to either (a subagent inherits a toolset; a REPL is
+ * a shell by another name). Named EXPLICITLY rather than derived, and deliberately over-inclusive -
+ * a name this SDK no longer ships (`MultiEdit`, `KillBash`) is inert, while a name it revives is
+ * already denied.
+ *
+ * This is DEFENCE IN DEPTH, not the primary control. The primary control is that a floored run loads
+ * an empty base toolset ({@link flooredClaudeToolBase}), so a file tool a future SDK adds arrives
+ * absent rather than denied. This list is what still holds if that base set is ever widened, because
+ * the SDK removes a `disallowedTools` name from the model's context "even if it would otherwise be
+ * allowed" - a deny outranks every allow.
+ */
+export const FLOORED_DENIED_CLAUDE_TOOLS: readonly string[] = [
+  'Bash',
+  'BashOutput',
+  'KillShell',
+  'KillBash',
+  'Read',
+  'Write',
+  'Edit',
+  'MultiEdit',
+  'NotebookEdit',
+  'NotebookRead',
+  'Glob',
+  'Grep',
+  'Task',
+  'Agent',
+  'REPL',
+  'SlashCommand'
+]
+
+/** The prefix every Claude MCP tool name carries, which is what tells one apart from a built-in. */
+const MCP_TOOL_PREFIX = 'mcp__'
+
+/**
+ * The base set of BUILT-IN tools a floored run may load, derived from the allow-list the floor already
+ * composed: everything in it that is not an MCP tool. In practice that is the CLI's web tools on a
+ * network-on run and NOTHING at all otherwise.
+ *
+ * This is the floor's primary control and the reason it is an allow-list rather than a denylist. The
+ * SDK's `tools` option is what decides which built-ins EXIST for a run (`[]` disables all of them);
+ * `allowedTools` only decides which of the existing ones skip the approval prompt. So a file-touching
+ * tool a future Claude Code release ships arrives DISABLED on every paired device, because it was
+ * never named here - no list of ours has to be updated for that to hold.
+ *
+ * The driver therefore sets `tools` UNCONDITIONALLY for a floored run: the empty array is the whole
+ * point, so it must NOT be dropped the way an empty `allowedTools` is.
+ *
+ * @param allowedTools - The run's full allow-list (MCP names plus whatever built-ins the floor permits).
+ * @returns The built-in tool names, for the SDK's `tools` option.
+ */
+export function flooredClaudeToolBase(allowedTools: readonly string[]): string[] {
+  return allowedTools.filter((name) => !name.startsWith(MCP_TOOL_PREFIX))
+}
+
+/**
  * Maps the abstract {@link PermissionMode} onto Claude Agent SDK controls.
  * `read-only` is a hard non-destructive posture: read tools allowed, writers
  * removed, and `dontAsk` so unlisted tools are denied (no interactive prompts).
  * `auto-edit` accepts edits but routes other tools (e.g. Bash) to `canUseTool`.
  * `full` bypasses permissions (gated behind explicit opt-in in the UI).
+ *
+ * A FLOORED run ignores the mode entirely - a dispatched run has no posture to express, only a
+ * capability set. It answers no prompts (`dontAsk`, since the daemon is unattended and its caller
+ * auto-approves whatever it is asked), contributes NO allow-list of its own so the driver's
+ * concatenation yields exactly the run's own manifest tools, and denies every file and shell built-in
+ * outright. Note what the floored branch must NOT do: return `read-only`, whose allow-list injects
+ * `Read`/`Glob`/`Grep` and would hand a floored run the filesystem through the very control meant to
+ * take it away.
+ *
+ * @param mode - The abstract permission posture.
+ * @param floored - Whether the run is capability-floored (a paired backend dispatched it).
+ * @returns The SDK permission controls for the run.
  */
-export function claudePermissionOptions(mode: PermissionMode): ClaudePermissionOptions {
+export function claudePermissionOptions(
+  mode: PermissionMode,
+  floored = false
+): ClaudePermissionOptions {
+  if (floored) {
+    return {
+      permissionMode: 'dontAsk',
+      allowedTools: [],
+      disallowedTools: [...FLOORED_DENIED_CLAUDE_TOOLS]
+    }
+  }
   switch (mode) {
     case 'read-only':
       return {
@@ -618,6 +696,9 @@ const CODEX_PROFILE_BASE: Record<CodexPosture['sandboxMode'], string> = {
   'danger-full-access': ':danger-full-access'
 }
 
+/** The filesystem root, denied outright to a floored run rather than path by path. */
+const FILESYSTEM_ROOT = '/'
+
 /** Inputs for {@link buildCodexPermissionProfileOverrides}. */
 export interface CodexPermissionProfileInput {
   /** Sandbox tier from {@link codexPosture}; selects the built-in profile to extend. */
@@ -626,6 +707,12 @@ export interface CodexPermissionProfileInput {
   networkAccessEnabled: boolean
   /** Absolute paths whose reads are DENIED to the spawned CLI (the daemon's own secrets dir). */
   denyReadPaths: string[]
+  /**
+   * Whether the run is CAPABILITY-FLOORED (a paired web backend dispatched it). Codex has no per-tool
+   * disable and its shell is a core tool, so the floor can only be expressed as a filesystem deny at
+   * the root - which the profile makes OS-enforced.
+   */
+  floored?: boolean
 }
 
 /**
@@ -640,23 +727,45 @@ export interface CodexPermissionProfileInput {
  * The emitted `filesystem` map is rendered as ONE TOML inline table (its keys are absolute paths, so
  * they must not be flattened into codex's dotted `-c` key path); {@link toCodexTomlValue} quotes them.
  *
+ * A FLOORED run (dispatched by a paired web backend) denies the filesystem ROOT instead of a path
+ * list, and always extends `:read-only` rather than the run's tier. Codex offers no per-tool disable
+ * and its shell is a core tool, so a root deny is the only thing that can express "this run touches no
+ * file": there is no `Bash` to leave out of an allow-list the way there is on Claude Code. The
+ * per-path `denyReadPaths` are dropped as redundant - a root deny subsumes every one of them - which
+ * also keeps the override short enough to stay readable in a crash log.
+ *
+ * VERIFIED against the real `codex-cli 0.145.0` on macOS: with this profile, a shell read of a canary
+ * outside the cwd was killed by seatbelt (`exited 134`), the model answered `BLOCKED`, and the run
+ * still authenticated and completed a model call. The codex process reads its OWN `auth.json` while
+ * the sandbox denies `/` to everything it spawns, so the deny costs the run nothing it needs.
+ *
+ * PLATFORM COVERAGE (disclosed, not silently degraded): this is OS-enforced only where codex has a
+ * sandbox - macOS seatbelt, and Linux with the sandbox helper. On Windows, or Linux without it, a
+ * floored codex run is NOT contained, and that is surfaced through the reduced-containment disclosure
+ * rather than silently claimed.
+ *
  * Callers MUST also omit the legacy thread-level `sandbox` mode from `thread/start`
  * ({@link buildCodexThreadStartParams} does): passing it makes codex ignore the profile entirely
  * (`activePermissionProfile: null`) and the deny is silently lost. The per-turn `sandboxPolicy` is
  * unaffected and coexists with the profile.
  *
- * @param input - The tier, the network posture, and the paths to deny.
+ * A FLOORED run replaces the per-path deny with a deny of `/`. Codex has no per-tool disable, so the
+ * SANDBOX is the floor here, and this profile is what makes it OS-enforced.
+ *
+ * @param input - The tier, the network posture, the paths to deny, and whether the run is floored.
  * @returns The `key=value` overrides to pass after each `-c`, or `[]` when nothing is denied.
  */
 export function buildCodexPermissionProfileOverrides(
   input: CodexPermissionProfileInput
 ): string[] {
-  if (input.denyReadPaths.length === 0) return []
+  if (!input.floored && input.denyReadPaths.length === 0) return []
   const key = `permissions.${CODEX_CONFINED_PROFILE}`
   const filesystem: Record<string, string> = {}
-  for (const path of input.denyReadPaths) filesystem[path] = 'deny'
+  if (input.floored) filesystem[FILESYSTEM_ROOT] = 'deny'
+  else for (const path of input.denyReadPaths) filesystem[path] = 'deny'
+  const base = input.floored ? CODEX_PROFILE_BASE['read-only'] : CODEX_PROFILE_BASE[input.sandboxMode]
   return [
-    `${key}.extends=${toCodexTomlValue(CODEX_PROFILE_BASE[input.sandboxMode], `${key}.extends`)}`,
+    `${key}.extends=${toCodexTomlValue(base, `${key}.extends`)}`,
     `${key}.network=${toCodexTomlValue({ enabled: input.networkAccessEnabled }, `${key}.network`)}`,
     `${key}.filesystem=${toCodexTomlValue(filesystem, `${key}.filesystem`)}`,
     `default_permissions=${toCodexTomlValue(CODEX_CONFINED_PROFILE, 'default_permissions')}`

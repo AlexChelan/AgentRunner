@@ -1,0 +1,6 @@
+{
+  "type": "stdio",
+  "command": "npx",
+  "args": ["-y", "@modelcontextprotocol/server-filesystem", "/work/acme-notes"],
+  "env": { "NODE_ENV": "production" }
+}

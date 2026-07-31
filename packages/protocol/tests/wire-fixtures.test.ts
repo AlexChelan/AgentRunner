@@ -65,7 +65,7 @@ const fixturesDir = fileURLToPath(new URL('./fixtures/', import.meta.url))
  * directory is ever edited or deleted - those bytes are what some daemon in the field actually sends,
  * and this suite is the only thing that proves the current schema still accepts them.
  */
-const FROZEN_VERSIONS = [1, 2, 3] as const
+const FROZEN_VERSIONS = [1, 2, 3, 4] as const
 
 /**
  * Reads and JSON-parses a wire fixture from a version's fixture directory.

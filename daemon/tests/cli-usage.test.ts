@@ -56,4 +56,22 @@ describe('cli routing - unknown command, --help, --version', () => {
     await run(['--help'])
     expect(out.stdout).toContain('terminal [<productId>]')
   })
+
+  it('names the RETIRED `policy` command and the capability widening that came with it', async () => {
+    await run(['policy', 'set', '--network', 'off'])
+    expect(out.exitCode).toBe(1)
+    // A retired command that fell through to the generic banner reads as a typo, so a user who
+    // scripted `--network off` to air-gap a pairing would re-run it and never learn that egress is now
+    // permitted to a dispatched run that asks for it. A widening landing on an existing install has to
+    // name itself.
+    expect(out.stderr).toContain('`policy` was removed')
+    expect(out.stderr).toContain('no longer air-gaps a pairing')
+    expect(out.stderr).toContain(`${BRAND.binary} origin`)
+    // And it must name where the PERMISSION half went. That half did not go away for terminal sessions,
+    // so a notice that says it had nothing left to clamp would send a user who wants their approval
+    // prompts back away believing there is no longer a control at all.
+    expect(out.stderr).toContain('approvals set --mode prompt|bypass')
+    // And it must NOT fall back to the banner, which is what made it look like a typo.
+    expect(out.stderr).not.toContain(`Usage: ${BRAND.binary} <command>`)
+  })
 })

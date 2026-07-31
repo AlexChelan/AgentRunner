@@ -1,4 +1,5 @@
-import type { HttpClient, HttpResponse } from '@opencompanion/core/runtime/poll-client'
+import type { StreamOpener } from '@opencompanion/core/runtime/backend-http'
+import type { HttpClient, HttpResponse } from '@opencompanion/core/runtime/stream-client'
 
 /**
  * The recording HTTP fake the shell's `serve` suite drives. A byte-identical twin lives at
@@ -65,4 +66,52 @@ export function createRecordingHttp(
     return route(recorded, calls)
   }
   return { http, calls }
+}
+
+/** Encodes one named SSE event, exactly as the backend writes it. */
+function frame(event: string, data: unknown): string {
+  return `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`
+}
+
+/**
+ * Serves whatever a suite's scripted route returns as REAL SSE frames, so a test keeps scripting one
+ * batch body while the client reads it the way production does - through the frame decoder and the
+ * per-event routing rather than a back door into the applier.
+ *
+ * The `/stream` request is rewritten to `/poll` before it reaches the fake, so an existing route table
+ * keeps working unchanged and the recorded call still looks like the request the suite scripted.
+ */
+export function streamFrom(http: HttpClient): StreamOpener {
+  return async (url, init) => {
+    const res = await http(url.replace('/stream', '/poll'), { method: 'GET', headers: init.headers })
+    if (res.status !== 200) {
+      return {
+        status: res.status,
+        ...(res.retryAfterMs !== undefined ? { retryAfterMs: res.retryAfterMs } : {}),
+        chunks: (async function* () {})()
+      }
+    }
+    const body = (await res.json()) as {
+      runs?: unknown[]
+      cancel?: string[]
+      connects?: unknown[]
+      disconnects?: unknown[]
+      wireToken?: string
+    }
+    const list = (v: unknown): unknown[] => (Array.isArray(v) ? v : [])
+    const frames: string[] = []
+    for (const runId of list(body.cancel)) frames.push(frame('cancel', { runId }))
+    for (const item of list(body.connects)) frames.push(frame('connect', item))
+    for (const item of list(body.disconnects)) frames.push(frame('disconnect', item))
+    for (const item of list(body.runs)) frames.push(frame('run', item))
+    if (body.wireToken) frames.push(frame('token', { wireToken: body.wireToken }))
+    return {
+      status: 200,
+      chunks: (async function* () {
+        // A keep-alive first, so every suite also proves a comment frame is ignored rather than parsed.
+        yield ': keepalive\n\n'
+        for (const f of frames) yield f
+      })()
+    }
+  }
 }

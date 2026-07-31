@@ -5,9 +5,19 @@ import {
   type RunContextResolvers,
   type RuntimeRunRequest
 } from '../index'
-import { clampPolicy, type RunPolicy, type RunStart } from '@opencompanion/protocol'
+import {
+  clampPolicy,
+  comparePermissionModes,
+  type PermissionMode,
+  type RunPolicy,
+  type RunStart
+} from '@opencompanion/protocol'
+import { isLocalScope } from './local/scope'
+import { DISPATCHED_POLICY, LOCAL_TERMINAL_POLICY } from './policies'
 import { localDataDir, runtimeIdentityDir, secretsDir } from './paths'
 import { codexCredentialReadDenyPaths, sensitiveHomeReadDenyPaths } from './read-deny'
+import { webToolServerName } from './tool-proxy'
+import { claudeAllowedToolsForFloor } from './web-floor'
 import { resolveWorkFolder } from './work-folder'
 
 /** Inputs for {@link buildRun}. */
@@ -18,8 +28,6 @@ export interface BuildRunOpts {
   backendKey: string
   /** The dispatched run descriptor. */
   start: RunStart
-  /** The per-backend capability ceiling the requested policy is clamped to. */
-  ceiling: RunPolicy
   /** The resolved connection (tool + auth mode) to drive. */
   connection: ConnectionRef
   /** Resolves a tool binary for a bare name, or `null`. */
@@ -47,10 +55,32 @@ export interface BuiltRun {
 }
 
 /**
+ * Raises the on-device LOCAL leg's permission mode UP to at least `auto-edit`, leaving a higher mode
+ * (`full`) unchanged - but only when the ceiling permits it. The desktop app's chats and schedules
+ * compose no policy of their own, so {@link clampPolicy} resolves them to the unattended `read-only`
+ * default, under which the CLIs that map the mode to a static sandbox (Codex/OpenCode) refuse every
+ * write and the app's assistant cannot edit anything. An EXPLICIT `read-only` ceiling is the one
+ * exception: a user who set that is opting into a non-destructive local agent, so the clamped mode
+ * stands. This never LOWERS a mode.
+ *
+ * It applies to the LOCAL leg ONLY. A backend-dispatched run is floored instead, which is the opposite
+ * direction and the whole point of {@link buildRun}'s floor.
+ *
+ * @param mode - The clamped permission mode from the policy.
+ * @param ceiling - The local ceiling; an explicit `read-only` ceiling suppresses the raise.
+ * @returns The mode, raised to `auto-edit` unless the ceiling is `read-only`.
+ */
+function localLegPermission(mode: PermissionMode, ceiling: PermissionMode): PermissionMode {
+  if (ceiling === 'read-only') return mode
+  return comparePermissionModes(mode, 'auto-edit') >= 0 ? mode : 'auto-edit'
+}
+
+/**
  * Prepares a dispatched `run.start` for execution: resolves the confined
  * `work/<backendKey>/<productId>/` cwd (backend-namespaced so paired backends never collide on a
- * shared `productId`), clamps the requested policy DOWN to the per-backend ceiling, builds the isolated
- * {@link RunContext}, and maps the descriptor onto a {@link RuntimeRunRequest}. The clamped
+ * shared `productId`), clamps the requested policy DOWN to the FIXED posture its scope carries (a
+ * dispatched run is then floored further still - see below), builds the isolated {@link RunContext}, and maps the
+ * descriptor onto a {@link RuntimeRunRequest}. The effective
  * `permissionMode` AND `network` posture are both threaded into the runtime. `network: 'off'`
  * becomes an OS-enforced egress block ONLY on adapters that can enforce it (Codex
  * `networkAccessEnabled: false`); for Claude Code / OpenCode the runtime discloses that
@@ -79,7 +109,30 @@ export interface BuiltRun {
  * daemon's OWN loopback web-tools proxy - is added SEPARATELY by the executor, not from the wire.
  * Dropping the wire value therefore closes the spawn vector with zero impact on the real flow.
  *
- * @param opts - The descriptor, ceiling, connection, and resolvers.
+ * A run dispatched by a PAIRED BACKEND is additionally FLOORED (see {@link claudeAllowedToolsForFloor}):
+ * its posture drops to the bottom of the ladder whatever it asked for, and its tool allow-list
+ * is exactly the backend's own manifest tools (which execute on the backend, not this machine) plus the
+ * CLI's web tools when the clamped policy permits egress. From a web app's view the companion is a model
+ * provider that happens to bill the user's subscription, and providers have no filesystem. The floor is
+ * not a policy field and not clampable: it is a property of being dispatched. The ONE exception is the
+ * on-device LOCAL leg (the desktop app's own chats, keyed by the local pseudo-scope - see
+ * {@link isLocalScope}), which keeps full capability because the user is sitting in front of it. That
+ * test is structural rather than a flag: a paired backend key is always `<host>-<8 hex digest>` and can
+ * never equal `local`, so a backend cannot name its way out of the floor, and every scope that is not
+ * the local leg is floored. The run's SCOPE therefore decides its posture - there is no stored ceiling
+ * and nothing to look up - and it FAILS CLOSED: anything that is not the on-device local leg is a
+ * dispatched run.
+ *
+ * A dispatched run IS its clamp: `DISPATCHED_POLICY.permissionMode` is the bottom of the ladder, so
+ * `clampPolicy` has already landed it there whatever the run asked for, and re-stating the mode
+ * afterwards would make that constant decide nothing.
+ *
+ * A floored run's WHOLE toolset is the backend's own manifest tools, which run ON THE BACKEND over the
+ * daemon's loopback MCP, plus the CLI's web tools when egress is permitted. Each adapter turns
+ * `floored` into its own native control - Claude, for instance, into an empty built-in tool base plus
+ * this allow-list - so a file-touching tool a CLI ships tomorrow arrives disabled rather than enabled.
+ *
+ * @param opts - The descriptor, connection, and resolvers.
  * @returns The prepared run.
  */
 export function buildRun(opts: BuildRunOpts): BuiltRun {
@@ -88,7 +141,12 @@ export function buildRun(opts: BuildRunOpts): BuiltRun {
     backendKey: opts.backendKey,
     productId: opts.start.productId
   })
-  const effectivePolicy = clampPolicy(opts.ceiling, opts.start.policy)
+  const floored = !isLocalScope(opts.backendKey)
+  const ceiling = floored ? DISPATCHED_POLICY : LOCAL_TERMINAL_POLICY
+  const clamped = clampPolicy(ceiling, opts.start.policy)
+  const effectivePolicy: RunPolicy = floored
+    ? clamped
+    : { permissionMode: localLegPermission(clamped.permissionMode, ceiling.permissionMode), network: clamped.network }
 
   const ctx = makeRunContext({
     productId: opts.start.productId,
@@ -125,6 +183,16 @@ export function buildRun(opts: BuildRunOpts): BuiltRun {
       ...sensitiveHomeReadDenyPaths(),
       ...(isCodexRun ? [] : codexCredentialReadDenyPaths(opts.appDataRoot))
     ],
+    ...(floored
+      ? {
+          floored: true,
+          allowedTools: claudeAllowedToolsForFloor(
+            opts.start.webToolManifest.map((entry) => entry.name),
+            webToolServerName(),
+            effectivePolicy.network === 'on'
+          )
+        }
+      : {}),
     ...(opts.start.systemPrompt ? { systemPrompt: opts.start.systemPrompt } : {}),
     ...(opts.start.modelId ? { modelId: opts.start.modelId } : {}),
     ...(opts.start.effort ? { effort: opts.start.effort } : {}),

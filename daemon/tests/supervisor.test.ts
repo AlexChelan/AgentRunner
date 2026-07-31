@@ -8,6 +8,8 @@ interface FakeSession {
   starts: number
   stops: number
   active: number
+  /** How many times the supervisor asked THIS session to re-report the machine's free capacity. */
+  capacityReports: number
 }
 
 /**
@@ -32,6 +34,7 @@ function fakeFactory(): {
       starts: 0,
       stops: 0,
       active: 0,
+      capacityReports: 0,
       session: {
         backendUrl,
         start: () => {
@@ -43,7 +46,10 @@ function fakeFactory(): {
         stop: async () => {
           rec.stops++
         },
-        activeRunCount: () => rec.active
+        activeRunCount: () => rec.active,
+        reportCapacity: async () => {
+          rec.capacityReports++
+        }
       }
     }
     created.set(backendUrl, rec)
@@ -89,6 +95,25 @@ describe('createSessionSupervisor', () => {
     factory.created.get('https://a.example')!.active = 2
     factory.created.get('https://b.example')!.active = 1
     expect(supervisor.activeRunCount()).toBe(3)
+  })
+
+  it('reportCapacityFreed reaches EVERY running session, not just the one whose run ended', () => {
+    const urls = ['https://a.example', 'https://b.example']
+    const factory = fakeFactory()
+    const supervisor = createSessionSupervisor({
+      listScopes: () => [...urls],
+      makeSession: factory.makeSession,
+      setTimer: setInterval,
+      clearTimer: clearInterval
+    })
+    supervisor.reconcile()
+
+    supervisor.reportCapacityFreed()
+    // The concurrent-run cap is machine-global, so a slot freed on backend A is a slot freed for B too -
+    // and B only ever sees ITS own runs end. Without the fan-out, a B that had reported zero capacity
+    // while A was busy would never be told otherwise and its queued work would wait for a reconnect.
+    expect(factory.created.get('https://a.example')?.capacityReports).toBe(1)
+    expect(factory.created.get('https://b.example')?.capacityReports).toBe(1)
   })
 
   it('the periodic timer hot-adds a newly-paired backend without an explicit reconcile', async () => {

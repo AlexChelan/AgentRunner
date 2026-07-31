@@ -3,7 +3,6 @@ import {
   type AdapterCapabilities,
   type ConnectionRef,
   type McpServerSpec,
-  type PermissionMode,
   type RunContext,
   type RuntimeRunEvent,
   type RuntimeRunRequest,
@@ -17,14 +16,14 @@ import type {
   RunStart,
   ToolCall
 } from '@opencompanion/protocol'
-import { comparePermissionModes } from '@opencompanion/protocol'
 import type { AuditLog } from './audit-log'
-import { brand } from './brand'
 import { ensureIsolatedCodexHome } from './codex-isolation'
 import { messageOf } from './error-message'
 import { deriveRunKind, isRunKindDenied, type OriginPolicy, type RunKind } from './origin-policy'
 import { buildRun } from './run-context-builder'
-import { manifestToToolSet } from './tool-proxy'
+import { isLocalScope } from './local/scope'
+import { manifestToToolSet, webToolServerName } from './tool-proxy'
+import { isDispatchUnconfined, UNCONFINED_DISCLOSURE } from './web-floor'
 
 /** A running loopback app-MCP handle (the subset of the runtime's `LocalMcpHandle`). */
 interface ServedTools {
@@ -82,16 +81,10 @@ export interface ExecutorDeps {
   /** Resolves a connection for a product, or `null`. */
   getConnection(productId: string, connectionId: string): ConnectionRef | null
   /**
-   * Returns the policy ceiling the requested policy is clamped to. The daemon resolves ONE ceiling
-   * per paired backend (keyed by `backendUrl`), so its implementation ignores `productId`; the
-   * argument is kept for the seam's shape, not because the ceiling varies by product.
-   */
-  getCeiling(productId: string): RunPolicy
-  /**
-   * Returns the device origin policy the run's DERIVED kind is checked against. Like {@link getCeiling}
-   * the daemon resolves ONE policy per paired backend (keyed by `backendUrl`), so its implementation
-   * ignores `productId`; the argument is kept for the seam's shape. A denied `schedule`/`dispatch` run
-   * is refused locally before any CLI spawn; `chat` is never deniable.
+   * Returns the device origin policy the run's DERIVED kind is checked against. The daemon resolves ONE
+   * policy per paired backend (keyed by `backendUrl`), so its implementation ignores `productId`; the
+   * argument is kept for the seam's shape. A denied `schedule`/`dispatch` run is refused locally before
+   * any CLI spawn; `chat` is never deniable.
    */
   getOriginPolicy(productId: string): OriginPolicy
   /** Resolves a tool binary by bare name, or `null`. */
@@ -120,7 +113,30 @@ export interface ExecutorDeps {
 
 /** Starts and cancels dispatched runs. */
 export interface Executor {
-  /** Starts a dispatched run; idempotent dedupe is the caller's job (by `runId`). */
+  /**
+   * Starts a dispatched run; idempotent dedupe is the caller's job (by `runId`).
+   *
+   * A CLI THE FLOOR CANNOT BE ENFORCED FOR RUNS ANYWAY - ruled, because a user keeps their preferred
+   * CLI - but it is never silent. The daemon asks an ACP agent to stay in its work folder and cannot
+   * make it: proven, not assumed, since a dispatched run reached files outside the work folder on both
+   * and Hermes read the user's `~/.ssh`. So every such run is recorded as unconfined in the LOCAL
+   * audit log, the one record the user owns and no backend can rewrite. Local surfaces are not
+   * disclosed, because they were never claimed to be confined in the first place.
+   *
+   * The audit entry records the policy the run ACTUALLY executes under, exactly as `buildRun` composed
+   * it: the floored posture for a dispatched run, the clamped one for the on-device local leg. Its
+   * `unconfined` marker records that the floor was REQUESTED of this CLI rather than enforced on it,
+   * so the log distinguishes a run that could not leave its work folder from one that merely was not
+   * seen to - without it the two are indistinguishable after the fact, which is the only thing a user
+   * has to reason about later.
+   *
+   * A PERMISSION REQUEST IS AUTO-APPROVED, not auto-denied. The companion runs UNATTENDED: there is no
+   * synchronous approver and no permission-response wire back from the backend, so an interactive
+   * approval can never be surfaced to a human. Denying would make the on-device LOCAL leg - the
+   * desktop app's own chats, where the user IS present - a read-only agent that cannot act, and a
+   * backend-dispatched run is not made safe by this answer either way: its boundary is the capability
+   * floor `buildRun` applies, which leaves nothing dangerous to approve.
+   */
   start(start: RunStart, hooks: RunHooks): void
   /** Cancels an in-flight run by id. */
   cancel(runId: string): void
@@ -135,28 +151,6 @@ const DEFAULT_CAPS: AdapterCapabilities = {
   interactiveApproval: false,
   subscriptionRequiresDisclosure: false,
   httpMcp: true
-}
-
-/**
- * Raises a permission mode UP to at least `auto-edit`, leaving a higher mode (`full`) unchanged - but
- * ONLY when the per-backend `ceiling` permits it. The companion is UNATTENDED, so it normally mirrors
- * the desktop SCHEDULED posture: the CLI must be able to edit/act headlessly (a `read-only` posture
- * would refuse every write on the CLIs that map the mode to a static sandbox - Codex/OpenCode - making
- * the companion a read-only agent). The one exception is an EXPLICIT read-only ceiling: a builder who
- * sets `ceiling.permissionMode === 'read-only'` is opting into a truly non-destructive companion, so
- * the floor is NOT applied and the clamped `read-only` mode stands. Otherwise this floors up. It never
- * LOWERS a mode, and the run's real safety boundaries (work-folder confinement + network posture) come
- * from the clamped policy, not the permission mode.
- *
- * @param mode - The clamped permission mode from the policy.
- * @param ceiling - The per-backend permission ceiling; a `read-only` ceiling suppresses the floor.
- * @returns The mode, floored up to `auto-edit` unless the ceiling is `read-only`.
- */
-function floorToAutoEdit(mode: PermissionMode, ceiling: PermissionMode): PermissionMode {
-  // Honor an explicit read-only CEILING: the builder wants a non-destructive companion, so do not
-  // raise a clamped read-only mode. The floor only ever applies under a more permissive ceiling.
-  if (ceiling === 'read-only') return mode
-  return comparePermissionModes(mode, 'auto-edit') >= 0 ? mode : 'auto-edit'
 }
 
 /**
@@ -200,16 +194,15 @@ function refusalDetail(start: RunStart): Record<string, string> {
 
 /**
  * Builds the {@link Executor} over the runtime session manager. Each `start` resolves the
- * connection + policy ceiling, builds the isolated {@link RunContext} + clamped
+ * connection, builds the isolated {@link RunContext} + clamped
  * {@link RuntimeRunRequest}, optionally serves the web tools over loopback MCP and injects the
  * spec into `mcpServers`, then drives the run - forwarding every runtime event up as a
  * `run.event`, forwarding the SDK session id as a `run.conversation`, AUTO-APPROVING any CLI
- * permission-request and flooring the posture to `auto-edit` (the daemon is unattended with no
- * approver, so it mirrors the desktop SCHEDULED posture and lets the CLI act headlessly rather than
- * refusing every write - UNLESS the per-backend ceiling is explicitly `read-only`, an opt-in
- * non-destructive companion where the floor is suppressed), and tearing the MCP server down on close.
- * A cancel that arrives while a run's loopback MCP is still being served is honored (the served
- * handle is closed and the run never starts) rather than dropped.
+ * permission-request (the daemon is unattended: there is no approver to surface the prompt to, and a
+ * backend-dispatched run's real boundary is the capability floor {@link buildRun} applies, not a
+ * prompt nobody can answer), and tearing the MCP server down on close. A cancel that arrives while a
+ * run's loopback MCP is still being served is honored (the served handle is closed and the run never
+ * starts) rather than dropped.
  *
  * Before any of that, each run's kind is DERIVED (schedule | dispatch | chat) from the frozen wire
  * fields and checked against the per-backend device origin policy: a denied `schedule`/`dispatch` run
@@ -221,6 +214,23 @@ function refusalDetail(start: RunStart): Record<string, string> {
  * error frame, CLI never started) so an unlogged run is impossible. The terminal outcome
  * (`completed`/`failed`/`cancelled`, with a duration) is then recorded best-effort - a throwing
  * terminal append is swallowed to a warning line rather than crashing the already-executed run.
+ *
+ * A RUN IS COUNTED IN FLIGHT BEFORE ANY OF IT CAN FAIL, so the whole of `start` is guarded and every
+ * exit releases the id. Preparing a run does real work that throws SYNCHRONOUSLY - the Codex isolation
+ * mkdirs, symlinks and writes; `buildRun` refuses a crafted `productId` outright - and an escaping
+ * throw used to leave the id in the active set forever. Nothing ever removes it: at the default cap of
+ * two, two such runs pin the machine-global count at the cap, so the device reports zero free slots
+ * and is handed no work for the life of the daemon, while the self-updater's idle gate
+ * (`totalActiveRuns() === 0`) never opens and the daemon stops updating itself. The guard turns such a
+ * throw into the same terminal error frame every other refusal produces, which is also what the
+ * callers need: the local schedule runner settles on `onClose`, and the local fallback dispatches its
+ * second CLI on seeing a pre-execution `error`, so a throw that skipped both stranded them too. The
+ * frame is emitted BEFORE the close for exactly that reason, and the release sits in a `finally` so a
+ * throwing host hook cannot re-open the leak. The wire message is FIXED, so no local path or
+ * filesystem detail leaks upstream; the cause goes to the local log only. The terminal audit recorder
+ * is a no-op until the `dispatched` entry lands, so a setup throw records no outcome for a run the log
+ * never opened, and `finish` is once-only, so a close path that already ran cannot fire `onClose`
+ * twice.
  *
  * @param deps - The injected runtime + storage + MCP + audit dependencies.
  * @returns The executor.
@@ -248,247 +258,252 @@ export function createExecutor(deps: ExecutorDeps): Executor {
       // Mark this run in flight and route every close path through `finish`, so the active set always
       // reflects the true lifecycle (start -> onClose) whichever branch closes the run.
       active.add(start.runId)
+      let closed = false
       const finish = (): void => {
+        if (closed) return
+        closed = true
         active.delete(start.runId)
         hooks.onClose()
       }
 
-      // Derive this run's kind (schedule | dispatch | chat) from the frozen wire fields and refuse it
-      // locally when this backend's device origin policy denies that kind. This runs BEFORE the
-      // connection lookup, any CLI spawn, and the `dispatched` audit append, so a denied run never
-      // executes and is recorded ONLY as `refused` (never `dispatched`). Chat is never deniable, so a
-      // chat turn always falls through. The refusal audit is best-effort - the run is refused either
-      // way, so a broken sink cannot let a denied run proceed; it is surfaced as a warning line.
-      const kind = deriveRunKind(start)
-      if (isRunKindDenied(deps.getOriginPolicy(start.productId), kind)) {
-        try {
-          deps.audit.append({
-            backendUrl: deps.backendUrl,
-            event: 'refused',
-            runId: start.runId,
-            productId: start.productId,
-            detail: refusalDetail(start)
-          })
-        } catch (err) {
-          deps.log?.(
-            `audit refused append failed for run ${start.runId}: ${messageOf(err)}\n`
-          )
-        }
-        hooks.onEvent({
-          type: 'run.event',
-          runId: start.runId,
-          event: { type: 'error', message: `${RUN_KIND_LABEL[kind]} runs are refused by device policy` }
-        })
-        finish()
-        return
-      }
+      let recordTerminal: (event: 'completed' | 'failed' | 'cancelled', outcome?: string) => void =
+        () => undefined
 
-      const connection = deps.getConnection(start.productId, start.connectionId)
-      if (!connection) {
-        hooks.onEvent({
-          type: 'run.event',
-          runId: start.runId,
-          event: { type: 'error', message: 'Unknown connection' }
-        })
-        finish()
-        return
-      }
-
-      const ceiling = deps.getCeiling(start.productId)
-      // A headless Codex run is isolated from the user's personal `~/.codex` (which has no strict-MCP
-      // flag) by pointing CODEX_HOME at a companion-managed home whose config declares no personal MCP
-      // servers; its auth.json symlinks the user's real login, so subscription auth is preserved. Only
-      // Codex needs this (Claude Code isolates via SDK options); the interactive terminal is a separate
-      // spawn that never reaches here, so it keeps the user's full config.
-      const codexHome =
-        connection.toolId === 'codex' ? ensureIsolatedCodexHome(deps.appDataRoot) : undefined
-      const { ctx, req, resolvers, effectivePolicy } = buildRun({
-        appDataRoot: deps.appDataRoot,
-        backendKey: deps.backendKey,
-        start,
-        ceiling,
-        connection,
-        resolveBinary: deps.resolveBinary,
-        ...(codexHome ? { codexHome } : {})
-      })
-
-      const toolSet = manifestToToolSet(start.webToolManifest, start.runId, hooks.onToolCall)
-      const caps = getCaps(connection.toolId)
-
-      // Floor the clamped permission mode UP to `auto-edit` for this unattended run (mirroring the
-      // desktop SCHEDULED posture) so the CLIs that map the mode to a static sandbox (Codex/OpenCode)
-      // can actually edit/act headlessly. Paired with the auto-approve of interactive permission
-      // requests below, this gives the companion the same act-headlessly capability desktop scheduled
-      // runs have. It never LOWERS a mode (a `full` ceiling stays `full`), and an explicit read-only
-      // CEILING suppresses the floor entirely (an opt-in non-destructive companion).
-      const postured: RuntimeRunRequest = {
-        ...req,
-        permissionMode: floorToAutoEdit(req.permissionMode, ceiling.permissionMode)
-      }
-
-      // The policy this run ACTUALLY executes under (the clamped network posture plus the floored
-      // permission mode) - the honest record for the audit log, not the pre-floor clamped mode.
-      const auditedPolicy: RunPolicy = {
-        permissionMode: postured.permissionMode,
-        network: effectivePolicy.network
-      }
-
-      // FAIL-CLOSED: record the dispatch locally BEFORE the CLI is started. If the append throws (a
-      // full or unwritable audit dir), refuse the run through the existing terminal error frame path
-      // and never start the CLI - an unlogged run is impossible. Terminal outcomes below are recorded
-      // best-effort (a throwing terminal append must not crash the daemon).
-      const dispatchedAt = performance.now()
       try {
-        deps.audit.append({
-          backendUrl: deps.backendUrl,
-          event: 'dispatched',
-          runId: start.runId,
-          productId: start.productId,
-          toolId: connection.toolId,
-          promptSha256: promptFingerprint(start),
-          policy: auditedPolicy,
-          ...(start.origin ? { detail: { origin: start.origin } } : {})
-        })
-      } catch (err) {
-        // Surface the underlying cause (disk-full vs permission) in the LOCAL daemon log so an operator
-        // can debug refused runs; the wire frame stays a fixed message so no local detail leaks upstream.
-        deps.log?.(
-          `audit dispatch append failed for run ${start.runId} - refusing run: ${messageOf(err)}\n`
-        )
-        hooks.onEvent({
-          type: 'run.event',
-          runId: start.runId,
-          event: { type: 'error', message: 'audit log unavailable - run refused' }
-        })
-        finish()
-        return
-      }
+        // Derive this run's kind (schedule | dispatch | chat) from the frozen wire fields and refuse it
+        // locally when this backend's device origin policy denies that kind. This runs BEFORE the
+        // connection lookup, any CLI spawn, and the `dispatched` audit append, so a denied run never
+        // executes and is recorded ONLY as `refused` (never `dispatched`). Chat is never deniable, so a
+        // chat turn always falls through. The refusal audit is best-effort - the run is refused either
+        // way, so a broken sink cannot let a denied run proceed; it is surfaced as a warning line.
+        const kind = deriveRunKind(start)
+        if (isRunKindDenied(deps.getOriginPolicy(start.productId), kind)) {
+          try {
+            deps.audit.append({
+              backendUrl: deps.backendUrl,
+              event: 'refused',
+              runId: start.runId,
+              productId: start.productId,
+              detail: refusalDetail(start)
+            })
+          } catch (err) {
+            deps.log?.(
+              `audit refused append failed for run ${start.runId}: ${messageOf(err)}\n`
+            )
+          }
+          hooks.onEvent({
+            type: 'run.event',
+            runId: start.runId,
+            event: { type: 'error', message: `${RUN_KIND_LABEL[kind]} runs are refused by device policy` }
+          })
+          finish()
+          return
+        }
 
-      // Records the terminal outcome exactly once (a `done`/`error` event or a cancel that reaps the
-      // run without one). Best-effort: a throwing append is swallowed and surfaced as a warning line,
-      // so a broken audit sink never crashes an already-executed run.
-      let terminalRecorded = false
-      const recordTerminal = (event: 'completed' | 'failed' | 'cancelled', outcome?: string): void => {
-        if (terminalRecorded) return
-        terminalRecorded = true
+        const connection = deps.getConnection(start.productId, start.connectionId)
+        if (!connection) {
+          hooks.onEvent({
+            type: 'run.event',
+            runId: start.runId,
+            event: { type: 'error', message: 'Unknown connection' }
+          })
+          finish()
+          return
+        }
+
+        const dispatchUnconfined =
+          !isLocalScope(deps.backendKey) && isDispatchUnconfined(connection.toolId)
+        if (dispatchUnconfined) {
+          deps.log?.(`${connection.toolId} ${UNCONFINED_DISCLOSURE}\n`)
+        }
+
+        // A headless Codex run is isolated from the user's personal `~/.codex` (which has no strict-MCP
+        // flag) by pointing CODEX_HOME at a companion-managed home whose config declares no personal MCP
+        // servers; its auth.json symlinks the user's real login, so subscription auth is preserved. Only
+        // Codex needs this (Claude Code isolates via SDK options); the interactive terminal is a separate
+        // spawn that never reaches here, so it keeps the user's full config.
+        const codexHome =
+          connection.toolId === 'codex' ? ensureIsolatedCodexHome(deps.appDataRoot) : undefined
+        const { ctx, req, resolvers, effectivePolicy } = buildRun({
+          appDataRoot: deps.appDataRoot,
+          backendKey: deps.backendKey,
+          start,
+          connection,
+          resolveBinary: deps.resolveBinary,
+          ...(codexHome ? { codexHome } : {})
+        })
+
+        const toolSet = manifestToToolSet(start.webToolManifest, start.runId, hooks.onToolCall)
+        const caps = getCaps(connection.toolId)
+
+        // FAIL-CLOSED: record the dispatch locally BEFORE the CLI is started. If the append throws (a
+        // full or unwritable audit dir), refuse the run through the existing terminal error frame path
+        // and never start the CLI - an unlogged run is impossible. Terminal outcomes below are recorded
+        // best-effort (a throwing terminal append must not crash the daemon).
+        const dispatchedAt = performance.now()
         try {
           deps.audit.append({
             backendUrl: deps.backendUrl,
-            event,
+            event: 'dispatched',
             runId: start.runId,
             productId: start.productId,
             toolId: connection.toolId,
-            durationMs: Math.round(performance.now() - dispatchedAt),
-            ...(outcome !== undefined ? { outcome } : {})
+            promptSha256: promptFingerprint(start),
+            policy: effectivePolicy,
+            ...(start.origin || dispatchUnconfined
+              ? {
+                  detail: {
+                    ...(start.origin ? { origin: start.origin } : {}),
+                    ...(dispatchUnconfined ? { unconfined: connection.toolId } : {})
+                  }
+                }
+              : {})
           })
         } catch (err) {
+          // Surface the underlying cause (disk-full vs permission) in the LOCAL daemon log so an operator
+          // can debug refused runs; the wire frame stays a fixed message so no local detail leaks upstream.
           deps.log?.(
-            `audit terminal append failed for run ${start.runId}: ${messageOf(err)}\n`
+            `audit dispatch append failed for run ${start.runId} - refusing run: ${messageOf(err)}\n`
+          )
+          hooks.onEvent({
+            type: 'run.event',
+            runId: start.runId,
+            event: { type: 'error', message: 'audit log unavailable - run refused' }
+          })
+          finish()
+          return
+        }
+
+        // Records the terminal outcome exactly once (a `done`/`error` event or a cancel that reaps the
+        // run without one). Best-effort: a throwing append is swallowed and surfaced as a warning line,
+        // so a broken audit sink never crashes an already-executed run.
+        let terminalRecorded = false
+        recordTerminal = (event: 'completed' | 'failed' | 'cancelled', outcome?: string): void => {
+          if (terminalRecorded) return
+          terminalRecorded = true
+          try {
+            deps.audit.append({
+              backendUrl: deps.backendUrl,
+              event,
+              runId: start.runId,
+              productId: start.productId,
+              toolId: connection.toolId,
+              durationMs: Math.round(performance.now() - dispatchedAt),
+              ...(outcome !== undefined ? { outcome } : {})
+            })
+          } catch (err) {
+            deps.log?.(
+              `audit terminal append failed for run ${start.runId}: ${messageOf(err)}\n`
+            )
+          }
+        }
+
+        const run = (served: ServedTools | null): void => {
+          // Merge the (optional) local-session MCP pass-throughs with the served loopback web-tools spec.
+          // GUARDED: when both are absent the request keeps NO `mcpServers` key at all (byte-identical to
+          // the pre-seam dispatched path), rather than an empty `{}` the Claude driver would treat as a
+          // real, present server map. Local mode always has `served === null` (empty manifest), and the
+          // dispatched path never sets `localMcpServers`, so the two sources can never collide.
+          const localServers = deps.localMcpServers?.(start.productId) ?? {}
+          const merged = { ...localServers, ...(served ? { [webToolServerName()]: served.spec } : {}) }
+          const runReq: RuntimeRunRequest =
+            Object.keys(merged).length > 0 ? { ...req, mcpServers: merged } : req
+          deps.sessionManager.startRun(
+            runReq,
+            ctx,
+            resolvers,
+            (event: RuntimeRunEvent, runId) => {
+              // Forward the SDK session/thread id UP so the backend can persist it and resume the
+              // next turn, instead of dropping it; everything else rides the `run.event` channel.
+              if (event.type === 'conversation') {
+                hooks.onConversation?.({ type: 'run.conversation', runId, conversationId: event.id })
+                return
+              }
+              // A `network: 'off'` run on an adapter that cannot OS-enforce egress: surface the
+              // best-effort disclosure once (the run still proceeds). It is a package-local runtime
+              // event, not a wire `RunEvent`, so it never rides the run.event channel and is NOT
+              // mapped onto an `error` (which would mark the non-fatal run as failed).
+              if (event.type === 'network-not-enforced') {
+                hooks.onNetworkNotEnforced?.(event.adapter)
+                return
+              }
+              if (event.type === 'permission-request') {
+                deps.sessionManager.respondToPermission(runId, event.requestId, 'allow')
+                return
+              }
+              // Record the terminal outcome locally before forwarding it up: a `done` completed the run,
+              // an `error` failed it. Best-effort so a broken audit sink never crashes an executed run.
+              if (event.type === 'done') recordTerminal('completed')
+              else if (event.type === 'error') recordTerminal('failed', event.message)
+              hooks.onEvent({ type: 'run.event', runId, event })
+            },
+            null,
+            () => {
+              void served?.close()
+              // The run left the active map without a terminal event: it was cancelled (or reaped as an
+              // orphan). `recordTerminal` no-ops if a `done`/`error` already recorded the outcome.
+              recordTerminal('cancelled')
+              finish()
+            },
+            // Key the run by the DISPATCH id so emitted events (and cancel-by-id) correlate to the
+            // dispatched run, and drive THIS run's already-resolved, product-scoped connection so a
+            // colliding bare connection id never resolves another product's connection.
+            { runId: start.runId, connection }
           )
         }
-      }
 
-      const run = (served: ServedTools | null): void => {
-        // Merge the (optional) local-session MCP pass-throughs with the served loopback web-tools spec.
-        // GUARDED: when both are absent the request keeps NO `mcpServers` key at all (byte-identical to
-        // the pre-seam dispatched path), rather than an empty `{}` the Claude driver would treat as a
-        // real, present server map. Local mode always has `served === null` (empty manifest), and the
-        // dispatched path never sets `localMcpServers`, so the two sources can never collide.
-        const localServers = deps.localMcpServers?.(start.productId) ?? {}
-        const merged = { ...localServers, ...(served ? { [brand().binary]: served.spec } : {}) }
-        const runReq: RuntimeRunRequest =
-          Object.keys(merged).length > 0 ? { ...postured, mcpServers: merged } : postured
-        deps.sessionManager.startRun(
-          runReq,
-          ctx,
-          resolvers,
-          (event: RuntimeRunEvent, runId) => {
-            // Forward the SDK session/thread id UP so the backend can persist it and resume the
-            // next turn, instead of dropping it; everything else rides the `run.event` channel.
-            if (event.type === 'conversation') {
-              hooks.onConversation?.({ type: 'run.conversation', runId, conversationId: event.id })
-              return
-            }
-            // A `network: 'off'` run on an adapter that cannot OS-enforce egress: surface the
-            // best-effort disclosure once (the run still proceeds). It is a package-local runtime
-            // event, not a wire `RunEvent`, so it never rides the run.event channel and is NOT
-            // mapped onto an `error` (which would mark the non-fatal run as failed).
-            if (event.type === 'network-not-enforced') {
-              hooks.onNetworkNotEnforced?.(event.adapter)
-              return
-            }
-            // The companion runs UNATTENDED: there is no synchronous approver and no permission-
-            // response wire back from the backend, so an interactive approval can never be surfaced
-            // to a human. Mirror the DESKTOP SCHEDULED posture (auto-approve mutating tools) rather
-            // than auto-denying: auto-DENY would silently refuse every write and make the companion a
-            // read-only agent that cannot actually act, defeating parity. Auto-APPROVE so the CLI can
-            // edit/act headlessly; the run is already bounded by the work-folder confinement, the
-            // clamped network posture, and the per-backend policy ceiling, which are the real safety
-            // boundaries for an unattended run (not an approval prompt no one can answer).
-            if (event.type === 'permission-request') {
-              deps.sessionManager.respondToPermission(runId, event.requestId, 'allow')
-              return
-            }
-            // Record the terminal outcome locally before forwarding it up: a `done` completed the run,
-            // an `error` failed it. Best-effort so a broken audit sink never crashes an executed run.
-            if (event.type === 'done') recordTerminal('completed')
-            else if (event.type === 'error') recordTerminal('failed', event.message)
-            hooks.onEvent({ type: 'run.event', runId, event })
-          },
-          null,
-          () => {
-            void served?.close()
-            // The run left the active map without a terminal event: it was cancelled (or reaped as an
-            // orphan). `recordTerminal` no-ops if a `done`/`error` already recorded the outcome.
-            recordTerminal('cancelled')
-            finish()
-          },
-          // Key the run by the DISPATCH id so emitted events (and cancel-by-id) correlate to the
-          // dispatched run, and drive THIS run's already-resolved, product-scoped connection so a
-          // colliding bare connection id never resolves another product's connection.
-          { runId: start.runId, connection }
-        )
-      }
-
-      if (deps.shouldServe(caps, toolSet)) {
-        // `serveTools()` is async: mark the run pending so a cancel arriving during this window is not
-        // dropped (the session manager has no run to cancel yet). When it resolves, if the run was
-        // canceled meanwhile, close the served handle and DO NOT start it; otherwise proceed.
-        pending.add(start.runId)
-        void deps.serveTools(toolSet).then(
-          (served: ServedTools) => {
-            pending.delete(start.runId)
-            if (canceledWhilePending.delete(start.runId)) {
-              void served.close()
-              // Cancelled during the serve window: the dispatched run never reached the session
-              // manager, so record its cancellation here (the run's onClose path is not taken).
-              recordTerminal('cancelled')
+        if (deps.shouldServe(caps, toolSet)) {
+          // `serveTools()` is async: mark the run pending so a cancel arriving during this window is not
+          // dropped (the session manager has no run to cancel yet). When it resolves, if the run was
+          // canceled meanwhile, close the served handle and DO NOT start it; otherwise proceed.
+          pending.add(start.runId)
+          void deps.serveTools(toolSet).then(
+            (served: ServedTools) => {
+              pending.delete(start.runId)
+              if (canceledWhilePending.delete(start.runId)) {
+                void served.close()
+                // Cancelled during the serve window: the dispatched run never reached the session
+                // manager, so record its cancellation here (the run's onClose path is not taken).
+                recordTerminal('cancelled')
+                finish()
+                return
+              }
+              run(served)
+            },
+            (err: unknown) => {
+              pending.delete(start.runId)
+              // A cancel that landed during the serve window wins over a serve REJECTION too (mirroring
+              // the resolve path): the run was cancelled, so record `cancelled` and close quietly rather
+              // than reporting the serve failure the user pre-empted. No `error` frame is surfaced.
+              if (canceledWhilePending.delete(start.runId)) {
+                recordTerminal('cancelled')
+                finish()
+                return
+              }
+              recordTerminal('failed', err instanceof Error ? err.message : 'Failed to serve tools')
+              hooks.onEvent({
+                type: 'run.event',
+                runId: start.runId,
+                event: { type: 'error', message: err instanceof Error ? err.message : 'Failed to serve tools' }
+              })
               finish()
-              return
             }
-            run(served)
-          },
-          (err: unknown) => {
-            pending.delete(start.runId)
-            // A cancel that landed during the serve window wins over a serve REJECTION too (mirroring
-            // the resolve path): the run was cancelled, so record `cancelled` and close quietly rather
-            // than reporting the serve failure the user pre-empted. No `error` frame is surfaced.
-            if (canceledWhilePending.delete(start.runId)) {
-              recordTerminal('cancelled')
-              finish()
-              return
-            }
-            recordTerminal('failed', err instanceof Error ? err.message : 'Failed to serve tools')
-            hooks.onEvent({
-              type: 'run.event',
-              runId: start.runId,
-              event: { type: 'error', message: err instanceof Error ? err.message : 'Failed to serve tools' }
-            })
-            finish()
-          }
-        )
-      } else {
-        run(null)
+          )
+        } else {
+          run(null)
+        }
+      } catch (err) {
+        try {
+          deps.log?.(`run ${start.runId} could not be prepared - refusing run: ${messageOf(err)}\n`)
+          recordTerminal('failed', 'run setup failed')
+          hooks.onEvent({
+            type: 'run.event',
+            runId: start.runId,
+            event: { type: 'error', message: 'run setup failed - run refused' }
+          })
+        } finally {
+          finish()
+        }
       }
     },
     cancel(runId): void {
