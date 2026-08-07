@@ -1,15 +1,14 @@
 import { describe, expect, it } from 'vitest'
-import { join } from 'node:path'
 import {
-  run,
-  out,
   APP_DATA,
-  tempAppData,
   createStateStore,
   envVar,
   installService,
-  uninstallService,
-  serviceStatus
+  out,
+  run,
+  serviceStatus,
+  tempAppData,
+  uninstallService
 } from './cli-harness'
 
 describe('cli routing - service install / uninstall / status + app-scoped flips', () => {
@@ -25,7 +24,7 @@ describe('cli routing - service install / uninstall / status + app-scoped flips'
     // marker so this asserts the dev-build fallback path, not the versioned-install path.
     const originalEntry = process.argv[1]
     const originalLauncher = process.env[envVar('ROOT_LAUNCHER')]
-    process.argv[1] = '/opt/opencompanion/daemon/cli.js'
+    process.argv[1] = '/opt/agentrunner/daemon/cli.js'
     delete process.env[envVar('ROOT_LAUNCHER')]
     try {
       await run(['service', 'install'])
@@ -37,7 +36,7 @@ describe('cli routing - service install / uninstall / status + app-scoped flips'
     expect(installService).toHaveBeenCalledOnce()
     // The boot service runs `<node> <argv[1]> serve` (bare: serve-all + hot pickup, never pinned to a --url).
     const program = installService.mock.calls[0]?.[0].program
-    expect(program).toEqual([process.execPath, '/opt/opencompanion/daemon/cli.js', 'serve'])
+    expect(program).toEqual([process.execPath, '/opt/agentrunner/daemon/cli.js', 'serve'])
     expect(program).not.toContain('--url')
     expect(out.stdout).toContain('installed')
     expect(out.exitCode).toBe(0)
@@ -53,7 +52,7 @@ describe('cli routing - service install / uninstall / status + app-scoped flips'
     // service tracks the `current` pointer across updates by running `<root launcher> serve` instead
     // of node+cli paths baked inside one version dir (which an update would orphan).
     const originalLauncher = process.env[envVar('ROOT_LAUNCHER')]
-    process.env[envVar('ROOT_LAUNCHER')] = '/home/u/.opencompanion/opencompanion'
+    process.env[envVar('ROOT_LAUNCHER')] = '/home/u/.agentrunner/agentrunner'
     try {
       await run(['service', 'install'])
     } finally {
@@ -62,7 +61,7 @@ describe('cli routing - service install / uninstall / status + app-scoped flips'
     }
     expect(installService).toHaveBeenCalledOnce()
     const program = installService.mock.calls[0]?.[0].program
-    expect(program).toEqual(['/home/u/.opencompanion/opencompanion', 'serve'])
+    expect(program).toEqual(['/home/u/.agentrunner/agentrunner', 'serve'])
     expect(out.exitCode).toBe(0)
   })
 
@@ -93,7 +92,7 @@ describe('cli routing - service install / uninstall / status + app-scoped flips'
   it('"service install" refuses (never installs an unusable daemon) when nothing is paired', async () => {
     // A bare `serve` with nothing paired exits non-zero, and the OS would restart it into a crash
     // loop, so installing the boot service must require at least one pairing.
-    const solo = tempAppData('svc-unpaired')
+    tempAppData('svc-unpaired')
     await run(['service', 'install'])
     expect(installService).not.toHaveBeenCalled()
     expect(out.stderr).toContain('No backend paired')

@@ -1,5 +1,5 @@
-import { parseAccountScope } from '../account-scope'
-import { backendKey } from '../backend-key'
+import { parseAccountScope } from "../account-scope";
+import { backendKey } from "../backend-key";
 
 /**
  * The pseudo backend key scoping every LOCAL-mode record (connections, MCP servers, policy,
@@ -9,7 +9,7 @@ import { backendKey } from '../backend-key'
  * never enters the pairing canonicalization migration (which iterates only paired-backend keys),
  * and it is a safe single path segment for the `work/<key>/<productId>/` tree.
  */
-export const LOCAL_SCOPE = 'local'
+export const LOCAL_SCOPE = "local";
 
 /**
  * True when a scope string is the LOCAL pseudo-scope rather than a paired backend URL.
@@ -18,7 +18,7 @@ export const LOCAL_SCOPE = 'local'
  * @returns Whether the scope is local.
  */
 export function isLocalScope(scope: string): boolean {
-  return scope === LOCAL_SCOPE
+	return scope === LOCAL_SCOPE;
 }
 
 /**
@@ -30,7 +30,7 @@ export function isLocalScope(scope: string): boolean {
  * @returns A filesystem-safe single path segment.
  */
 export function scopeWorkKey(scope: string): string {
-  return isLocalScope(scope) ? LOCAL_SCOPE : backendKey(scope)
+	return isLocalScope(scope) ? LOCAL_SCOPE : backendKey(scope);
 }
 
 /**
@@ -44,7 +44,7 @@ export function scopeWorkKey(scope: string): string {
  * @returns The flags naming that scope, ready to paste after a command.
  */
 export function scopeFlag(scope: string): string {
-  if (isLocalScope(scope)) return '--local'
-  const parsed = parseAccountScope(scope)
-  return parsed ? `--url ${parsed.backendUrl} --user ${parsed.userId}` : `--url ${scope}`
+	if (isLocalScope(scope)) return "--local";
+	const parsed = parseAccountScope(scope);
+	return parsed ? `--url ${parsed.backendUrl} --user ${parsed.userId}` : `--url ${scope}`;
 }

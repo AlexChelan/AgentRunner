@@ -2,13 +2,13 @@ import { describe, expect, it } from 'vitest'
 import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import {
-  run,
+  BRAND,
+  createStateStore,
   out,
-  tempAppData,
   pairBackend,
   readMcpSecret,
-  createStateStore,
-  BRAND
+  run,
+  tempAppData
 } from './cli-harness'
 
 describe('cli routing - mcp add / remove / list', () => {
@@ -186,10 +186,10 @@ describe('cli routing - mcp add / remove / list', () => {
   // cleans it, while a typo still exits non-zero.
   it('"mcp remove" scrubs an ORPHANED env secret (a spec-less credential) while still refusing', async () => {
     const solo = tempAppData('mcporphan')
-    const { createFileSecretStore } = await import('@opencompanion/core/runtime/storage/secret-store')
-    const { makeMasterKey } = await import('@opencompanion/core/runtime/master-key')
-    const { secretsDir } = await import('@opencompanion/core/runtime/paths')
-    const { writeMcpEnv } = await import('@opencompanion/core/runtime/mcp-secrets')
+    const { createFileSecretStore } = await import('@agentrunner/core/runtime/storage/secret-store')
+    const { makeMasterKey } = await import('@agentrunner/core/runtime/master-key')
+    const { secretsDir } = await import('@agentrunner/core/runtime/paths')
+    const { writeMcpEnv } = await import('@agentrunner/core/runtime/mcp-secrets')
     const url = 'https://mcporphan.example'
     pairBackend(solo, { backendUrl: url, deviceId: 'dm' })
     // The orphan: the credential exists, the spec never landed.

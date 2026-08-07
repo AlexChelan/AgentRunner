@@ -1,0 +1,17 @@
+# The image build reads exactly two things out of this repo: the pre-built standalone payload under
+# daemon/dist-standalone/ and entrypoint.sh. Everything else is context weight, so it is excluded here -
+# a smaller context is a faster, more reproducible build (and never leaks a stray .env into a layer).
+#
+# Do NOT exclude daemon/dist-standalone: it IS the image.
+.git
+.github
+.env
+.env.*
+**/node_modules
+**/.turbo
+**/dist
+**/dist-bundle
+**/*.tsbuildinfo
+**/tests
+docs
+*.md

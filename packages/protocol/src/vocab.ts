@@ -1,5 +1,5 @@
 /**
- * The wire vocabulary the companion protocol OWNS: the small set of pure enums,
+ * The wire vocabulary the runner protocol OWNS: the small set of pure enums,
  * shapes, and the streamed run-event union that both the protocol schemas and the
  * AI backend contract share. Kept dependency-free (zod-only at the package level;
  * this file is zero-runtime types plus the reasoning-effort ladder) so the protocol
@@ -43,7 +43,7 @@ export const REASONING_EFFORTS: readonly ReasoningEffort[] = [
 	"off",
 	"low",
 	"medium",
-	"high",
+	"high"
 ];
 
 /** Type guard for a {@link ReasoningEffort} value. */

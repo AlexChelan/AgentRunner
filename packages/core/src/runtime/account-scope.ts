@@ -1,11 +1,11 @@
-import { canonicalizeBackendUrl } from './backend-url'
+import { canonicalizeBackendUrl } from "./backend-url";
 
 /**
  * The separator joining a canonical backend URL to the owning user id. `|` cannot appear in a URL, so
  * a scope parses unambiguously, and the LOCAL pseudo-scope (`local`) contains none so it reads as
  * "not an account scope" and keeps its existing behaviour untouched.
  */
-const SEPARATOR = '|'
+const SEPARATOR = "|";
 
 /**
  * Builds the ACCOUNT SCOPE that keys every per-pairing record: the paired backend PLUS the SaaS user
@@ -25,10 +25,10 @@ const SEPARATOR = '|'
  * @throws When `userId` contains the reserved separator, which would make the scope ambiguous.
  */
 export function accountScope(backendUrl: string, userId: string): string {
-  if (userId.includes(SEPARATOR)) {
-    throw new Error(`User id must not contain "${SEPARATOR}": ${userId}`)
-  }
-  return `${canonicalizeBackendUrl(backendUrl)}${SEPARATOR}${userId}`
+	if (userId.includes(SEPARATOR)) {
+		throw new Error(`User id must not contain "${SEPARATOR}": ${userId}`);
+	}
+	return `${canonicalizeBackendUrl(backendUrl)}${SEPARATOR}${userId}`;
 }
 
 /**
@@ -40,11 +40,11 @@ export function accountScope(backendUrl: string, userId: string): string {
  * @returns The parts, or `null` when the scope is not account-scoped.
  */
 export function parseAccountScope(scope: string): { backendUrl: string; userId: string } | null {
-  const index = scope.indexOf(SEPARATOR)
-  if (index <= 0) return null
-  const userId = scope.slice(index + SEPARATOR.length)
-  if (userId.length === 0) return null
-  return { backendUrl: scope.slice(0, index), userId }
+	const index = scope.indexOf(SEPARATOR);
+	if (index <= 0) return null;
+	const userId = scope.slice(index + SEPARATOR.length);
+	if (userId.length === 0) return null;
+	return { backendUrl: scope.slice(0, index), userId };
 }
 
 /**
@@ -56,5 +56,5 @@ export function parseAccountScope(scope: string): { backendUrl: string; userId: 
  * @returns The backend URL to dial.
  */
 export function scopeBackendUrl(scope: string): string {
-  return parseAccountScope(scope)?.backendUrl ?? scope
+	return parseAccountScope(scope)?.backendUrl ?? scope;
 }

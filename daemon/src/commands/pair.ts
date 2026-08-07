@@ -1,8 +1,10 @@
-import { scopeBackendUrl } from '@opencompanion/core/runtime/account-scope'
-import { DEFAULT_CLIENT_ID, resolveBackendUrl } from '@opencompanion/core/runtime/backend-url'
+import { Buffer } from 'node:buffer'
+import { scopeBackendUrl } from '@agentrunner/core/runtime/account-scope'
+import { DEFAULT_CLIENT_ID, resolveBackendUrl } from '@agentrunner/core/runtime/backend-url'
 import { BRAND } from '../brand'
-import { messageOf } from '@opencompanion/core/runtime/error-message'
-import { resolveTokenArg, runPair, runPairWithToken, runUnpair } from '@opencompanion/core/runtime/pair'
+import { runEnroll } from '@agentrunner/core/runtime/enroll'
+import { messageOf } from '@agentrunner/core/runtime/error-message'
+import { resolveTokenArg, runPair, runPairWithToken, runUnpair } from '@agentrunner/core/runtime/pair'
 import * as ui from '../ui'
 import { flagValue, openAuditLog, openStores, resolveCommandScope, selectBackendUrl } from './shared'
 
@@ -13,7 +15,13 @@ async function readStdin(): Promise<string> {
   return Buffer.concat(chunks).toString('utf8')
 }
 
-/** Runs the `pair` command and exits with the appropriate code. */
+/**
+ * Runs the `pair` command and exits with the appropriate code. Three pairing credentials, in priority
+ * order: `--token` (a bearer the app already obtained), `--enroll` (a one-time, server-pre-approved
+ * enrollment code, the container path), else the interactive RFC-8628 device-authorization flow.
+ *
+ * @param argv - The process arguments (`pair` is `argv[0]`).
+ */
 export async function cmdPair(argv: string[]): Promise<void> {
   ui.intro()
   const { appDataRoot, state, secrets } = openStores()
@@ -40,6 +48,20 @@ export async function cmdPair(argv: string[]): Promise<void> {
     )
     if (ok) ui.outro(`Paired with ${backendUrl}.`)
     else ui.p.cancel('Pairing failed.')
+    process.exit(ok ? 0 : 1)
+    return
+  }
+  // `--enroll` redeems a one-time, server-pre-approved enrollment code with no terminal interaction at
+  // all. It is the recovery path for a container whose boot-time redemption failed (its code expired
+  // before the image started): `docker exec … pair --enroll <fresh> --url <backend>`, then restart.
+  const enrollFlag = flagValue(argv, '--enroll')
+  if (enrollFlag !== undefined) {
+    const { ok } = await runEnroll(
+      { backendUrl, enrollCode: enrollFlag, clientId: DEFAULT_CLIENT_ID },
+      { state, secrets, audit: openAuditLog(appDataRoot), write: ui.line }
+    )
+    if (ok) ui.outro(`Paired with ${backendUrl}.`)
+    else ui.p.cancel('Enrollment failed.')
     process.exit(ok ? 0 : 1)
     return
   }

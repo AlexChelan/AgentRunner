@@ -1,13 +1,13 @@
-import { createHash } from 'node:crypto'
-import type { LocalMcpSpec } from './local-mcp-spec'
-import type { SecretStore } from './storage/secret-store'
+import { createHash } from "node:crypto";
+import type { LocalMcpSpec } from "./local-mcp-spec";
+import type { SecretStore } from "./storage/secret-store";
 
 /**
  * The secret-store key prefix a local MCP server's environment VALUES are stored under. The full key is
  * `mcp-env-<sha256(scope \0 serverName)>`, so it is filesystem-safe ({@link SecretStore} only
  * allows `[a-zA-Z0-9_-]`) and one server maps to exactly one entry, per scope.
  */
-const MCP_ENV_KEY_PREFIX = 'mcp-env-'
+const MCP_ENV_KEY_PREFIX = "mcp-env-";
 
 /**
  * Derives the per-server secret-store key for a local MCP server's environment values. The scope and
@@ -20,8 +20,11 @@ const MCP_ENV_KEY_PREFIX = 'mcp-env-'
  * @returns The secret-store key for that server's environment values.
  */
 export function mcpEnvKey(scope: string, serverName: string): string {
-  const digest = createHash('sha256').update(`${scope}\u0000${serverName}`).digest('hex').slice(0, 32)
-  return MCP_ENV_KEY_PREFIX + digest
+	const digest = createHash("sha256")
+		.update(`${scope}\u0000${serverName}`)
+		.digest("hex")
+		.slice(0, 32);
+	return MCP_ENV_KEY_PREFIX + digest;
 }
 
 /**
@@ -39,17 +42,17 @@ export function mcpEnvKey(scope: string, serverName: string): string {
  * @param env - The environment values (empty deletes the entry).
  */
 export function writeMcpEnv(
-  secrets: SecretStore,
-  scope: string,
-  serverName: string,
-  env: Record<string, string>
+	secrets: SecretStore,
+	scope: string,
+	serverName: string,
+	env: Record<string, string>
 ): void {
-  const key = mcpEnvKey(scope, serverName)
-  if (Object.keys(env).length === 0) {
-    secrets.delete(key)
-    return
-  }
-  secrets.set(key, JSON.stringify(env))
+	const key = mcpEnvKey(scope, serverName);
+	if (Object.keys(env).length === 0) {
+		secrets.delete(key);
+		return;
+	}
+	secrets.set(key, JSON.stringify(env));
 }
 
 /**
@@ -65,29 +68,29 @@ export function writeMcpEnv(
  * @returns The environment values, or `{}`.
  */
 export function readMcpEnv(
-  secrets: SecretStore,
-  scope: string,
-  serverName: string
+	secrets: SecretStore,
+	scope: string,
+	serverName: string
 ): Record<string, string> {
-  const raw = secrets.get(mcpEnvKey(scope, serverName))
-  if (raw === null) return {}
-  let parsed: unknown
-  try {
-    parsed = JSON.parse(raw)
-  } catch {
-    return {}
-  }
-  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) return {}
-  const env: Record<string, string> = {}
-  for (const [key, value] of Object.entries(parsed)) {
-    if (typeof value === 'string') env[key] = value
-  }
-  return env
+	const raw = secrets.get(mcpEnvKey(scope, serverName));
+	if (raw === null) return {};
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(raw);
+	} catch {
+		return {};
+	}
+	if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return {};
+	const env: Record<string, string> = {};
+	for (const [key, value] of Object.entries(parsed)) {
+		if (typeof value === "string") env[key] = value;
+	}
+	return env;
 }
 
 /** Removes a local MCP server's stored environment values (no-op when absent). */
 export function deleteMcpEnv(secrets: SecretStore, scope: string, serverName: string): void {
-  secrets.delete(mcpEnvKey(scope, serverName))
+	secrets.delete(mcpEnvKey(scope, serverName));
 }
 
 /**
@@ -108,18 +111,18 @@ export function deleteMcpEnv(secrets: SecretStore, scope: string, serverName: st
  * @returns The merged environment values to spawn the CLI with (empty when no server declares any).
  */
 export function collectMcpEnv(
-  secrets: SecretStore,
-  scope: string,
-  servers: Record<string, LocalMcpSpec>
+	secrets: SecretStore,
+	scope: string,
+	servers: Record<string, LocalMcpSpec>
 ): Record<string, string> {
-  const merged: Record<string, string> = {}
-  for (const [name, spec] of Object.entries(servers)) {
-    if (spec.type !== 'stdio' || !spec.envKeys?.length) continue
-    const stored = readMcpEnv(secrets, scope, name)
-    for (const key of spec.envKeys) {
-      const value = stored[key]
-      if (value !== undefined) merged[key] = value
-    }
-  }
-  return merged
+	const merged: Record<string, string> = {};
+	for (const [name, spec] of Object.entries(servers)) {
+		if (spec.type !== "stdio" || !spec.envKeys?.length) continue;
+		const stored = readMcpEnv(secrets, scope, name);
+		for (const key of spec.envKeys) {
+			const value = stored[key];
+			if (value !== undefined) merged[key] = value;
+		}
+	}
+	return merged;
 }

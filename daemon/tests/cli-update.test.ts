@@ -1,16 +1,41 @@
-import { describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it } from 'vitest'
 import {
-  run,
-  out,
-  tempAppData,
-  createStateStore,
   checkLatest,
+  createStateStore,
+  envVar,
+  flipCurrent,
   isSourceBuild,
+  out,
+  run,
   stageVersion,
-  flipCurrent
+  tempAppData
 } from './cli-harness'
 
 describe('cli routing - update / update --check / --auto', () => {
+  afterEach(() => {
+    delete process.env[envVar('CONTAINED')]
+  })
+
+  // In a container the IMAGE is the update unit: a self-update would stage a release into a writable
+  // layer that the next `docker compose pull` throws away, and flip a `current` pointer the entrypoint
+  // never reads. The refusal names the command that actually updates a container.
+  it('"update" is a no-op in container mode and names the image pull instead', async () => {
+    process.env[envVar('CONTAINED')] = '1'
+    await run(['update'])
+    expect(out.stdout).toContain('docker compose pull')
+    expect(checkLatest).not.toHaveBeenCalled()
+    expect(stageVersion).not.toHaveBeenCalled()
+    expect(flipCurrent).not.toHaveBeenCalled()
+    expect(out.exitCode).toBe(0)
+  })
+
+  it('"update --check" is refused in container mode too (no route reaches the release channel)', async () => {
+    process.env[envVar('CONTAINED')] = '1'
+    await run(['update', '--check'])
+    expect(checkLatest).not.toHaveBeenCalled()
+    expect(out.exitCode).toBe(0)
+  })
+
   it('"update --auto off" persists the auto-update toggle and exits 0', async () => {
     const solo = tempAppData('autoupd')
     await run(['update', '--auto', 'off'])

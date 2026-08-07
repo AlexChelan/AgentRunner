@@ -1,11 +1,12 @@
 {
-  "name": "OpenCompanion",
-  "binary": "opencompanion",
-  "scope": "@opencompanion",
-  "serviceLabel": "com.generatesaas.opencompanion",
-  "appDirName": "opencompanion",
-  "envPrefix": "OPENCOMPANION",
-  "docsUrl": "https://generatesaas.com/docs/opencompanion",
-  "repoUrl": "https://github.com/AlexChelan/OpenCompanion",
-  "installBase": "https://github.com/AlexChelan/OpenCompanion/releases/latest/download"
+  "name": "AgentRunner",
+  "binary": "agentrunner",
+  "scope": "@agentrunner",
+  "serviceLabel": "com.generatesaas.agentrunner",
+  "appDirName": "agentrunner",
+  "envPrefix": "AGENTRUNNER",
+  "docsUrl": "https://generatesaas.com/docs/agentrunner",
+  "repoUrl": "https://github.com/AlexChelan/AgentRunner",
+  "installBase": "https://github.com/AlexChelan/AgentRunner/releases/latest/download",
+  "image": "ghcr.io/alexchelan/agentrunner"
 }

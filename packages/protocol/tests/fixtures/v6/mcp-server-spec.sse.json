@@ -1,0 +1,5 @@
+{
+  "type": "sse",
+  "url": "https://mcp.example.com/sse",
+  "env": { "MCP_TOKEN": "tok_live_9f2" }
+}

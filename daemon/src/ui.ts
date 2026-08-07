@@ -3,14 +3,14 @@ import pc from 'picocolors'
 import { BRAND } from './brand'
 
 /**
- * The companion CLI's terminal UI, built on `@clack/prompts` + `picocolors` so it matches the look
+ * The runner CLI's terminal UI, built on `@clack/prompts` + `picocolors` so it matches the look
  * of the main GenerateSaaS CLI (boxed intro/outro, a gutter for status lines, arrow-key selects,
  * spinners). Presentation lives here and in `cli.ts`; the core flows (`pair`/`connect`/`serve`) stay
  * UI-agnostic and just take a `write(line)` sink, so `line` below is what routes their output into
  * this style.
  */
 
-/** The OpenCompanion intro banner label (padded for the yellow background; matches the main CLI's accent). */
+/** The AgentRunner intro banner label (padded for the yellow background; matches the main CLI's accent). */
 const BRAND_LABEL = ` ${BRAND.name} `
 
 /** Opens a command with the branded intro banner. */

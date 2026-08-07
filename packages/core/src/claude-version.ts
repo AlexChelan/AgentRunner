@@ -1,7 +1,7 @@
-import type { RunTool } from './adapters/types'
+import type { RunTool } from "./adapters/types";
 
 /** Version reported when the `claude` CLI is absent or unparseable. */
-export const CLAUDE_CODE_VERSION_FALLBACK = '2.1.74'
+export const CLAUDE_CODE_VERSION_FALLBACK = "2.1.74";
 
 /**
  * Resolves the installed Claude Code version by shelling `claude --version`, used
@@ -17,16 +17,16 @@ export const CLAUDE_CODE_VERSION_FALLBACK = '2.1.74'
  * @returns The parsed semver, or {@link CLAUDE_CODE_VERSION_FALLBACK}.
  */
 export async function getClaudeCodeVersion(
-  run: RunTool,
-  resolveBinary: (name: string) => string | null
+	run: RunTool,
+	resolveBinary: (name: string) => string | null
 ): Promise<string> {
-  const path = resolveBinary('claude')
-  if (!path) return CLAUDE_CODE_VERSION_FALLBACK
-  try {
-    const { stdout } = await run(path, ['--version'])
-    const match = stdout.match(/\d+\.\d+\.\d+/)
-    return match ? match[0] : CLAUDE_CODE_VERSION_FALLBACK
-  } catch {
-    return CLAUDE_CODE_VERSION_FALLBACK
-  }
+	const path = resolveBinary("claude");
+	if (!path) return CLAUDE_CODE_VERSION_FALLBACK;
+	try {
+		const { stdout } = await run(path, ["--version"]);
+		const match = stdout.match(/\d+\.\d+\.\d+/);
+		return match ? match[0] : CLAUDE_CODE_VERSION_FALLBACK;
+	} catch {
+		return CLAUDE_CODE_VERSION_FALLBACK;
+	}
 }

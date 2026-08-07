@@ -1,13 +1,14 @@
 import { existsSync, renameSync } from 'node:fs'
 import { join } from 'node:path'
-import { accountScope, parseAccountScope, scopeBackendUrl } from '@opencompanion/core/runtime/account-scope'
-import { backendKey } from '@opencompanion/core/runtime/backend-key'
+import { accountScope, parseAccountScope, scopeBackendUrl } from '@agentrunner/core/runtime/account-scope'
+import { backendKey } from '@agentrunner/core/runtime/backend-key'
 import { BRAND } from './brand'
-import { mcpEnvKey } from '@opencompanion/core/runtime/mcp-secrets'
-import { bearerKey, readBearer, resolveBearerUser, type FetchFn } from '@opencompanion/core/runtime/pair'
-import { workRoot } from '@opencompanion/core/runtime/paths'
-import type { SecretStore } from '@opencompanion/core/runtime/storage/secret-store'
-import type { PairingStateSnapshot, StateStore } from '@opencompanion/core/runtime/storage/state-store'
+import { mcpEnvKey } from '@agentrunner/core/runtime/mcp-secrets'
+import { bearerKey,  readBearer, resolveBearerUser } from '@agentrunner/core/runtime/pair'
+import type {FetchFn} from '@agentrunner/core/runtime/pair';
+import { workRoot } from '@agentrunner/core/runtime/paths'
+import type { SecretStore } from '@agentrunner/core/runtime/storage/secret-store'
+import type { PairingStateSnapshot, StateStore } from '@agentrunner/core/runtime/storage/state-store'
 
 /**
  * How long ONE legacy pairing's owner lookup may take before the migration gives up on it. This runs on
@@ -46,7 +47,7 @@ interface ResolvedPairing {
  *
  * A pairing whose owner cannot be resolved (no stored bearer, or one the backend no longer accepts) is
  * NEVER dropped: it is carried through under its legacy key and a line tells the user to pair again. So
- * are records under any key this migration does not re-key - the {@link import('@opencompanion/core/runtime/local/scope').LOCAL_SCOPE}
+ * are records under any key this migration does not re-key - the {@link import('@agentrunner/core/runtime/local/scope').LOCAL_SCOPE}
  * pseudo-scope above all, whose records have no pairing to be rebuilt through and would otherwise be
  * deleted by the full-substrate write-back.
  *
@@ -64,9 +65,9 @@ interface ResolvedPairing {
  * The full-substrate write-back is composed from a snapshot taken AFTER the network work, never the one
  * the owner lookups ran against. `replacePairingState` replaces every map wholesale, so a key absent from
  * what it is handed is DELETED - and the lookups take up to {@link RESOLVE_TIMEOUT_MS} per pairing, a
- * window in which a `companion pair` run in another terminal (a separate process, outside the daemon's
+ * window in which a `runner pair` run in another terminal (a separate process, outside the daemon's
  * single-instance lock) can write a whole new pairing. Composing from the pre-lookup snapshot silently
- * deleted it: the user saw `pair` succeed and then no such pairing in `companion backends`. Re-reading
+ * deleted it: the user saw `pair` succeed and then no such pairing in `runner backends`. Re-reading
  * first shrinks that window to the microseconds between the read and the write, which is the same window
  * the predecessor URL-canonicalization migration has always had.
  *
@@ -76,6 +77,8 @@ interface ResolvedPairing {
  * @param fetchFn - The fetch used to resolve each legacy bearer's owner.
  * @param opts - The app-data root (so each re-keyed pairing's confined work tree moves with it) and the
  *   sink for the per-pairing "pair again" line (defaults to `process.stdout.write`).
+ * @param opts.appDataRoot - The app-data root, so each re-keyed pairing's confined work tree moves with it.
+ * @param opts.write - Sink for the per-pairing "pair again" line; defaults to `process.stdout.write`.
  */
 export async function migrateAccountScopes(
   state: StateStore,
@@ -280,7 +283,7 @@ function moveWorkTree(
 async function resolveOwner(backendUrl: string, token: string, fetchFn: FetchFn): Promise<string | null> {
   return Promise.race([
     resolveBearerUser(backendUrl, token, fetchFn),
-    new Promise<null>((resolve) => void setTimeout(() => resolve(null), RESOLVE_TIMEOUT_MS).unref())
+    new Promise<null>((resolve) => void setTimeout(resolve, RESOLVE_TIMEOUT_MS, null).unref())
   ])
 }
 

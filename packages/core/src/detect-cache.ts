@@ -1,7 +1,7 @@
-import type { DetectResult } from '@opencompanion/core-types'
+import type { DetectResult } from "@agentrunner/core-types";
 
 /** Per-tool detection cache for the app session. */
-const cache = new Map<string, DetectResult>()
+const cache = new Map<string, DetectResult>();
 
 /**
  * Caches tool detection so repeated visits to the AI Tools screen do not re-spawn
@@ -16,17 +16,17 @@ const cache = new Map<string, DetectResult>()
  * @returns The cached or freshly probed detection result.
  */
 export async function cachedDetect(
-  toolId: string,
-  detect: () => Promise<DetectResult>
+	toolId: string,
+	detect: () => Promise<DetectResult>
 ): Promise<DetectResult> {
-  const cached = cache.get(toolId)
-  if (cached?.installed) return cached
-  const result = await detect()
-  if (result.installed) cache.set(toolId, result)
-  return result
+	const cached = cache.get(toolId);
+	if (cached?.installed) return cached;
+	const result = await detect();
+	if (result.installed) cache.set(toolId, result);
+	return result;
 }
 
 /** Clears the detection cache (test helper). */
 export function clearDetectCache(): void {
-  cache.clear()
+	cache.clear();
 }

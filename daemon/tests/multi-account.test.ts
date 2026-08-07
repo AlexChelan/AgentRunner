@@ -2,14 +2,15 @@ import { mkdtempSync, readdirSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { describe, expect, it } from 'vitest'
-import { accountScope } from '@opencompanion/core/runtime/account-scope'
-import { backendKey } from '@opencompanion/core/runtime/backend-key'
-import { makeMasterKey } from '@opencompanion/core/runtime/master-key'
-import { bearerKey, runPairWithToken, runUnpair, type FetchFn } from '@opencompanion/core/runtime/pair'
-import { secretsDir } from '@opencompanion/core/runtime/paths'
-import { createFileSecretStore } from '@opencompanion/core/runtime/storage/secret-store'
-import { createStateStore } from '@opencompanion/core/runtime/storage/state-store'
-import { resolveWorkFolder } from '@opencompanion/core/runtime/work-folder'
+import { accountScope } from '@agentrunner/core/runtime/account-scope'
+import { backendKey } from '@agentrunner/core/runtime/backend-key'
+import { makeMasterKey } from '@agentrunner/core/runtime/master-key'
+import { bearerKey,  runPairWithToken, runUnpair } from '@agentrunner/core/runtime/pair'
+import type {FetchFn} from '@agentrunner/core/runtime/pair';
+import { secretsDir } from '@agentrunner/core/runtime/paths'
+import { createFileSecretStore } from '@agentrunner/core/runtime/storage/secret-store'
+import { createStateStore } from '@agentrunner/core/runtime/storage/state-store'
+import { resolveWorkFolder } from '@agentrunner/core/runtime/work-folder'
 
 /** The one backend both SaaS logins below pair with (the collision only exists on a SHARED backend). */
 const BACKEND = 'https://app.test/api'
@@ -51,7 +52,7 @@ function harness(prefix: string) {
  */
 describe('two SaaS logins on one machine', () => {
   it('keeps both pairings, both bearers, and two isolated work folders', async () => {
-    const h = harness('companion-multi-')
+    const h = harness('runner-multi-')
     const deps = { state: h.state, secrets: h.secrets, appDataRoot: h.root, write: h.write }
 
     expect(
@@ -82,7 +83,7 @@ describe('two SaaS logins on one machine', () => {
   })
 
   it('unpairing one account leaves the other working', async () => {
-    const h = harness('companion-unpair-')
+    const h = harness('runner-unpair-')
     const deps = { state: h.state, secrets: h.secrets, appDataRoot: h.root, write: h.write }
 
     await runPairWithToken({ backendUrl: BACKEND, token: 'tok-a' }, { ...deps, fetchFn: sessionFetchFor('user-a') })

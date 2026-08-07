@@ -1,0 +1,4 @@
+# These are verbatim byte captures of real CLI login sessions, CRLF and escape sequences included.
+# The repo-wide `* text=auto eol=lf` rule would rewrite the CRs a PTY emits, so the parser suite would
+# stop seeing the bytes it exists to handle. Never normalize anything in this directory.
+* -text

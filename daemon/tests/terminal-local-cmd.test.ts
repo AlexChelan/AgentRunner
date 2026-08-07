@@ -3,7 +3,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { BRAND } from '../src/brand'
-import { LOCAL_SCOPE } from '@opencompanion/core/runtime/local/scope'
+import { LOCAL_SCOPE } from '@agentrunner/core/runtime/local/scope'
 
 /**
  * The `terminal --local` COMMAND (the argv seam the desktop app spawns). The session itself is covered in
@@ -14,18 +14,18 @@ import { LOCAL_SCOPE } from '@opencompanion/core/runtime/local/scope'
  */
 
 // The app-data dir the mocked `appDataDir()` returns; each test points it at its own fresh temp dir.
-let appDataOverride = mkdtempSync(join(tmpdir(), 'companion-terminal-cmd-'))
+let appDataOverride = mkdtempSync(join(tmpdir(), 'runner-terminal-cmd-'))
 
-vi.mock('@opencompanion/core/runtime/paths', async (importOriginal) => {
-  const actual = await importOriginal<typeof import('@opencompanion/core/runtime/paths')>()
+vi.mock('@agentrunner/core/runtime/paths', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@agentrunner/core/runtime/paths')>()
   return { ...actual, appDataDir: () => appDataOverride }
 })
 // The CLI binary NEVER resolves here. These tests drive the real command through to its spawn decision, and
 // a box that happens to have `claude` installed (the resolver probes well-known dirs, not just PATH) would
 // otherwise have the command start the real thing - interactively, with inherited stdio - inside the test
 // run. A null resolver stops exactly at the spawn, which is the last thing this suite needs to see.
-vi.mock('@opencompanion/core', async (importOriginal) => {
-  const actual = await importOriginal<typeof import('@opencompanion/core')>()
+vi.mock('@agentrunner/core', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@agentrunner/core')>()
   return { ...actual, resolveToolBinary: () => null }
 })
 // Fake the clack UI so the command never touches a real TTY: the message helpers echo to stdout (so the
@@ -53,7 +53,7 @@ let stdout: string
 beforeEach(() => {
   exitCode = undefined
   stdout = ''
-  appDataOverride = mkdtempSync(join(tmpdir(), 'companion-terminal-cmd-'))
+  appDataOverride = mkdtempSync(join(tmpdir(), 'runner-terminal-cmd-'))
   vi.clearAllMocks()
   // Non-TTY, so a path that DID resolve a backend would refuse rather than block on an interactive pick -
   // which is exactly the failure these tests must be able to see.
@@ -107,7 +107,7 @@ describe('terminal --local', () => {
 
   it('drives the CLI the user connected under the LOCAL scope, and grounds the session on this machine', async () => {
     const path = stageAppConfig({ productId: 'acme', productName: 'Acme' })
-    const { createStateStore } = await import('@opencompanion/core/runtime/storage/state-store')
+    const { createStateStore } = await import('@agentrunner/core/runtime/storage/state-store')
     createStateStore({ cwd: appDataOverride }).upsertConnection(LOCAL_SCOPE, {
       toolId: 'claude-code',
       source: 'installed',
@@ -122,13 +122,13 @@ describe('terminal --local', () => {
     expect(exitCode).toBe(1)
   })
 
-  it('REFUSES without an --app-config: a local session has nothing to compose from', async () => {
+  it('rEFUSES without an --app-config: a local session has nothing to compose from', async () => {
     await run(['terminal', '--local'])
     expect(stdout).toContain('--app-config')
     expect(exitCode).toBe(1)
   })
 
-  it('REFUSES a stray product argument: the local product comes from --app-config, never a positional', async () => {
+  it('rEFUSES a stray product argument: the local product comes from --app-config, never a positional', async () => {
     // The paired form takes `terminal <productId>`; the local form does not - its product is the
     // on-device app config. Silently ignoring the positional would run a session the user did not ask for
     // (a different product than they typed), so it is refused loudly, naming the argument and the flag.
@@ -143,7 +143,7 @@ describe('terminal --local', () => {
     expect(exitCode).toBe(1)
   })
 
-  it('REFUSES an app config that is not valid (the file names itself in the failure)', async () => {
+  it('rEFUSES an app config that is not valid (the file names itself in the failure)', async () => {
     // A `productId` with a separator would become a `work/local/<id>` path segment.
     const path = stageAppConfig({ productId: '../escape', productName: 'Acme' })
 

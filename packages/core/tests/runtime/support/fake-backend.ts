@@ -1,10 +1,10 @@
-import type { StreamOpener } from '../../../src/runtime/backend-http'
-import type { HttpClient, HttpResponse } from '../../../src/runtime/stream-client'
+import type { StreamOpener } from "../../../src/runtime/backend-http";
+import type { HttpClient, HttpResponse } from "../../../src/runtime/stream-client";
 
 /**
  * The recording HTTP fake the runtime's backend suites drive. A byte-identical twin lives at
- * `apps/companion/tests/support/fake-backend.ts` for the shell's own `serve` suite: a package
- * boundary sits between them and the companion export pipeline copies each package independently,
+ * `apps/runner/tests/support/fake-backend.ts` for the shell's own `serve` suite: a package
+ * boundary sits between them and the runner export pipeline copies each package independently,
  * so a shared file would have to be reached by a relative path that the exported layout breaks.
  * Keep the two in step when either changes.
  */
@@ -15,10 +15,10 @@ import type { HttpClient, HttpResponse } from '../../../src/runtime/stream-clien
  * {@link RecordingHttpOptions.recordHeaders}.
  */
 export interface RecordedRequest {
-  url: string
-  method: string
-  headers?: Record<string, string>
-  body?: string
+	url: string;
+	method: string;
+	headers?: Record<string, string>;
+	body?: string;
 }
 
 /**
@@ -27,17 +27,17 @@ export interface RecordedRequest {
  * are passed too, for a route that keys off request order.
  */
 export type FakeRoute = (
-  recorded: RecordedRequest,
-  calls: readonly RecordedRequest[]
-) => HttpResponse | Promise<HttpResponse>
+	recorded: RecordedRequest,
+	calls: readonly RecordedRequest[]
+) => HttpResponse | Promise<HttpResponse>;
 
 /** Options for {@link createRecordingHttp}. */
 export interface RecordingHttpOptions {
-  /**
-   * Whether to capture each request's headers on the recorded call (default true). Suites that assert over the
-   * serialized `calls` and never inspect headers opt out so the recorded shape stays header-free.
-   */
-  recordHeaders?: boolean
+	/**
+	 * Whether to capture each request's headers on the recorded call (default true). Suites that assert over the
+	 * serialized `calls` and never inspect headers opt out so the recorded shape stays header-free.
+	 */
+	recordHeaders?: boolean;
 }
 
 /**
@@ -50,27 +50,27 @@ export interface RecordingHttpOptions {
  * @returns The fake client plus the live array of requests it has recorded.
  */
 export function createRecordingHttp(
-  route: FakeRoute,
-  options: RecordingHttpOptions = {}
+	route: FakeRoute,
+	options: RecordingHttpOptions = {}
 ): { http: HttpClient; calls: RecordedRequest[] } {
-  const recordHeaders = options.recordHeaders ?? true
-  const calls: RecordedRequest[] = []
-  const http: HttpClient = async (url, init) => {
-    const recorded: RecordedRequest = {
-      url,
-      method: init.method,
-      ...(recordHeaders ? { headers: init.headers } : {}),
-      ...(init.body ? { body: init.body } : {})
-    }
-    calls.push(recorded)
-    return route(recorded, calls)
-  }
-  return { http, calls }
+	const recordHeaders = options.recordHeaders ?? true;
+	const calls: RecordedRequest[] = [];
+	const http: HttpClient = async (url, init) => {
+		const recorded: RecordedRequest = {
+			url,
+			method: init.method,
+			...(recordHeaders ? { headers: init.headers } : {}),
+			...(init.body ? { body: init.body } : {})
+		};
+		calls.push(recorded);
+		return route(recorded, calls);
+	};
+	return { http, calls };
 }
 
 /** Encodes one named SSE event, exactly as the backend writes it. */
 function frame(event: string, data: unknown): string {
-  return `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`
+	return `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
 }
 
 /**
@@ -82,36 +82,43 @@ function frame(event: string, data: unknown): string {
  * keeps working unchanged and the recorded call still looks like the request the suite scripted.
  */
 export function streamFrom(http: HttpClient): StreamOpener {
-  return async (url, init) => {
-    const res = await http(url.replace('/stream', '/poll'), { method: 'GET', headers: init.headers })
-    if (res.status !== 200) {
-      return {
-        status: res.status,
-        ...(res.retryAfterMs !== undefined ? { retryAfterMs: res.retryAfterMs } : {}),
-        chunks: (async function* () {})()
-      }
-    }
-    const body = (await res.json()) as {
-      runs?: unknown[]
-      cancel?: string[]
-      connects?: unknown[]
-      disconnects?: unknown[]
-      wireToken?: string
-    }
-    const list = (v: unknown): unknown[] => (Array.isArray(v) ? v : [])
-    const frames: string[] = []
-    for (const runId of list(body.cancel)) frames.push(frame('cancel', { runId }))
-    for (const item of list(body.connects)) frames.push(frame('connect', item))
-    for (const item of list(body.disconnects)) frames.push(frame('disconnect', item))
-    for (const item of list(body.runs)) frames.push(frame('run', item))
-    if (body.wireToken) frames.push(frame('token', { wireToken: body.wireToken }))
-    return {
-      status: 200,
-      chunks: (async function* () {
-        // A keep-alive first, so every suite also proves a comment frame is ignored rather than parsed.
-        yield ': keepalive\n\n'
-        for (const f of frames) yield f
-      })()
-    }
-  }
+	return async (url, init) => {
+		const res = await http(url.replace("/stream", "/poll"), {
+			method: "GET",
+			headers: init.headers
+		});
+		if (res.status !== 200) {
+			return {
+				status: res.status,
+				...(res.retryAfterMs !== undefined ? { retryAfterMs: res.retryAfterMs } : {}),
+				chunks: (async function* () {})()
+			};
+		}
+		const body = (await res.json()) as {
+			runs?: unknown[];
+			cancel?: string[];
+			connects?: unknown[];
+			disconnects?: unknown[];
+			logins?: unknown[];
+			loginInputs?: unknown[];
+			wireToken?: string;
+		};
+		const list = (v: unknown): unknown[] => (Array.isArray(v) ? v : []);
+		const frames: string[] = [];
+		for (const runId of list(body.cancel)) frames.push(frame("cancel", { runId }));
+		for (const item of list(body.connects)) frames.push(frame("connect", item));
+		for (const item of list(body.disconnects)) frames.push(frame("disconnect", item));
+		for (const item of list(body.logins)) frames.push(frame("login", item));
+		for (const item of list(body.loginInputs)) frames.push(frame("login-input", item));
+		for (const item of list(body.runs)) frames.push(frame("run", item));
+		if (body.wireToken) frames.push(frame("token", { wireToken: body.wireToken }));
+		return {
+			status: 200,
+			chunks: (async function* () {
+				// A keep-alive first, so every suite also proves a comment frame is ignored rather than parsed.
+				yield ": keepalive\n\n";
+				for (const f of frames) yield f;
+			})()
+		};
+	};
 }

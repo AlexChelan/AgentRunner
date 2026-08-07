@@ -43,10 +43,10 @@ export interface DaemonLivenessOpts {
 }
 
 /**
- * Reports whether a live companion daemon currently holds the single-instance lock, by reading the
+ * Reports whether a live runner daemon currently holds the single-instance lock, by reading the
  * PID file {@link acquireSingleInstanceLock} writes and probing that pid for liveness. A missing,
  * unparseable, or dead-pid lock reads as not running (matching the lock's stale-reclaim rule). This is
- * read-only: it never creates, reclaims, or removes the lock, so a `companion backends` status probe
+ * read-only: it never creates, reclaims, or removes the lock, so a `runner backends` status probe
  * can never disturb a running daemon.
  *
  * @param opts - The lock directory and optional liveness probe.
@@ -68,7 +68,7 @@ export function isDaemonRunning(opts: DaemonLivenessOpts): boolean {
  * lock (its recorded pid is dead) is reclaimed.
  *
  * Scope: one daemon per OS USER, NOT per machine. The PID file lives in the per-OS-user app-data root
- * ({@link import('@opencompanion/core/runtime/paths').appDataDir}), so two OS users on one PC each hold their OWN lock and each
+ * ({@link import('@agentrunner/core/runtime/paths').appDataDir}), so two OS users on one PC each hold their OWN lock and each
  * run their own daemon. That is the correct boundary and the one the work-tree isolation design counts
  * on: each user's daemon owns a separate app-data root, hence a separate `work/` tree, store, and
  * secrets, and nothing is shared for two daemons to fight over. Reading it as per-machine would suggest
@@ -180,6 +180,8 @@ export function installShutdownHandlers(deps: ShutdownDeps): () => Promise<void>
  *
  * @param drain - The graceful drain to await (cancel runs, flush poll client, release lock).
  * @param opts - Optional drain timeout (default {@link DEFAULT_DRAIN_TIMEOUT_MS}) and process emitter (default `process`).
+ * @param opts.timeoutMs - How long to wait for the drain before exiting anyway (default {@link DEFAULT_DRAIN_TIMEOUT_MS}).
+ * @param opts.proc - The process to exit through (default `process`); injected so a test asserts the exit without taking one.
  */
 export function drainThenExit(
   drain: () => Promise<void>,

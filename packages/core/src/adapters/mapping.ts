@@ -2,15 +2,16 @@
 // deleted at the end of the Tauri migration); this is now the single canonical copy. It holds the
 // `codexAppServerItemToMessage`/permission/posture/mcp maps; the `mcpToolCall` case below is covered
 // by a test to catch drift.
-import type { EffortLevel, McpServerConfig } from '@anthropic-ai/claude-agent-sdk'
-import type { McpServerSpec, PermissionMode, TokenUsage } from '@opencompanion/protocol'
-import type { AdvertisedModel, AgenticDriverMessage } from './types'
+import type { EffortLevel, McpServerConfig } from "@anthropic-ai/claude-agent-sdk";
+import type { McpServerSpec, PermissionMode, TokenUsage } from "@agentrunner/protocol";
+import type { AdvertisedModel, AgenticDriverMessage } from "./types";
+import { isRecord } from "../runtime/local/is-record";
 
 /** Claude Agent SDK options derived from the abstract permission mode. */
 export interface ClaudePermissionOptions {
-  permissionMode: 'dontAsk' | 'acceptEdits' | 'bypassPermissions'
-  allowedTools?: string[]
-  disallowedTools?: string[]
+	permissionMode: "dontAsk" | "acceptEdits" | "bypassPermissions";
+	allowedTools?: string[];
+	disallowedTools?: string[];
 }
 
 /**
@@ -27,26 +28,26 @@ export interface ClaudePermissionOptions {
  * allowed" - a deny outranks every allow.
  */
 export const FLOORED_DENIED_CLAUDE_TOOLS: readonly string[] = [
-  'Bash',
-  'BashOutput',
-  'KillShell',
-  'KillBash',
-  'Read',
-  'Write',
-  'Edit',
-  'MultiEdit',
-  'NotebookEdit',
-  'NotebookRead',
-  'Glob',
-  'Grep',
-  'Task',
-  'Agent',
-  'REPL',
-  'SlashCommand'
-]
+	"Bash",
+	"BashOutput",
+	"KillShell",
+	"KillBash",
+	"Read",
+	"Write",
+	"Edit",
+	"MultiEdit",
+	"NotebookEdit",
+	"NotebookRead",
+	"Glob",
+	"Grep",
+	"Task",
+	"Agent",
+	"REPL",
+	"SlashCommand"
+];
 
 /** The prefix every Claude MCP tool name carries, which is what tells one apart from a built-in. */
-const MCP_TOOL_PREFIX = 'mcp__'
+const MCP_TOOL_PREFIX = "mcp__";
 
 /**
  * The base set of BUILT-IN tools a floored run may load, derived from the allow-list the floor already
@@ -66,7 +67,7 @@ const MCP_TOOL_PREFIX = 'mcp__'
  * @returns The built-in tool names, for the SDK's `tools` option.
  */
 export function flooredClaudeToolBase(allowedTools: readonly string[]): string[] {
-  return allowedTools.filter((name) => !name.startsWith(MCP_TOOL_PREFIX))
+	return allowedTools.filter((name) => !name.startsWith(MCP_TOOL_PREFIX));
 }
 
 /**
@@ -89,34 +90,34 @@ export function flooredClaudeToolBase(allowedTools: readonly string[]): string[]
  * @returns The SDK permission controls for the run.
  */
 export function claudePermissionOptions(
-  mode: PermissionMode,
-  floored = false
+	mode: PermissionMode,
+	floored = false
 ): ClaudePermissionOptions {
-  if (floored) {
-    return {
-      permissionMode: 'dontAsk',
-      allowedTools: [],
-      disallowedTools: [...FLOORED_DENIED_CLAUDE_TOOLS]
-    }
-  }
-  switch (mode) {
-    case 'read-only':
-      return {
-        permissionMode: 'dontAsk',
-        allowedTools: ['Read', 'Glob', 'Grep'],
-        disallowedTools: ['Edit', 'Write', 'Bash']
-      }
-    case 'auto-edit':
-      return { permissionMode: 'acceptEdits' }
-    case 'full':
-      return { permissionMode: 'bypassPermissions' }
-  }
+	if (floored) {
+		return {
+			permissionMode: "dontAsk",
+			allowedTools: [],
+			disallowedTools: [...FLOORED_DENIED_CLAUDE_TOOLS]
+		};
+	}
+	switch (mode) {
+		case "read-only":
+			return {
+				permissionMode: "dontAsk",
+				allowedTools: ["Read", "Glob", "Grep"],
+				disallowedTools: ["Edit", "Write", "Bash"]
+			};
+		case "auto-edit":
+			return { permissionMode: "acceptEdits" };
+		case "full":
+			return { permissionMode: "bypassPermissions" };
+	}
 }
 
 /** Codex sandbox + approval posture derived from the abstract permission mode. */
 export interface CodexPosture {
-  sandboxMode: 'read-only' | 'workspace-write' | 'danger-full-access'
-  approvalPolicy: 'never' | 'on-request' | 'untrusted'
+	sandboxMode: "read-only" | "workspace-write" | "danger-full-access";
+	approvalPolicy: "never" | "on-request" | "untrusted";
 }
 
 /**
@@ -126,14 +127,14 @@ export interface CodexPosture {
  * writes, no escalation).
  */
 export function codexPosture(mode: PermissionMode): CodexPosture {
-  switch (mode) {
-    case 'read-only':
-      return { sandboxMode: 'read-only', approvalPolicy: 'never' }
-    case 'auto-edit':
-      return { sandboxMode: 'workspace-write', approvalPolicy: 'never' }
-    case 'full':
-      return { sandboxMode: 'danger-full-access', approvalPolicy: 'never' }
-  }
+	switch (mode) {
+		case "read-only":
+			return { sandboxMode: "read-only", approvalPolicy: "never" };
+		case "auto-edit":
+			return { sandboxMode: "workspace-write", approvalPolicy: "never" };
+		case "full":
+			return { sandboxMode: "danger-full-access", approvalPolicy: "never" };
+	}
 }
 
 /**
@@ -146,49 +147,49 @@ export function codexPosture(mode: PermissionMode): CodexPosture {
  * ARGV (`claude --mcp-config <json>`; see {@link claudeTerminalArgs}), and a process argv is readable by
  * any local user on Linux (`/proc/<pid>/cmdline`) for the life of the process. A caller that puts a
  * CREDENTIAL in `env` therefore exposes it. Pass secrets in the spawned CLI's own ENVIRONMENT instead -
- * its stdio MCP children inherit it - which is what the companion daemon's `terminal` command does for
+ * its stdio MCP children inherit it - which is what the runner daemon's `terminal` command does for
  * the servers a user adds with `mcp add`.
  */
 export function mapMcpServers(
-  specs: Record<string, McpServerSpec>
+	specs: Record<string, McpServerSpec>
 ): Record<string, McpServerConfig> {
-  const out: Record<string, McpServerConfig> = {}
-  for (const [name, spec] of Object.entries(specs)) {
-    if (spec.type === 'stdio') {
-      out[name] = {
-        type: 'stdio',
-        command: spec.command ?? '',
-        ...(spec.args ? { args: spec.args } : {}),
-        ...(spec.env ? { env: spec.env } : {})
-      }
-    } else {
-      out[name] = { type: spec.type, url: spec.url ?? '' }
-    }
-  }
-  return out
+	const out: Record<string, McpServerConfig> = {};
+	for (const [name, spec] of Object.entries(specs)) {
+		if (spec.type === "stdio") {
+			out[name] = {
+				type: "stdio",
+				command: spec.command ?? "",
+				...(spec.args ? { args: spec.args } : {}),
+				...(spec.env ? { env: spec.env } : {})
+			};
+		} else {
+			out[name] = { type: spec.type, url: spec.url ?? "" };
+		}
+	}
+	return out;
 }
 
 /**
  * Codex per-server tool-approval mode. We tag every app-wired MCP server `'approve'` so Codex
  * auto-approves its tool calls without prompting. This is REQUIRED, not cosmetic: a non-interactive
- * `codex exec` run (both the unattended companion and desktop) has no approver, so under a restrictive
+ * `codex exec` run (both the unattended runner and desktop) has no approver, so under a restrictive
  * sandbox (`read-only`/`workspace-write`) Codex otherwise auto-cancels EVERY MCP tool call with "user
  * cancelled MCP tool call". Verified empirically (2026-07-03) that `'approve'` lets the call through
  * while the OS sandbox stays fully enforced (macOS seatbelt), so it removes only the un-answerable
  * approval gate, never the sandbox or network ceiling. (`'auto'` defers to the global approval policy,
  * which is `never` and cancels; `'prompt'` always prompts and cancels non-interactively.)
  */
-export type CodexToolsApprovalMode = 'auto' | 'prompt' | 'approve'
+export type CodexToolsApprovalMode = "auto" | "prompt" | "approve";
 
 /** One Codex `mcp_servers.<name>` config entry (stdio command or http url), auto-approved. */
 export type CodexMcpServerConfig =
-  | {
-      command: string
-      args?: string[]
-      env?: Record<string, string>
-      default_tools_approval_mode: CodexToolsApprovalMode
-    }
-  | { url: string; default_tools_approval_mode: CodexToolsApprovalMode }
+	| {
+			command: string;
+			args?: string[];
+			env?: Record<string, string>;
+			default_tools_approval_mode: CodexToolsApprovalMode;
+	  }
+	| { url: string; default_tools_approval_mode: CodexToolsApprovalMode };
 
 /**
  * Maps transport-neutral {@link McpServerSpec} entries onto Codex's `mcp_servers.*`
@@ -207,27 +208,23 @@ export type CodexMcpServerConfig =
  * @returns The Codex `mcp_servers` config object.
  */
 export function mapCodexMcpServers(
-  specs: Record<string, McpServerSpec>
+	specs: Record<string, McpServerSpec>
 ): Record<string, CodexMcpServerConfig> {
-  const out: Record<string, CodexMcpServerConfig> = {}
-  for (const [name, spec] of Object.entries(specs)) {
-    if (spec.type === 'stdio') {
-      if (!spec.command) continue
-      out[name] = {
-        command: spec.command,
-        ...(spec.args ? { args: spec.args } : {}),
-        ...(spec.env ? { env: spec.env } : {}),
-        default_tools_approval_mode: 'approve'
-      }
-    } else if (spec.url) {
-      out[name] = { url: spec.url, default_tools_approval_mode: 'approve' }
-    }
-  }
-  return out
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null
+	const out: Record<string, CodexMcpServerConfig> = {};
+	for (const [name, spec] of Object.entries(specs)) {
+		if (spec.type === "stdio") {
+			if (!spec.command) continue;
+			out[name] = {
+				command: spec.command,
+				...(spec.args ? { args: spec.args } : {}),
+				...(spec.env ? { env: spec.env } : {}),
+				default_tools_approval_mode: "approve"
+			};
+		} else if (spec.url) {
+			out[name] = { url: spec.url, default_tools_approval_mode: "approve" };
+		}
+	}
+	return out;
 }
 
 /**
@@ -236,10 +233,10 @@ function isRecord(value: unknown): value is Record<string, unknown> {
  * event shape, so a schema change degrades to "no delta" rather than throwing.
  */
 export function extractTextDelta(event: unknown): string | null {
-  if (!isRecord(event) || event.type !== 'content_block_delta') return null
-  const delta = event.delta
-  if (!isRecord(delta) || delta.type !== 'text_delta') return null
-  return typeof delta.text === 'string' ? delta.text : null
+	if (!isRecord(event) || event.type !== "content_block_delta") return null;
+	const delta = event.delta;
+	if (!isRecord(delta) || delta.type !== "text_delta") return null;
+	return typeof delta.text === "string" ? delta.text : null;
 }
 
 /**
@@ -249,49 +246,123 @@ export function extractTextDelta(event: unknown): string | null {
  * schema change degrades to "no reasoning" rather than throwing.
  */
 export function extractThinkingDelta(event: unknown): string | null {
-  if (!isRecord(event) || event.type !== 'content_block_delta') return null
-  const delta = event.delta
-  if (!isRecord(delta) || delta.type !== 'thinking_delta') return null
-  return typeof delta.thinking === 'string' ? delta.thinking : null
+	if (!isRecord(event) || event.type !== "content_block_delta") return null;
+	const delta = event.delta;
+	if (!isRecord(delta) || delta.type !== "thinking_delta") return null;
+	return typeof delta.thinking === "string" ? delta.thinking : null;
+}
+
+/** One `tool_use` block the model emitted: its call id, tool name, and a short input summary. */
+export interface ClaudeToolUse {
+	/** The block's `id`, absent only on a malformed block (it is what a `tool_result` matches on). */
+	id?: string;
+	/** The tool name as Claude reports it. */
+	name: string;
+	/** A short, readable one-liner built from the tool's input. */
+	detail?: string;
 }
 
 /**
- * Defensively extracts `tool_use` blocks (tool name + a short input summary) from a
+ * Defensively extracts `tool_use` blocks (call id + tool name + a short input summary) from a
  * Claude Agent SDK `assistant` message's content, so a run can surface WHICH tools
  * the model used (Claude's adapter otherwise drops all tool activity). Returns `[]`
  * for any unexpected shape, so a schema change degrades to "no tools" not a throw.
  *
  * @param message - An SDK message (only `assistant` messages carry tool_use blocks).
- * @returns The tools invoked in this message, name + optional one-line detail.
+ * @returns The tools invoked in this message, id + name + optional one-line detail.
  */
-export function extractToolUses(message: unknown): { name: string; detail?: string }[] {
-  if (!isRecord(message)) return []
-  const inner = message.message
-  if (!isRecord(inner) || !Array.isArray(inner.content)) return []
-  const tools: { name: string; detail?: string }[] = []
-  for (const block of inner.content) {
-    if (isRecord(block) && block.type === 'tool_use' && typeof block.name === 'string') {
-      tools.push({ name: block.name, ...summarizeToolInput(block.input) })
-    }
-  }
-  return tools
+export function extractToolUses(message: unknown): ClaudeToolUse[] {
+	if (!isRecord(message)) return [];
+	const inner = message.message;
+	if (!isRecord(inner) || !Array.isArray(inner.content)) return [];
+	const tools: ClaudeToolUse[] = [];
+	for (const block of inner.content) {
+		if (isRecord(block) && block.type === "tool_use" && typeof block.name === "string") {
+			tools.push({
+				...(typeof block.id === "string" ? { id: block.id } : {}),
+				name: block.name,
+				...summarizeToolInput(block.input)
+			});
+		}
+	}
+	return tools;
+}
+
+/** One `tool_result` block: the `tool_use` it answers, whether it failed, and a short summary. */
+export interface ClaudeToolResult {
+	/** The `tool_use_id` this result answers (matches a {@link ClaudeToolUse} `id`). */
+	toolUseId: string;
+	/** True when the block carries `is_error: true` - the tool reported a failure. */
+	isError: boolean;
+	/** A short, readable one-liner built from the result's own content, when it carries readable text. */
+	detail?: string;
+}
+
+/**
+ * Defensively extracts `tool_result` blocks from a Claude Agent SDK `user` message's content. The
+ * SDK streams one such message after each tool runs, and it is the ONLY place the tool's real
+ * outcome appears - the `tool_use` block that started it says nothing about how it ended. Returns
+ * `[]` for any unexpected shape (including the user's own prompt/replay messages, which carry text
+ * and image blocks instead), so a schema change degrades to "no outcomes" rather than a throw.
+ *
+ * @param message - An SDK message (only `user` messages carry tool_result blocks).
+ * @returns The tool outcomes in this message, each matched to its `tool_use` by id.
+ */
+export function extractToolResults(message: unknown): ClaudeToolResult[] {
+	if (!isRecord(message)) return [];
+	const inner = message.message;
+	if (!isRecord(inner) || !Array.isArray(inner.content)) return [];
+	const results: ClaudeToolResult[] = [];
+	for (const block of inner.content) {
+		if (isRecord(block) && block.type === "tool_result" && typeof block.tool_use_id === "string") {
+			results.push({
+				toolUseId: block.tool_use_id,
+				isError: block.is_error === true,
+				...summarizeToolResult(block.content)
+			});
+		}
+	}
+	return results;
+}
+
+/**
+ * Builds a short, readable one-liner from a tool result's content. The SDK sends either a plain
+ * string or an array of content blocks; only the text blocks are readable (an image block carries
+ * base64 that would be worthless in a tool card), so they are joined and everything else dropped.
+ */
+function summarizeToolResult(content: unknown): { detail?: string } {
+	const text =
+		typeof content === "string"
+			? content
+			: Array.isArray(content)
+				? content
+						.map((block) =>
+							isRecord(block) && block.type === "text" && typeof block.text === "string"
+								? block.text
+								: ""
+						)
+						.filter((part) => part.length > 0)
+						.join("\n")
+				: "";
+	const trimmed = text.trim();
+	return trimmed.length > 0 ? { detail: trimmed.slice(0, 140) } : {};
 }
 
 /** Builds a short, readable one-liner from a tool's input for the UI's tool card. */
 function summarizeToolInput(input: unknown): { detail?: string } {
-  if (typeof input === 'string') return { detail: input.slice(0, 140) }
-  if (isRecord(input)) {
-    for (const key of ['command', 'file_path', 'path', 'pattern', 'query', 'url']) {
-      const value = input[key]
-      if (typeof value === 'string' && value.length > 0) return { detail: value.slice(0, 140) }
-    }
-    try {
-      return { detail: JSON.stringify(input).slice(0, 140) }
-    } catch {
-      return {}
-    }
-  }
-  return {}
+	if (typeof input === "string") return { detail: input.slice(0, 140) };
+	if (isRecord(input)) {
+		for (const key of ["command", "file_path", "path", "pattern", "query", "url"]) {
+			const value = input[key];
+			if (typeof value === "string" && value.length > 0) return { detail: value.slice(0, 140) };
+		}
+		try {
+			return { detail: JSON.stringify(input).slice(0, 140) };
+		} catch {
+			return {};
+		}
+	}
+	return {};
 }
 
 /**
@@ -299,7 +370,7 @@ function summarizeToolInput(input: unknown): { detail?: string } {
  * union rather than inferred, so a level the SDK later drops fails this package's typecheck instead
  * of reaching the SDK at runtime and failing a buyer's run.
  */
-const CLAUDE_SDK_EFFORT_LEVELS: readonly EffortLevel[] = ['low', 'medium', 'high', 'xhigh', 'max']
+const CLAUDE_SDK_EFFORT_LEVELS: readonly EffortLevel[] = ["low", "medium", "high", "xhigh", "max"];
 
 /**
  * Claude Agent SDK reasoning controls for a requested effort level.
@@ -319,13 +390,13 @@ const CLAUDE_SDK_EFFORT_LEVELS: readonly EffortLevel[] = ['low', 'medium', 'high
  * @returns A partial of `{ thinking, effort }` to spread into the SDK `Options`.
  */
 export function claudeReasoningOptions(effort: string | undefined): {
-  thinking?: { type: 'disabled' } | { type: 'adaptive' }
-  effort?: EffortLevel
+	thinking?: { type: "disabled" } | { type: "adaptive" };
+	effort?: EffortLevel;
 } {
-  if (effort === undefined || effort === 'default') return {}
-  if (effort === 'off') return { thinking: { type: 'disabled' } }
-  const level = CLAUDE_SDK_EFFORT_LEVELS.find((candidate) => candidate === effort)
-  return { thinking: { type: 'adaptive' }, ...(level ? { effort: level } : {}) }
+	if (effort === undefined || effort === "default") return {};
+	if (effort === "off") return { thinking: { type: "disabled" } };
+	const level = CLAUDE_SDK_EFFORT_LEVELS.find((candidate) => candidate === effort);
+	return { thinking: { type: "adaptive" }, ...(level ? { effort: level } : {}) };
 }
 
 /**
@@ -348,8 +419,8 @@ export function claudeReasoningOptions(effort: string | undefined): {
  * @returns The Codex effort, or `undefined`.
  */
 export function codexReasoningEffort(effort: string | undefined): string | undefined {
-  if (effort === undefined || effort === 'default' || effort === 'off') return undefined
-  return effort.trim().length > 0 ? effort : undefined
+	if (effort === undefined || effort === "default" || effort === "off") return undefined;
+	return effort.trim().length > 0 ? effort : undefined;
 }
 
 /**
@@ -365,12 +436,12 @@ export function codexReasoningEffort(effort: string | undefined): string | undef
  * @returns The prompt to send, with the system prompt prepended when present.
  */
 export function prependSystemPrompt(systemPrompt: string | undefined, prompt: string): string {
-  return systemPrompt ? `${systemPrompt}\n\n${prompt}` : prompt
+	return systemPrompt ? `${systemPrompt}\n\n${prompt}` : prompt;
 }
 
 /** Coerces an unknown value to a string, or a fallback (defensive JSON-field read). */
-function asString(value: unknown, fallback = ''): string {
-  return typeof value === 'string' ? value : fallback
+function asString(value: unknown, fallback = ""): string {
+	return typeof value === "string" ? value : fallback;
 }
 
 /**
@@ -378,10 +449,10 @@ function asString(value: unknown, fallback = ''): string {
  * unrecognized value from a foreign CLI version) means the tool is running (`started`); the
  * terminal `completed`/`failed` pass through.
  */
-function codexToolStatus(status: unknown): 'started' | 'completed' | 'failed' {
-  if (status === 'completed') return 'completed'
-  if (status === 'failed') return 'failed'
-  return 'started'
+function codexToolStatus(status: unknown): "started" | "completed" | "failed" {
+	if (status === "completed") return "completed";
+	if (status === "failed") return "failed";
+	return "started";
 }
 
 /**
@@ -400,52 +471,52 @@ function codexToolStatus(status: unknown): 'started' | 'completed' | 'failed' {
  * @returns The driver message to yield, or `null` to skip the item.
  */
 export function codexAppServerItemToMessage(
-  item: unknown,
-  completed: boolean
+	item: unknown,
+	completed: boolean
 ): AgenticDriverMessage | null {
-  if (!isRecord(item) || typeof item.type !== 'string') return null
-  switch (item.type) {
-    case 'commandExecution':
-      return {
-        kind: 'tool',
-        name: 'command',
-        status: codexToolStatus(item.status),
-        detail: asString(item.command)
-      }
-    case 'fileChange': {
-      if (!completed) return null
-      const changes = Array.isArray(item.changes) ? item.changes : []
-      return {
-        kind: 'tool',
-        name: 'file_change',
-        status: item.status === 'failed' ? 'failed' : 'completed',
-        detail: changes
-          .map((c) => (isRecord(c) ? `${asString(c.kind)} ${asString(c.path)}` : ''))
-          .filter((s) => s.trim().length > 0)
-          .join(', ')
-      }
-    }
-    case 'webSearch':
-      return completed
-        ? { kind: 'tool', name: 'web_search', status: 'completed', detail: asString(item.query) }
-        : null
-    case 'mcpToolCall': {
-      // App-MCP tool calls (e.g. the capability tools served over the local MCP): surface them as
-      // tool chips just like Codex's native tools, so a Codex run shows `list_schedules` etc.
-      const error =
-        isRecord(item.error) && typeof item.error.message === 'string'
-          ? item.error.message
-          : undefined
-      return {
-        kind: 'tool',
-        name: asString(item.tool, 'tool'),
-        status: codexToolStatus(item.status),
-        ...(error ? { detail: error } : {})
-      }
-    }
-    default:
-      return null
-  }
+	if (!isRecord(item) || typeof item.type !== "string") return null;
+	switch (item.type) {
+		case "commandExecution":
+			return {
+				kind: "tool",
+				name: "command",
+				status: codexToolStatus(item.status),
+				detail: asString(item.command)
+			};
+		case "fileChange": {
+			if (!completed) return null;
+			const changes = Array.isArray(item.changes) ? item.changes : [];
+			return {
+				kind: "tool",
+				name: "file_change",
+				status: item.status === "failed" ? "failed" : "completed",
+				detail: changes
+					.map((c) => (isRecord(c) ? `${asString(c.kind)} ${asString(c.path)}` : ""))
+					.filter((s) => s.trim().length > 0)
+					.join(", ")
+			};
+		}
+		case "webSearch":
+			return completed
+				? { kind: "tool", name: "web_search", status: "completed", detail: asString(item.query) }
+				: null;
+		case "mcpToolCall": {
+			// App-MCP tool calls (e.g. the capability tools served over the local MCP): surface them as
+			// tool chips just like Codex's native tools, so a Codex run shows `list_schedules` etc.
+			const error =
+				isRecord(item.error) && typeof item.error.message === "string"
+					? item.error.message
+					: undefined;
+			return {
+				kind: "tool",
+				name: asString(item.tool, "tool"),
+				status: codexToolStatus(item.status),
+				...(error ? { detail: error } : {})
+			};
+		}
+		default:
+			return null;
+	}
 }
 
 /**
@@ -459,25 +530,25 @@ export function codexAppServerItemToMessage(
  * @returns The TOML-encoded value.
  */
 function toCodexTomlValue(value: unknown, path: string): string {
-  if (typeof value === 'string') return JSON.stringify(value)
-  if (typeof value === 'number') {
-    if (!Number.isFinite(value)) throw new Error(`Codex config at ${path} must be a finite number`)
-    return `${value}`
-  }
-  if (typeof value === 'boolean') return value ? 'true' : 'false'
-  if (Array.isArray(value)) {
-    return `[${value.map((item, i) => toCodexTomlValue(item, `${path}[${i}]`)).join(', ')}]`
-  }
-  if (isRecord(value)) {
-    const parts: string[] = []
-    for (const [key, child] of Object.entries(value)) {
-      if (child === undefined) continue
-      const encodedKey = /^[A-Za-z0-9_-]+$/.test(key) ? key : JSON.stringify(key)
-      parts.push(`${encodedKey} = ${toCodexTomlValue(child, `${path}.${key}`)}`)
-    }
-    return `{${parts.join(', ')}}`
-  }
-  throw new Error(`Unsupported Codex config value at ${path}`)
+	if (typeof value === "string") return JSON.stringify(value);
+	if (typeof value === "number") {
+		if (!Number.isFinite(value)) throw new Error(`Codex config at ${path} must be a finite number`);
+		return `${value}`;
+	}
+	if (typeof value === "boolean") return value ? "true" : "false";
+	if (Array.isArray(value)) {
+		return `[${value.map((item, i) => toCodexTomlValue(item, `${path}[${i}]`)).join(", ")}]`;
+	}
+	if (isRecord(value)) {
+		const parts: string[] = [];
+		for (const [key, child] of Object.entries(value)) {
+			if (child === undefined) continue;
+			const encodedKey = /^[\w-]+$/.test(key) ? key : JSON.stringify(key);
+			parts.push(`${encodedKey} = ${toCodexTomlValue(child, `${path}.${key}`)}`);
+		}
+		return `{${parts.join(", ")}}`;
+	}
+	throw new Error(`Unsupported Codex config value at ${path}`);
 }
 
 /**
@@ -490,21 +561,21 @@ function toCodexTomlValue(value: unknown, path: string): string {
  * @returns One `key.path=value` string per leaf, to pass after each `--config`.
  */
 export function serializeCodexConfigOverrides(config: Record<string, unknown>): string[] {
-  const out: string[] = []
-  const walk = (value: unknown, prefix: string): void => {
-    if (isRecord(value) && !Array.isArray(value)) {
-      for (const [key, child] of Object.entries(value)) {
-        if (child === undefined) continue
-        walk(child, prefix ? `${prefix}.${key}` : key)
-      }
-      return
-    }
-    out.push(`${prefix}=${toCodexTomlValue(value, prefix)}`)
-  }
-  for (const [key, value] of Object.entries(config)) {
-    if (value !== undefined) walk(value, key)
-  }
-  return out
+	const out: string[] = [];
+	const walk = (value: unknown, prefix: string): void => {
+		if (isRecord(value) && !Array.isArray(value)) {
+			for (const [key, child] of Object.entries(value)) {
+				if (child === undefined) continue;
+				walk(child, prefix ? `${prefix}.${key}` : key);
+			}
+			return;
+		}
+		out.push(`${prefix}=${toCodexTomlValue(value, prefix)}`);
+	};
+	for (const [key, value] of Object.entries(config)) {
+		if (value !== undefined) walk(value, key);
+	}
+	return out;
 }
 
 /**
@@ -512,17 +583,17 @@ export function serializeCodexConfigOverrides(config: Record<string, unknown>): 
  * NEUTRAL: this is reusable boilerplate, so the identity Codex sees must not carry a product
  * codename.
  */
-export const CODEX_APP_SERVER_CLIENT_INFO = { name: 'companion', version: '1.0.0' } as const
+export const CODEX_APP_SERVER_CLIENT_INFO = { name: "runner", version: "1.0.0" } as const;
 
 /** Inputs for {@link buildCodexAppServerArgs} - one `codex app-server` stdio spawn. */
 export interface CodexAppServerArgsInput {
-  /** App/integration MCP servers (already mapped via {@link mapCodexMcpServers}). */
-  mcpServers?: Record<string, CodexMcpServerConfig>
-  /**
-   * Config overrides defining + selecting the confined permissions profile, from
-   * {@link buildCodexPermissionProfileOverrides}. Empty/absent leaves codex on its stock posture.
-   */
-  permissionProfile?: string[]
+	/** App/integration MCP servers (already mapped via {@link mapCodexMcpServers}). */
+	mcpServers?: Record<string, CodexMcpServerConfig>;
+	/**
+	 * Config overrides defining + selecting the confined permissions profile, from
+	 * {@link buildCodexPermissionProfileOverrides}. Empty/absent leaves codex on its stock posture.
+	 */
+	permissionProfile?: string[];
 }
 
 /**
@@ -543,36 +614,36 @@ export interface CodexAppServerArgsInput {
  * @returns The `codex` argv (without the binary); the prompt is sent over JSON-RPC.
  */
 export function buildCodexAppServerArgs(input: CodexAppServerArgsInput): string[] {
-  // `--disable <feature>` maps to `-c features.<name>=false`; `plugins` and `apps` are the
-  // account-level tool surfaces we drop for a predictable product toolset (see JSDoc above).
-  const args = ['app-server', '--disable', 'plugins', '--disable', 'apps']
-  const config: Record<string, unknown> = { web_search: 'live' }
-  if (input.mcpServers && Object.keys(input.mcpServers).length > 0) {
-    config.mcp_servers = input.mcpServers
-  }
-  for (const override of serializeCodexConfigOverrides(config)) args.push('-c', override)
-  // The profile's `filesystem` map is keyed by ABSOLUTE PATH, so it is pre-serialized as whole TOML
-  // inline tables rather than walked into dotted `-c` keys like the config above.
-  for (const override of input.permissionProfile ?? []) args.push('-c', override)
-  return args
+	// `--disable <feature>` maps to `-c features.<name>=false`; `plugins` and `apps` are the
+	// account-level tool surfaces we drop for a predictable product toolset (see JSDoc above).
+	const args = ["app-server", "--disable", "plugins", "--disable", "apps"];
+	const config: Record<string, unknown> = { web_search: "live" };
+	if (input.mcpServers && Object.keys(input.mcpServers).length > 0) {
+		config.mcp_servers = input.mcpServers;
+	}
+	for (const override of serializeCodexConfigOverrides(config)) args.push("-c", override);
+	// The profile's `filesystem` map is keyed by ABSOLUTE PATH, so it is pre-serialized as whole TOML
+	// inline tables rather than walked into dotted `-c` keys like the config above.
+	for (const override of input.permissionProfile ?? []) args.push("-c", override);
+	return args;
 }
 
 /** Inputs for {@link buildCodexThreadStartParams} - a fresh app-server thread. */
 export interface CodexThreadStartParamsInput {
-  /** The run's working directory (the thread's cwd). */
-  cwd: string
-  /** Sandbox tier from {@link codexPosture} (the thread default; `turn/start` refines the egress). */
-  sandboxMode: CodexPosture['sandboxMode']
-  /** Approval policy from {@link codexPosture} (always `never` on this non-interactive path). */
-  approvalPolicy: CodexPosture['approvalPolicy']
-  /** Model id, or omit for Codex's default. */
-  model?: string
-  /**
-   * Whether a confined permissions profile is active for this spawn (from
-   * {@link buildCodexPermissionProfileOverrides}). When true the legacy `sandbox` tier is OMITTED -
-   * see the JSDoc below; the tier is carried by the profile's `extends` instead.
-   */
-  permissionProfileActive?: boolean
+	/** The run's working directory (the thread's cwd). */
+	cwd: string;
+	/** Sandbox tier from {@link codexPosture} (the thread default; `turn/start` refines the egress). */
+	sandboxMode: CodexPosture["sandboxMode"];
+	/** Approval policy from {@link codexPosture} (always `never` on this non-interactive path). */
+	approvalPolicy: CodexPosture["approvalPolicy"];
+	/** Model id, or omit for Codex's default. */
+	model?: string;
+	/**
+	 * Whether a confined permissions profile is active for this spawn (from
+	 * {@link buildCodexPermissionProfileOverrides}). When true the legacy `sandbox` tier is OMITTED -
+	 * see the JSDoc below; the tier is carried by the profile's `extends` instead.
+	 */
+	permissionProfileActive?: boolean;
 }
 
 /**
@@ -591,14 +662,14 @@ export interface CodexThreadStartParamsInput {
  * @returns The `thread/start` params object.
  */
 export function buildCodexThreadStartParams(
-  input: CodexThreadStartParamsInput
+	input: CodexThreadStartParamsInput
 ): Record<string, unknown> {
-  return {
-    cwd: input.cwd,
-    approvalPolicy: input.approvalPolicy,
-    ...(input.permissionProfileActive ? {} : { sandbox: input.sandboxMode }),
-    ...(input.model ? { model: input.model } : {})
-  }
+	return {
+		cwd: input.cwd,
+		approvalPolicy: input.approvalPolicy,
+		...(input.permissionProfileActive ? {} : { sandbox: input.sandboxMode }),
+		...(input.model ? { model: input.model } : {})
+	};
 }
 
 /**
@@ -609,26 +680,26 @@ export function buildCodexThreadStartParams(
  * @returns The `thread/resume` params object.
  */
 export function buildCodexThreadResumeParams(threadId: string): Record<string, unknown> {
-  return { threadId }
+	return { threadId };
 }
 
 /** Inputs for {@link buildCodexTurnStartParams} - one turn on an app-server thread. */
 export interface CodexTurnStartParamsInput {
-  /** The thread to run the turn on (from `thread/start` / `thread/resume`). */
-  threadId: string
-  /** The run's working directory (per-turn cwd). */
-  cwd: string
-  /** The composed prompt, sent structured (never argv) so it cannot smuggle CLI flags. */
-  prompt: string
-  /** Sandbox tier from {@link codexPosture}. */
-  sandboxMode: CodexPosture['sandboxMode']
-  /** Whether the sandbox may reach the network (OS-enforced egress). */
-  networkAccessEnabled: boolean
-  /**
-   * Reasoning effort from {@link codexReasoningEffort}, or omit for Codex's native default. A plain
-   * string because Codex's own `ReasoningEffort` is an open non-empty string advertised per model.
-   */
-  effort?: string
+	/** The thread to run the turn on (from `thread/start` / `thread/resume`). */
+	threadId: string;
+	/** The run's working directory (per-turn cwd). */
+	cwd: string;
+	/** The composed prompt, sent structured (never argv) so it cannot smuggle CLI flags. */
+	prompt: string;
+	/** Sandbox tier from {@link codexPosture}. */
+	sandboxMode: CodexPosture["sandboxMode"];
+	/** Whether the sandbox may reach the network (OS-enforced egress). */
+	networkAccessEnabled: boolean;
+	/**
+	 * Reasoning effort from {@link codexReasoningEffort}, or omit for Codex's native default. A plain
+	 * string because Codex's own `ReasoningEffort` is an open non-empty string advertised per model.
+	 */
+	effort?: string;
 }
 
 /**
@@ -641,15 +712,15 @@ export interface CodexTurnStartParamsInput {
  * @returns The `turn/start` params object.
  */
 export function buildCodexTurnStartParams(
-  input: CodexTurnStartParamsInput
+	input: CodexTurnStartParamsInput
 ): Record<string, unknown> {
-  return {
-    threadId: input.threadId,
-    cwd: input.cwd,
-    input: [{ type: 'text', text: input.prompt }],
-    sandboxPolicy: toCodexSandboxPolicy(input.sandboxMode, input.networkAccessEnabled, input.cwd),
-    ...(input.effort ? { effort: input.effort } : {})
-  }
+	return {
+		threadId: input.threadId,
+		cwd: input.cwd,
+		input: [{ type: "text", text: input.prompt }],
+		sandboxPolicy: toCodexSandboxPolicy(input.sandboxMode, input.networkAccessEnabled, input.cwd),
+		...(input.effort ? { effort: input.effort } : {})
+	};
 }
 
 /**
@@ -667,19 +738,19 @@ export function buildCodexTurnStartParams(
  * OS-enforced read-deny codex exposes to a per-spawn caller.
  */
 function toCodexSandboxPolicy(
-  sandboxMode: CodexPosture['sandboxMode'],
-  networkAccessEnabled: boolean,
-  cwd: string
+	sandboxMode: CodexPosture["sandboxMode"],
+	networkAccessEnabled: boolean,
+	cwd: string
 ): Record<string, unknown> {
-  if (sandboxMode === 'danger-full-access') return { type: 'dangerFullAccess' }
-  const writable = sandboxMode === 'workspace-write'
-  return {
-    type: writable ? 'workspaceWrite' : 'readOnly',
-    writableRoots: writable ? [cwd] : [],
-    networkAccess: networkAccessEnabled,
-    excludeTmpdirEnvVar: false,
-    excludeSlashTmp: false
-  }
+	if (sandboxMode === "danger-full-access") return { type: "dangerFullAccess" };
+	const writable = sandboxMode === "workspace-write";
+	return {
+		type: writable ? "workspaceWrite" : "readOnly",
+		writableRoots: writable ? [cwd] : [],
+		networkAccess: networkAccessEnabled,
+		excludeTmpdirEnvVar: false,
+		excludeSlashTmp: false
+	};
 }
 
 /**
@@ -687,32 +758,72 @@ function toCodexSandboxPolicy(
  * (not one of codex's built-ins) so it can never collide with a profile the user defined in their own
  * `~/.codex/config.toml`; the session-flag config layer we pass at spawn wins regardless.
  */
-const CODEX_CONFINED_PROFILE = 'companion-confined'
+const CODEX_CONFINED_PROFILE = "runner-confined";
 
 /** The codex built-in permission profile each abstract tier extends. */
-const CODEX_PROFILE_BASE: Record<CodexPosture['sandboxMode'], string> = {
-  'read-only': ':read-only',
-  'workspace-write': ':workspace',
-  'danger-full-access': ':danger-full-access'
-}
+const CODEX_PROFILE_BASE: Record<CodexPosture["sandboxMode"], string> = {
+	"read-only": ":read-only",
+	"workspace-write": ":workspace",
+	"danger-full-access": ":danger-full-access"
+};
 
 /** The filesystem root, denied outright to a floored run rather than path by path. */
-const FILESYSTEM_ROOT = '/'
+const FILESYSTEM_ROOT = "/";
+
+/**
+ * Whether Codex's filesystem sandbox is OS-ENFORCED on this platform.
+ *
+ * The floored profile denies `/` and relies on the OS to refuse the read. That works where codex has
+ * a real sandbox: macOS seatbelt (always present), and Linux through bubblewrap (`bwrap`, which the
+ * user may not have installed). Everywhere else - Windows, or a Linux box without bubblewrap - the
+ * deny is advisory, and a dispatched run can read the user's disk.
+ *
+ * This exists because codex has NO per-tool disable: its shell is a core tool, so unlike Claude Code
+ * there is no allow-list to leave `Bash` out of. The sandbox IS the floor, so where the sandbox is
+ * not enforced there is no floor at all.
+ *
+ * A CONTAINED host short-circuits all of that: when the runner is itself inside a container, the
+ * container is the security boundary, there is no user disk on the other side of it, and codex's own
+ * OS sandbox is redundant. So a contained host reports enforced on EVERY platform - including the
+ * ones (Windows, Linux without bubblewrap) a desktop install refuses outright.
+ *
+ * @param platform - The platform to evaluate (`process.platform`).
+ * @param hasBubblewrap - Whether `bwrap` resolves on this machine. Only consulted on Linux.
+ * @param contained - Whether the host process itself runs inside a container (defaults to `false`).
+ * @returns True when a floored codex run is genuinely contained.
+ */
+export function codexSandboxIsOsEnforced(
+	platform: NodeJS.Platform,
+	hasBubblewrap: () => boolean,
+	contained = false
+): boolean {
+	if (contained) return true;
+	if (platform === "darwin") return true;
+	if (platform === "linux") return hasBubblewrap();
+	return false;
+}
+
+/** What a user is told when a dispatched codex run is refused for want of an enforced sandbox. */
+export const CODEX_UNCONFINED_REFUSAL =
+	"Codex cannot be confined for app-dispatched work on this machine: its sandbox is OS-enforced only " +
+	"on macOS, and on Linux through bubblewrap (install `bwrap`). Codex has no way to switch its own " +
+	"file and shell tools off, so without the sandbox a dispatched run could read this disk. Your own " +
+	"terminal sessions and local runs are unaffected; connect Claude Code for dispatched work here.";
 
 /** Inputs for {@link buildCodexPermissionProfileOverrides}. */
 export interface CodexPermissionProfileInput {
-  /** Sandbox tier from {@link codexPosture}; selects the built-in profile to extend. */
-  sandboxMode: CodexPosture['sandboxMode']
-  /** Whether the sandbox may reach the network (OS-enforced on the profile too). */
-  networkAccessEnabled: boolean
-  /** Absolute paths whose reads are DENIED to the spawned CLI (the daemon's own secrets dir). */
-  denyReadPaths: string[]
-  /**
-   * Whether the run is CAPABILITY-FLOORED (a paired web backend dispatched it). Codex has no per-tool
-   * disable and its shell is a core tool, so the floor can only be expressed as a filesystem deny at
-   * the root - which the profile makes OS-enforced.
-   */
-  floored?: boolean
+	/** Sandbox tier from {@link codexPosture}; selects the built-in profile to extend. */
+	sandboxMode: CodexPosture["sandboxMode"];
+	/** Whether the sandbox may reach the network (OS-enforced on the profile too). */
+	networkAccessEnabled: boolean;
+	/** Absolute paths whose reads are DENIED to the spawned CLI (the daemon's own secrets dir). */
+	denyReadPaths: string[];
+	/**
+	 * Whether the run is CAPABILITY-FLOORED (a paired web backend dispatched it). Codex has no per-tool
+	 * disable and its shell is a core tool, so the floor can only be expressed as a filesystem deny at
+	 * the root - which the profile makes OS-enforced.
+	 */
+	floored?: boolean;
 }
 
 /**
@@ -755,21 +866,21 @@ export interface CodexPermissionProfileInput {
  * @param input - The tier, the network posture, the paths to deny, and whether the run is floored.
  * @returns The `key=value` overrides to pass after each `-c`, or `[]` when nothing is denied.
  */
-export function buildCodexPermissionProfileOverrides(
-  input: CodexPermissionProfileInput
-): string[] {
-  if (!input.floored && input.denyReadPaths.length === 0) return []
-  const key = `permissions.${CODEX_CONFINED_PROFILE}`
-  const filesystem: Record<string, string> = {}
-  if (input.floored) filesystem[FILESYSTEM_ROOT] = 'deny'
-  else for (const path of input.denyReadPaths) filesystem[path] = 'deny'
-  const base = input.floored ? CODEX_PROFILE_BASE['read-only'] : CODEX_PROFILE_BASE[input.sandboxMode]
-  return [
-    `${key}.extends=${toCodexTomlValue(base, `${key}.extends`)}`,
-    `${key}.network=${toCodexTomlValue({ enabled: input.networkAccessEnabled }, `${key}.network`)}`,
-    `${key}.filesystem=${toCodexTomlValue(filesystem, `${key}.filesystem`)}`,
-    `default_permissions=${toCodexTomlValue(CODEX_CONFINED_PROFILE, 'default_permissions')}`
-  ]
+export function buildCodexPermissionProfileOverrides(input: CodexPermissionProfileInput): string[] {
+	if (!input.floored && input.denyReadPaths.length === 0) return [];
+	const key = `permissions.${CODEX_CONFINED_PROFILE}`;
+	const filesystem: Record<string, string> = {};
+	if (input.floored) filesystem[FILESYSTEM_ROOT] = "deny";
+	else for (const path of input.denyReadPaths) filesystem[path] = "deny";
+	const base = input.floored
+		? CODEX_PROFILE_BASE["read-only"]
+		: CODEX_PROFILE_BASE[input.sandboxMode];
+	return [
+		`${key}.extends=${toCodexTomlValue(base, `${key}.extends`)}`,
+		`${key}.network=${toCodexTomlValue({ enabled: input.networkAccessEnabled }, `${key}.network`)}`,
+		`${key}.filesystem=${toCodexTomlValue(filesystem, `${key}.filesystem`)}`,
+		`default_permissions=${toCodexTomlValue(CODEX_CONFINED_PROFILE, "default_permissions")}`
+	];
 }
 
 /**
@@ -798,7 +909,7 @@ export function buildCodexPermissionProfileOverrides(
  *
  * PLATFORM COVERAGE (disclosed, not silently degraded): the sandbox is OS-enforced on macOS and on
  * Linux with `bubblewrap`. `failIfUnavailable: false` is set EXPLICITLY so a dispatched run on a
- * headless Linux host WITHOUT bubblewrap (the companion's primary target) does not hard-error; the
+ * headless Linux host WITHOUT bubblewrap (the runner's primary target) does not hard-error; the
  * sandbox degrades to a warning there and the Bash read-syscall deny is NOT OS-enforced. The
  * permission `Read(...)` rules still fully cover the Read/Grep/Glob tools and statically-recognized
  * Bash reads on that host; only a Bash read the static recognizer does not catch (an obfuscated path,
@@ -809,33 +920,33 @@ export function buildCodexPermissionProfileOverrides(
  * @returns The `settings` object, or `undefined` when nothing is denied (leaves the run untouched).
  */
 export function claudeConfinementSettings(
-  denyReadPaths: string[],
-  networkEnabled: boolean
+	denyReadPaths: string[],
+	networkEnabled: boolean
 ): Record<string, unknown> | undefined {
-  if (denyReadPaths.length === 0) return undefined
-  const deny: string[] = []
-  for (const path of denyReadPaths) {
-    // Claude's rule syntax addresses an absolute path with a leading `//`, so a plain `/a/b` must be
-    // written `Read(//a/b)`. Deny the directory itself and everything under it.
-    deny.push(`Read(/${path})`, `Read(/${path}/**)`)
-  }
-  return {
-    permissions: { deny },
-    sandbox: {
-      enabled: true,
-      // Both are load-bearing; see PLATFORM COVERAGE above. `failIfUnavailable: false` keeps a
-      // dispatched run from hard-erroring on a sandbox-less host; `allowUnsandboxedCommands: false`
-      // stops a prompt-injected Bash call from opting out of the sandbox via `dangerouslyDisableSandbox`.
-      failIfUnavailable: false,
-      autoAllowBashIfSandboxed: true,
-      allowUnsandboxedCommands: false,
-      filesystem: { denyRead: [...denyReadPaths] },
-      network: {
-        allowLocalBinding: true,
-        ...(networkEnabled ? { allowedDomains: ['*'] } : {})
-      }
-    }
-  }
+	if (denyReadPaths.length === 0) return undefined;
+	const deny: string[] = [];
+	for (const path of denyReadPaths) {
+		// Claude's rule syntax addresses an absolute path with a leading `//`, so a plain `/a/b` must be
+		// written `Read(//a/b)`. Deny the directory itself and everything under it.
+		deny.push(`Read(/${path})`, `Read(/${path}/**)`);
+	}
+	return {
+		permissions: { deny },
+		sandbox: {
+			enabled: true,
+			// Both are load-bearing; see PLATFORM COVERAGE above. `failIfUnavailable: false` keeps a
+			// dispatched run from hard-erroring on a sandbox-less host; `allowUnsandboxedCommands: false`
+			// stops a prompt-injected Bash call from opting out of the sandbox via `dangerouslyDisableSandbox`.
+			failIfUnavailable: false,
+			autoAllowBashIfSandboxed: true,
+			allowUnsandboxedCommands: false,
+			filesystem: { denyRead: [...denyReadPaths] },
+			network: {
+				allowLocalBinding: true,
+				...(networkEnabled ? { allowedDomains: ["*"] } : {})
+			}
+		}
+	};
 }
 
 /**
@@ -845,9 +956,9 @@ export function claudeConfinementSettings(
  * and `notification` (a streamed event, `method` only).
  */
 export type CodexAppServerIncoming =
-  | { kind: 'response'; id: number; result?: unknown; error?: string }
-  | { kind: 'serverRequest'; id: number; method: string }
-  | { kind: 'notification'; method: string; params: unknown }
+	| { kind: "response"; id: number; result?: unknown; error?: string }
+	| { kind: "serverRequest"; id: number; method: string }
+	| { kind: "notification"; method: string; params: unknown };
 
 /**
  * Parses one line of `codex app-server` stdout into a {@link CodexAppServerIncoming}, or `null` for a
@@ -858,43 +969,44 @@ export type CodexAppServerIncoming =
  * @returns The classified message, or `null` to skip the line.
  */
 export function parseCodexAppServerLine(line: string): CodexAppServerIncoming | null {
-  const trimmed = line.trim()
-  if (!trimmed) return null
-  let raw: unknown
-  try {
-    raw = JSON.parse(trimmed)
-  } catch {
-    return null
-  }
-  if (!isRecord(raw)) return null
-  const hasMethod = typeof raw.method === 'string'
-  const id = typeof raw.id === 'number' ? raw.id : typeof raw.id === 'string' ? Number(raw.id) : NaN
-  const hasId = Number.isFinite(id)
-  if (!hasMethod && hasId && (raw.result !== undefined || raw.error !== undefined)) {
-    const error =
-      isRecord(raw.error) && typeof raw.error.message === 'string'
-        ? raw.error.message
-        : raw.error !== undefined
-          ? 'Codex request failed'
-          : undefined
-    return {
-      kind: 'response',
-      id,
-      ...(raw.result !== undefined ? { result: raw.result } : {}),
-      ...(error !== undefined ? { error } : {})
-    }
-  }
-  if (hasMethod && hasId) return { kind: 'serverRequest', id, method: raw.method as string }
-  if (hasMethod) return { kind: 'notification', method: raw.method as string, params: raw.params }
-  return null
+	const trimmed = line.trim();
+	if (!trimmed) return null;
+	let raw: unknown;
+	try {
+		raw = JSON.parse(trimmed);
+	} catch {
+		return null;
+	}
+	if (!isRecord(raw)) return null;
+	const hasMethod = typeof raw.method === "string";
+	const id =
+		typeof raw.id === "number" ? raw.id : typeof raw.id === "string" ? Number(raw.id) : Number.NaN;
+	const hasId = Number.isFinite(id);
+	if (!hasMethod && hasId && (raw.result !== undefined || raw.error !== undefined)) {
+		const error =
+			isRecord(raw.error) && typeof raw.error.message === "string"
+				? raw.error.message
+				: raw.error !== undefined
+					? "Codex request failed"
+					: undefined;
+		return {
+			kind: "response",
+			id,
+			...(raw.result !== undefined ? { result: raw.result } : {}),
+			...(error !== undefined ? { error } : {})
+		};
+	}
+	if (hasMethod && hasId) return { kind: "serverRequest", id, method: raw.method as string };
+	if (hasMethod) return { kind: "notification", method: raw.method as string, params: raw.params };
+	return null;
 }
 
 /** Reads `result.thread.id` from a `thread/start` / `thread/resume` reply, or `undefined`. */
 export function extractCodexThreadId(result: unknown): string | undefined {
-  if (isRecord(result) && isRecord(result.thread) && typeof result.thread.id === 'string') {
-    return result.thread.id
-  }
-  return undefined
+	if (isRecord(result) && isRecord(result.thread) && typeof result.thread.id === "string") {
+		return result.thread.id;
+	}
+	return undefined;
 }
 
 /**
@@ -911,35 +1023,36 @@ export function extractCodexThreadId(result: unknown): string | undefined {
  * @returns One entry per advertised model that named an id; `[]` for any unusable payload.
  */
 export function extractCodexAdvertisedModels(result: unknown): AdvertisedModel[] {
-  if (!isRecord(result) || !Array.isArray(result.data)) return []
-  const models: AdvertisedModel[] = []
-  for (const entry of result.data) {
-    if (!isRecord(entry) || typeof entry.id !== 'string' || entry.id.length === 0) continue
-    const effortLevels: string[] = []
-    if (Array.isArray(entry.supportedReasoningEfforts)) {
-      for (const option of entry.supportedReasoningEfforts) {
-        if (!isRecord(option)) continue
-        const level = typeof option.reasoningEffort === 'string' ? option.reasoningEffort.trim() : ''
-        if (level.length > 0 && !effortLevels.includes(level)) effortLevels.push(level)
-      }
-    }
-    const defaultEffort =
-      typeof entry.defaultReasoningEffort === 'string' ? entry.defaultReasoningEffort.trim() : ''
-    models.push({
-      id: entry.id,
-      effortLevels,
-      ...(defaultEffort.length > 0 ? { defaultEffort } : {})
-    })
-  }
-  return models
+	if (!isRecord(result) || !Array.isArray(result.data)) return [];
+	const models: AdvertisedModel[] = [];
+	for (const entry of result.data) {
+		if (!isRecord(entry) || typeof entry.id !== "string" || entry.id.length === 0) continue;
+		const effortLevels: string[] = [];
+		if (Array.isArray(entry.supportedReasoningEfforts)) {
+			for (const option of entry.supportedReasoningEfforts) {
+				if (!isRecord(option)) continue;
+				const level =
+					typeof option.reasoningEffort === "string" ? option.reasoningEffort.trim() : "";
+				if (level.length > 0 && !effortLevels.includes(level)) effortLevels.push(level);
+			}
+		}
+		const defaultEffort =
+			typeof entry.defaultReasoningEffort === "string" ? entry.defaultReasoningEffort.trim() : "";
+		models.push({
+			id: entry.id,
+			effortLevels,
+			...(defaultEffort.length > 0 ? { defaultEffort } : {})
+		});
+	}
+	return models;
 }
 
 /** Reads `result.turn.id` from a `turn/start` reply, or `undefined`. */
 export function extractCodexTurnId(result: unknown): string | undefined {
-  if (isRecord(result) && isRecord(result.turn) && typeof result.turn.id === 'string') {
-    return result.turn.id
-  }
-  return undefined
+	if (isRecord(result) && isRecord(result.turn) && typeof result.turn.id === "string") {
+		return result.turn.id;
+	}
+	return undefined;
 }
 
 /**
@@ -948,36 +1061,36 @@ export function extractCodexTurnId(result: unknown): string | undefined {
  * turn's own cost). Reads defensively; returns `undefined` when neither token count is present.
  */
 function toAppServerUsage(raw: unknown): TokenUsage | undefined {
-  if (!isRecord(raw)) return undefined
-  const source = isRecord(raw.last) ? raw.last : isRecord(raw.total) ? raw.total : raw
-  const usage: TokenUsage = {}
-  if (typeof source.inputTokens === 'number') usage.inputTokens = source.inputTokens
-  if (typeof source.outputTokens === 'number') usage.outputTokens = source.outputTokens
-  return usage.inputTokens !== undefined || usage.outputTokens !== undefined ? usage : undefined
+	if (!isRecord(raw)) return undefined;
+	const source = isRecord(raw.last) ? raw.last : isRecord(raw.total) ? raw.total : raw;
+	const usage: TokenUsage = {};
+	if (typeof source.inputTokens === "number") usage.inputTokens = source.inputTokens;
+	if (typeof source.outputTokens === "number") usage.outputTokens = source.outputTokens;
+	return usage.inputTokens !== undefined || usage.outputTokens !== undefined ? usage : undefined;
 }
 
 /** Reads a human error message from a `turn/failed` / `error` notification's params. */
 function extractCodexErrorMessage(p: Record<string, unknown>): string {
-  if (isRecord(p.error) && typeof p.error.message === 'string') return p.error.message
-  if (typeof p.message === 'string') return p.message
-  return 'Codex error'
+	if (isRecord(p.error) && typeof p.error.message === "string") return p.error.message;
+	if (typeof p.message === "string") return p.message;
+	return "Codex error";
 }
 
 /** Mutable per-turn state threaded across {@link codexAppServerNotificationToMessages} calls. */
 export interface CodexAppServerTurnState {
-  /** Token usage captured from `thread/tokenUsage/updated`. */
-  usage?: TokenUsage
-  /** Whether any agent text has been emitted (drives blank-line separators between blocks). */
-  emittedText: boolean
-  /** Agent-message item ids that streamed >=1 delta, so a completed item is not re-emitted. */
-  streamedItemIds: Set<string>
-  /** The last agent-message item id emitted, so a distinct block gets a blank-line separator. */
-  lastAgentItemId?: string
+	/** Token usage captured from `thread/tokenUsage/updated`. */
+	usage?: TokenUsage;
+	/** Whether any agent text has been emitted (drives blank-line separators between blocks). */
+	emittedText: boolean;
+	/** Agent-message item ids that streamed >=1 delta, so a completed item is not re-emitted. */
+	streamedItemIds: Set<string>;
+	/** The last agent-message item id emitted, so a distinct block gets a blank-line separator. */
+	lastAgentItemId?: string;
 }
 
 /** A fresh {@link CodexAppServerTurnState} for one turn. */
 export function newCodexAppServerTurnState(): CodexAppServerTurnState {
-  return { emittedText: false, streamedItemIds: new Set() }
+	return { emittedText: false, streamedItemIds: new Set() };
 }
 
 /**
@@ -997,73 +1110,73 @@ export function newCodexAppServerTurnState(): CodexAppServerTurnState {
  * @returns The messages to yield, and the terminal outcome when the turn ends.
  */
 export function codexAppServerNotificationToMessages(
-  method: string,
-  params: unknown,
-  state: CodexAppServerTurnState
-): { messages: AgenticDriverMessage[]; outcome?: 'completed' | 'failed' } {
-  const p = isRecord(params) ? params : {}
-  switch (method) {
-    case 'item/agentMessage/delta': {
-      const delta = asString(p.delta)
-      if (!delta) return { messages: [] }
-      const itemId = asString(p.itemId)
-      // A distinct agent-message block (new item id after text already streamed) gets a blank-line
-      // separator so a pre-tool preamble never runs into the final answer; same-block deltas append.
-      const separator = state.emittedText && state.lastAgentItemId !== itemId ? '\n\n' : ''
-      state.streamedItemIds.add(itemId)
-      state.lastAgentItemId = itemId
-      state.emittedText = true
-      return { messages: [{ kind: 'text', text: `${separator}${delta}` }] }
-    }
-    case 'item/reasoning/textDelta':
-    case 'item/reasoning/summaryTextDelta': {
-      const delta = asString(p.delta)
-      return delta ? { messages: [{ kind: 'reasoning', text: delta }] } : { messages: [] }
-    }
-    case 'item/started':
-    case 'item/completed': {
-      const completed = method === 'item/completed'
-      const item = p.item
-      if (isRecord(item) && item.type === 'agentMessage') {
-        // Deltas already carried this message; only fall back to the completed item's full text when
-        // NO delta streamed for it (a Codex version that does not stream agentMessage deltas).
-        if (!completed) return { messages: [] }
-        const id = asString(item.id)
-        const text = asString(item.text)
-        if (state.streamedItemIds.has(id) || !text) return { messages: [] }
-        const separator = state.emittedText ? '\n\n' : ''
-        state.emittedText = true
-        state.lastAgentItemId = id
-        return { messages: [{ kind: 'text', text: `${separator}${text}` }] }
-      }
-      const message = codexAppServerItemToMessage(item, completed)
-      return { messages: message ? [message] : [] }
-    }
-    case 'thread/tokenUsage/updated': {
-      const usage = toAppServerUsage(p.tokenUsage)
-      if (usage) state.usage = usage
-      return { messages: [] }
-    }
-    case 'turn/completed': {
-      const status = isRecord(p.turn) ? asString(p.turn.status) : ''
-      if (status === 'failed') {
-        const message =
-          isRecord(p.turn) && isRecord(p.turn.error) && typeof p.turn.error.message === 'string'
-            ? p.turn.error.message
-            : 'Codex turn failed'
-        return { messages: [{ kind: 'error', message }], outcome: 'failed' }
-      }
-      // 'completed' or 'interrupted' both end the turn cleanly (interrupt = user cancel, swallowed by
-      // the driver when its signal is aborted).
-      return { messages: [], outcome: 'completed' }
-    }
-    case 'turn/failed':
-    case 'error':
-      return {
-        messages: [{ kind: 'error', message: extractCodexErrorMessage(p) }],
-        outcome: 'failed'
-      }
-    default:
-      return { messages: [] }
-  }
+	method: string,
+	params: unknown,
+	state: CodexAppServerTurnState
+): { messages: AgenticDriverMessage[]; outcome?: "completed" | "failed" } {
+	const p = isRecord(params) ? params : {};
+	switch (method) {
+		case "item/agentMessage/delta": {
+			const delta = asString(p.delta);
+			if (!delta) return { messages: [] };
+			const itemId = asString(p.itemId);
+			// A distinct agent-message block (new item id after text already streamed) gets a blank-line
+			// separator so a pre-tool preamble never runs into the final answer; same-block deltas append.
+			const separator = state.emittedText && state.lastAgentItemId !== itemId ? "\n\n" : "";
+			state.streamedItemIds.add(itemId);
+			state.lastAgentItemId = itemId;
+			state.emittedText = true;
+			return { messages: [{ kind: "text", text: `${separator}${delta}` }] };
+		}
+		case "item/reasoning/textDelta":
+		case "item/reasoning/summaryTextDelta": {
+			const delta = asString(p.delta);
+			return delta ? { messages: [{ kind: "reasoning", text: delta }] } : { messages: [] };
+		}
+		case "item/started":
+		case "item/completed": {
+			const completed = method === "item/completed";
+			const item = p.item;
+			if (isRecord(item) && item.type === "agentMessage") {
+				// Deltas already carried this message; only fall back to the completed item's full text when
+				// NO delta streamed for it (a Codex version that does not stream agentMessage deltas).
+				if (!completed) return { messages: [] };
+				const id = asString(item.id);
+				const text = asString(item.text);
+				if (state.streamedItemIds.has(id) || !text) return { messages: [] };
+				const separator = state.emittedText ? "\n\n" : "";
+				state.emittedText = true;
+				state.lastAgentItemId = id;
+				return { messages: [{ kind: "text", text: `${separator}${text}` }] };
+			}
+			const message = codexAppServerItemToMessage(item, completed);
+			return { messages: message ? [message] : [] };
+		}
+		case "thread/tokenUsage/updated": {
+			const usage = toAppServerUsage(p.tokenUsage);
+			if (usage) state.usage = usage;
+			return { messages: [] };
+		}
+		case "turn/completed": {
+			const status = isRecord(p.turn) ? asString(p.turn.status) : "";
+			if (status === "failed") {
+				const message =
+					isRecord(p.turn) && isRecord(p.turn.error) && typeof p.turn.error.message === "string"
+						? p.turn.error.message
+						: "Codex turn failed";
+				return { messages: [{ kind: "error", message }], outcome: "failed" };
+			}
+			// 'completed' or 'interrupted' both end the turn cleanly (interrupt = user cancel, swallowed by
+			// the driver when its signal is aborted).
+			return { messages: [], outcome: "completed" };
+		}
+		case "turn/failed":
+		case "error":
+			return {
+				messages: [{ kind: "error", message: extractCodexErrorMessage(p) }],
+				outcome: "failed"
+			};
+		default:
+			return { messages: [] };
+	}
 }

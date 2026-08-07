@@ -1,11 +1,11 @@
-import { z } from 'zod'
-import type { PermissionMode } from './vocab'
+import { z } from "zod";
+import type { PermissionMode } from "./vocab";
 
 /** Permission ladder order, lowest capability first; index = clamp rank. */
-const PERMISSION_LADDER: readonly PermissionMode[] = ['read-only', 'auto-edit', 'full']
+const PERMISSION_LADDER: readonly PermissionMode[] = ["read-only", "auto-edit", "full"];
 
 /** `zod` schema for the abstract permission mode (mirrors {@link PermissionMode}). */
-export const PermissionModeSchema = z.enum(['read-only', 'auto-edit', 'full'])
+export const PermissionModeSchema = z.enum(["read-only", "auto-edit", "full"]);
 
 /**
  * Compares two permission modes by capability rank (`read-only` < `auto-edit` < `full`): a negative
@@ -18,7 +18,7 @@ export const PermissionModeSchema = z.enum(['read-only', 'auto-edit', 'full'])
  * @returns `rank(a) - rank(b)`.
  */
 export function comparePermissionModes(a: PermissionMode, b: PermissionMode): number {
-  return PERMISSION_LADDER.indexOf(a) - PERMISSION_LADDER.indexOf(b)
+	return PERMISSION_LADDER.indexOf(a) - PERMISSION_LADDER.indexOf(b);
 }
 
 /**
@@ -31,24 +31,24 @@ export function comparePermissionModes(a: PermissionMode, b: PermissionMode): nu
  * itself), so no dispatcher can turn it off and there is nothing to represent or clamp here.
  */
 export interface RunPolicy {
-  /** Abstract permission posture (mapped per-adapter by the runtime). */
-  permissionMode: PermissionMode
-  /** Whether the run may reach the network (`off` is the unattended default). */
-  network: 'on' | 'off'
+	/** Abstract permission posture (mapped per-adapter by the runtime). */
+	permissionMode: PermissionMode;
+	/** Whether the run may reach the network (`off` is the unattended default). */
+	network: "on" | "off";
 }
 
 /** `zod` schema for {@link RunPolicy}. */
 export const RunPolicySchema = z.object({
-  permissionMode: PermissionModeSchema,
-  network: z.enum(['on', 'off'])
-})
+	permissionMode: PermissionModeSchema,
+	network: z.enum(["on", "off"])
+});
 
 /** The unattended floor used when a dispatch carries no policy. */
-const UNATTENDED_FLOOR: RunPolicy = { permissionMode: 'read-only', network: 'off' }
+const UNATTENDED_FLOOR: RunPolicy = { permissionMode: "read-only", network: "off" };
 
 /** Returns the lower-capability of two permission modes (by ladder rank). */
 function lowerPermission(a: PermissionMode, b: PermissionMode): PermissionMode {
-  return comparePermissionModes(a, b) <= 0 ? a : b
+	return comparePermissionModes(a, b) <= 0 ? a : b;
 }
 
 /**
@@ -62,9 +62,9 @@ function lowerPermission(a: PermissionMode, b: PermissionMode): PermissionMode {
  * @returns The effective, clamped policy.
  */
 export function clampPolicy(ceiling: RunPolicy, requested: RunPolicy | undefined): RunPolicy {
-  const req = requested ?? UNATTENDED_FLOOR
-  return {
-    permissionMode: lowerPermission(ceiling.permissionMode, req.permissionMode),
-    network: ceiling.network === 'on' && req.network === 'on' ? 'on' : 'off'
-  }
+	const req = requested ?? UNATTENDED_FLOOR;
+	return {
+		permissionMode: lowerPermission(ceiling.permissionMode, req.permissionMode),
+		network: ceiling.network === "on" && req.network === "on" ? "on" : "off"
+	};
 }

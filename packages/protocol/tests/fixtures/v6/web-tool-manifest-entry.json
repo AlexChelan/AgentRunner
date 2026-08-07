@@ -1,0 +1,12 @@
+{
+  "name": "knowledge_search",
+  "description": "Search the product knowledge base for grounded facts.",
+  "inputSchema": {
+    "type": "object",
+    "properties": {
+      "query": { "type": "string", "description": "The search query." }
+    },
+    "required": ["query"],
+    "additionalProperties": false
+  }
+}

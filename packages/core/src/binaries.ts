@@ -1,14 +1,14 @@
-import { readdirSync, statSync } from 'node:fs'
-import { homedir } from 'node:os'
-import { delimiter, join } from 'node:path'
+import { readdirSync, statSync } from "node:fs";
+import { homedir } from "node:os";
+import { delimiter, join } from "node:path";
 
 /** True when `path` exists and is a regular file (symlinks are followed). */
 function isFile(path: string): boolean {
-  try {
-    return statSync(path).isFile()
-  } catch {
-    return false
-  }
+	try {
+		return statSync(path).isFile();
+	} catch {
+		return false;
+	}
 }
 
 /**
@@ -19,26 +19,26 @@ function isFile(path: string): boolean {
  * when `dir` is unreadable or holds no match.
  */
 function firstFileCaseInsensitive(dir: string, names: string[]): string | null {
-  let entries: string[]
-  try {
-    entries = readdirSync(dir)
-  } catch {
-    return null
-  }
-  const byLowerName = new Map<string, string>()
-  for (const entry of entries) {
-    const lower = entry.toLowerCase()
-    if (!byLowerName.has(lower)) byLowerName.set(lower, entry)
-  }
-  for (const name of names) {
-    const real = byLowerName.get(name.toLowerCase())
-    if (real !== undefined && isFile(join(dir, real))) return join(dir, real)
-  }
-  return null
+	let entries: string[];
+	try {
+		entries = readdirSync(dir);
+	} catch {
+		return null;
+	}
+	const byLowerName = new Map<string, string>();
+	for (const entry of entries) {
+		const lower = entry.toLowerCase();
+		if (!byLowerName.has(lower)) byLowerName.set(lower, entry);
+	}
+	for (const name of names) {
+		const real = byLowerName.get(name.toLowerCase());
+		if (real !== undefined && isFile(join(dir, real))) return join(dir, real);
+	}
+	return null;
 }
 
 /** Default Windows executable extensions when `PATHEXT` is unset. */
-const DEFAULT_PATHEXT = '.COM;.EXE;.BAT;.CMD;.PS1'
+const DEFAULT_PATHEXT = ".COM;.EXE;.BAT;.CMD;.PS1";
 
 /**
  * The curated set of common install directories AI tool binaries live in. GUI
@@ -53,18 +53,18 @@ const DEFAULT_PATHEXT = '.COM;.EXE;.BAT;.CMD;.PS1'
  * @returns The ordered list of candidate install directories.
  */
 export function binaryCandidateDirs(
-  platform: NodeJS.Platform = process.platform,
-  env: NodeJS.ProcessEnv = process.env
+	platform: NodeJS.Platform = process.platform,
+	env: NodeJS.ProcessEnv = process.env
 ): string[] {
-  if (platform === 'win32') {
-    const dirs: string[] = []
-    if (env.APPDATA) dirs.push(join(env.APPDATA, 'npm'))
-    if (env.LOCALAPPDATA) dirs.push(join(env.LOCALAPPDATA, 'Microsoft', 'WindowsApps'))
-    if (env.ProgramFiles) dirs.push(join(env.ProgramFiles, 'nodejs'))
-    return dirs
-  }
-  const home = homedir()
-  return ['/usr/local/bin', '/opt/homebrew/bin', join(home, '.local', 'bin'), join(home, 'bin')]
+	if (platform === "win32") {
+		const dirs: string[] = [];
+		if (env.APPDATA) dirs.push(join(env.APPDATA, "npm"));
+		if (env.LOCALAPPDATA) dirs.push(join(env.LOCALAPPDATA, "Microsoft", "WindowsApps"));
+		if (env.ProgramFiles) dirs.push(join(env.ProgramFiles, "nodejs"));
+		return dirs;
+	}
+	const home = homedir();
+	return ["/usr/local/bin", "/opt/homebrew/bin", join(home, ".local", "bin"), join(home, "bin")];
 }
 
 /**
@@ -74,12 +74,12 @@ export function binaryCandidateDirs(
  * used.
  */
 function nameCandidates(name: string, platform: NodeJS.Platform, env: NodeJS.ProcessEnv): string[] {
-  if (platform !== 'win32') return [name]
-  const exts = (env.PATHEXT ?? DEFAULT_PATHEXT)
-    .split(';')
-    .map((e) => e.trim())
-    .filter(Boolean)
-  return [...exts.map((ext) => name + ext), name]
+	if (platform !== "win32") return [name];
+	const exts = (env.PATHEXT ?? DEFAULT_PATHEXT)
+		.split(";")
+		.map((e) => e.trim())
+		.filter(Boolean);
+	return [...exts.map((ext) => name + ext), name];
 }
 
 /**
@@ -103,42 +103,42 @@ function nameCandidates(name: string, platform: NodeJS.Platform, env: NodeJS.Pro
  * @returns The resolved binary path, or `null`.
  */
 export function resolveToolBinary(
-  name: string,
-  opts: {
-    override?: string
-    candidates?: string[]
-    managedDirs?: string[]
-    env?: NodeJS.ProcessEnv
-    platform?: NodeJS.Platform
-  } = {}
+	name: string,
+	opts: {
+		override?: string;
+		candidates?: string[];
+		managedDirs?: string[];
+		env?: NodeJS.ProcessEnv;
+		platform?: NodeJS.Platform;
+	} = {}
 ): string | null {
-  const env = opts.env ?? process.env
-  const platform = opts.platform ?? process.platform
-  if (opts.override && isFile(opts.override)) return opts.override
+	const env = opts.env ?? process.env;
+	const platform = opts.platform ?? process.platform;
+	if (opts.override && isFile(opts.override)) return opts.override;
 
-  const pathDirs = (env.PATH ?? '').split(delimiter).filter(Boolean)
-  const curated = opts.candidates ?? binaryCandidateDirs(platform, env)
-  const managed = opts.managedDirs ?? []
-  const names = nameCandidates(name, platform, env)
+	const pathDirs = (env.PATH ?? "").split(delimiter).filter(Boolean);
+	const curated = opts.candidates ?? binaryCandidateDirs(platform, env);
+	const managed = opts.managedDirs ?? [];
+	const names = nameCandidates(name, platform, env);
 
-  for (const dir of [...pathDirs, ...curated, ...managed]) {
-    if (platform === 'win32') {
-      // Windows is case-insensitive: a `.CMD` PATHEXT entry must match a `gemini.cmd`
-      // shim. A case-sensitive lookup would miss it on a case-sensitive filesystem.
-      const found = firstFileCaseInsensitive(dir, names)
-      if (found) return found
-      continue
-    }
-    for (const candidateName of names) {
-      const candidate = join(dir, candidateName)
-      if (isFile(candidate)) return candidate
-    }
-  }
-  return null
+	for (const dir of [...pathDirs, ...curated, ...managed]) {
+		if (platform === "win32") {
+			// Windows is case-insensitive: a `.CMD` PATHEXT entry must match a `gemini.cmd`
+			// shim. A case-sensitive lookup would miss it on a case-sensitive filesystem.
+			const found = firstFileCaseInsensitive(dir, names);
+			if (found) return found;
+			continue;
+		}
+		for (const candidateName of names) {
+			const candidate = join(dir, candidateName);
+			if (isFile(candidate)) return candidate;
+		}
+	}
+	return null;
 }
 
 /** Windows shim/binary extensions the SDK override filter accepts (spike-A carry-in). */
-const WINDOWS_SHIM_EXTENSIONS = ['.exe', '.cmd', '.ps1', '.bat'] as const
+const WINDOWS_SHIM_EXTENSIONS = [".exe", ".cmd", ".ps1", ".bat"] as const;
 
 /**
  * True when `path` ends in a Windows-executable extension the agentic SDK override
@@ -150,6 +150,6 @@ const WINDOWS_SHIM_EXTENSIONS = ['.exe', '.cmd', '.ps1', '.bat'] as const
  * @returns True for a forwardable Windows shim/binary extension.
  */
 export function isWindowsShimPath(path: string): boolean {
-  const lower = path.toLowerCase()
-  return WINDOWS_SHIM_EXTENSIONS.some((ext) => lower.endsWith(ext))
+	const lower = path.toLowerCase();
+	return WINDOWS_SHIM_EXTENSIONS.some((ext) => lower.endsWith(ext));
 }

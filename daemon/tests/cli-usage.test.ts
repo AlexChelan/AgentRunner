@@ -1,9 +1,8 @@
 import { describe, expect, it } from 'vitest'
 import {
-  run,
-  out,
   BRAND,
-  daemonVersion
+  out,
+  run
 } from './cli-harness'
 
 describe('cli routing - unknown command, --help, --version', () => {

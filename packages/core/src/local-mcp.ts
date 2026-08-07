@@ -1,7 +1,10 @@
-import { createServer, type IncomingMessage, type ServerResponse } from 'node:http'
-import { asSchema, type ToolSet } from 'ai'
-import type { AdapterCapabilities } from '@opencompanion/core-types'
-import type { McpServerSpec } from '@opencompanion/protocol'
+import { createServer } from "node:http";
+import type { IncomingMessage, ServerResponse } from "node:http";
+import { asSchema } from "ai";
+import type { ToolSet } from "ai";
+import type { AdapterCapabilities } from "@agentrunner/core-types";
+import type { McpServerSpec } from "@agentrunner/protocol";
+import { isRecord } from "./runtime/local/is-record";
 
 /**
  * One registered MCP tool's static definition plus its invocation handler. The
@@ -9,19 +12,23 @@ import type { McpServerSpec } from '@opencompanion/protocol'
  * over `tools/list` so the model knows how to call it.
  */
 interface RegisteredToolConfig {
-  /** Human-readable tool description. */
-  description?: string
-  /** The tool's input JSON Schema (already resolved from the AI SDK tool). */
-  inputSchema?: unknown
+	/** Human-readable tool description. */
+	description?: string;
+	/** The tool's input JSON Schema (already resolved from the AI SDK tool). */
+	inputSchema?: unknown;
 }
 
-/** Invokes one registered tool, returning an MCP text-content result. */
+/**
+ * Invokes one registered tool, returning an MCP text-content result. `isError` marks a TOOL failure -
+ * an outcome the model reads and can react to - as opposed to a thrown handler, which MCP turns into a
+ * transport-level `-32603` and the CLI reports as the server itself being broken.
+ */
 type ToolHandler = (
-  args: Record<string, unknown>
-) => Promise<{ content: { type: 'text'; text: string }[] }>
+	args: Record<string, unknown>
+) => Promise<{ content: { type: "text"; text: string }[]; isError?: boolean }>;
 
 /** Routes one HTTP request through the MCP transport. */
-type HttpRequestHandler = (req: IncomingMessage, res: ServerResponse) => void
+type HttpRequestHandler = (req: IncomingMessage, res: ServerResponse) => void;
 
 /**
  * The minimal MCP server surface this bridge depends on, mirroring the
@@ -30,20 +37,20 @@ type HttpRequestHandler = (req: IncomingMessage, res: ServerResponse) => void
  * `@modelcontextprotocol/sdk` server + transport without an unsafe cast.
  */
 export interface McpServerLike {
-  /** Registers one tool by name, with its config and an invocation handler. */
-  registerTool(name: string, config: RegisteredToolConfig, handler: ToolHandler): void
-  /**
-   * Returns the request handler the loopback HTTP listener routes every request to.
-   * Each request is served through its own MCP server + transport, so a coding CLI
-   * that sends more than one `initialize` per run is never rejected.
-   */
-  connect(): Promise<HttpRequestHandler>
-  /** Closes the server and releases its transport (idempotent). */
-  close(): Promise<void>
+	/** Registers one tool by name, with its config and an invocation handler. */
+	registerTool(name: string, config: RegisteredToolConfig, handler: ToolHandler): void;
+	/**
+	 * Returns the request handler the loopback HTTP listener routes every request to.
+	 * Each request is served through its own MCP server + transport, so a coding CLI
+	 * that sends more than one `initialize` per run is never rejected.
+	 */
+	connect(): Promise<HttpRequestHandler>;
+	/** Closes the server and releases its transport (idempotent). */
+	close(): Promise<void>;
 }
 
 /** Builds an MCP server (production uses the real SDK; tests inject a fake). */
-export type McpServerFactory = () => McpServerLike | Promise<McpServerLike>
+export type McpServerFactory = () => McpServerLike | Promise<McpServerLike>;
 
 /**
  * Default MCP server identity when a host does not inject one. Deliberately NEUTRAL (this is
@@ -51,19 +58,14 @@ export type McpServerFactory = () => McpServerLike | Promise<McpServerLike>
  * CLI shows this name to the user (e.g. in `/mcp`), so a host that has its own product name
  * passes it via {@link serveToolsOverHttp}'s `serverName` rather than relying on this fallback.
  */
-export const DEFAULT_MCP_SERVER_NAME = 'companion-tools'
+export const DEFAULT_MCP_SERVER_NAME = "runner-tools";
 
 /** A running local MCP server: the spec to inject plus a disposer. */
 export interface LocalMcpHandle {
-  /** The `http` MCP server spec to thread into an agentic run's `mcpServers`. */
-  spec: McpServerSpec
-  /** Stops the HTTP listener and the MCP server (idempotent, no leak). */
-  close(): Promise<void>
-}
-
-/** Narrows an unknown value to a non-null object record. */
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null
+	/** The `http` MCP server spec to thread into an agentic run's `mcpServers`. */
+	spec: McpServerSpec;
+	/** Stops the HTTP listener and the MCP server (idempotent, no leak). */
+	close(): Promise<void>;
 }
 
 /**
@@ -75,7 +77,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
  * @returns The tool's JSON Schema.
  */
 async function resolveInputSchema(tool: ToolSet[string]): Promise<unknown> {
-  return asSchema(tool.inputSchema).jsonSchema
+	return asSchema(tool.inputSchema).jsonSchema;
 }
 
 /**
@@ -103,73 +105,74 @@ async function resolveInputSchema(tool: ToolSet[string]): Promise<unknown> {
  * @returns A server adapter conforming to {@link McpServerLike}.
  */
 async function defaultServerFactory(serverName: string): Promise<McpServerLike> {
-  const { Server } = await import('@modelcontextprotocol/sdk/server/index.js')
-  const { CallToolRequestSchema, ListToolsRequestSchema } = await import(
-    '@modelcontextprotocol/sdk/types.js'
-  )
-  const { StreamableHTTPServerTransport } = await import(
-    '@modelcontextprotocol/sdk/server/streamableHttp.js'
-  )
-  const tools = new Map<string, { config: RegisteredToolConfig; handler: ToolHandler }>()
+	const { Server } = await import("@modelcontextprotocol/sdk/server/index.js");
+	const { CallToolRequestSchema, ListToolsRequestSchema } =
+		await import("@modelcontextprotocol/sdk/types.js");
+	const { StreamableHTTPServerTransport } =
+		await import("@modelcontextprotocol/sdk/server/streamableHttp.js");
+	const tools = new Map<string, { config: RegisteredToolConfig; handler: ToolHandler }>();
 
-  /** Builds a fresh low-level server whose tools/list + tools/call read the shared registration map. */
-  function buildServer(): InstanceType<typeof Server> {
-    const server = new Server({ name: serverName, version: '1.0.0' }, { capabilities: { tools: {} } })
-    server.setRequestHandler(ListToolsRequestSchema, () => ({
-      tools: [...tools.entries()].map(([name, { config }]) => ({
-        name,
-        ...(config.description !== undefined ? { description: config.description } : {}),
-        inputSchema:
-          isRecord(config.inputSchema) && config.inputSchema.type === 'object'
-            ? config.inputSchema
-            : { type: 'object' as const }
-      }))
-    }))
-    server.setRequestHandler(CallToolRequestSchema, async (request) => {
-      const entry = tools.get(request.params.name)
-      if (!entry) {
-        return {
-          content: [{ type: 'text' as const, text: `Unknown tool: ${request.params.name}` }],
-          isError: true
-        }
-      }
-      const args = isRecord(request.params.arguments) ? request.params.arguments : {}
-      return entry.handler(args)
-    })
-    return server
-  }
+	/** Builds a fresh low-level server whose tools/list + tools/call read the shared registration map. */
+	function buildServer(): InstanceType<typeof Server> {
+		const server = new Server(
+			{ name: serverName, version: "1.0.0" },
+			{ capabilities: { tools: {} } }
+		);
+		server.setRequestHandler(ListToolsRequestSchema, () => ({
+			tools: [...tools.entries()].map(([name, { config }]) => ({
+				name,
+				...(config.description !== undefined ? { description: config.description } : {}),
+				inputSchema:
+					isRecord(config.inputSchema) && config.inputSchema.type === "object"
+						? config.inputSchema
+						: { type: "object" as const }
+			}))
+		}));
+		server.setRequestHandler(CallToolRequestSchema, async (request) => {
+			const entry = tools.get(request.params.name);
+			if (!entry) {
+				return {
+					content: [{ type: "text" as const, text: `Unknown tool: ${request.params.name}` }],
+					isError: true
+				};
+			}
+			const args = isRecord(request.params.arguments) ? request.params.arguments : {};
+			return entry.handler(args);
+		});
+		return server;
+	}
 
-  return {
-    registerTool(name, config, handler): void {
-      tools.set(name, { config, handler })
-    },
-    async connect(): Promise<HttpRequestHandler> {
-      return (req, res) => {
-        // Serve every request through its OWN server + stateless transport. A coding CLI may send
-        // more than one `initialize` per run; a stateless transport carries no session so it never
-        // rejects a re-initialize, and the SDK requires a fresh stateless transport per request.
-        void (async () => {
-          const server = buildServer()
-          const transport = new StreamableHTTPServerTransport({
-            sessionIdGenerator: undefined,
-            enableJsonResponse: true
-          })
-          try {
-            await server.connect(transport)
-            await transport.handleRequest(req, res)
-          } catch {
-            if (!res.headersSent) res.writeHead(500).end()
-          } finally {
-            await transport.close().catch(() => undefined)
-            await server.close().catch(() => undefined)
-          }
-        })()
-      }
-    },
-    async close(): Promise<void> {
-      // Nothing persistent to release: each request owns and disposes its own server + transport.
-    }
-  }
+	return {
+		registerTool(name, config, handler): void {
+			tools.set(name, { config, handler });
+		},
+		async connect(): Promise<HttpRequestHandler> {
+			return (req, res) => {
+				// Serve every request through its OWN server + stateless transport. A coding CLI may send
+				// more than one `initialize` per run; a stateless transport carries no session so it never
+				// rejects a re-initialize, and the SDK requires a fresh stateless transport per request.
+				void (async () => {
+					const server = buildServer();
+					const transport = new StreamableHTTPServerTransport({
+						sessionIdGenerator: undefined,
+						enableJsonResponse: true
+					});
+					try {
+						await server.connect(transport);
+						await transport.handleRequest(req, res);
+					} catch {
+						if (!res.headersSent) res.writeHead(500).end();
+					} finally {
+						await transport.close().catch(() => undefined);
+						await server.close().catch(() => undefined);
+					}
+				})();
+			};
+		},
+		async close(): Promise<void> {
+			// Nothing persistent to release: each request owns and disposes its own server + transport.
+		}
+	};
 }
 
 /**
@@ -193,69 +196,83 @@ async function defaultServerFactory(serverName: string): Promise<McpServerLike> 
  * @returns The injectable spec and a disposer.
  */
 export async function serveToolsOverHttp(
-  tools: ToolSet,
-  makeServer?: McpServerFactory,
-  serverName: string = DEFAULT_MCP_SERVER_NAME
+	tools: ToolSet,
+	makeServer?: McpServerFactory,
+	serverName: string = DEFAULT_MCP_SERVER_NAME
 ): Promise<LocalMcpHandle> {
-  const server = await (makeServer ?? (() => defaultServerFactory(serverName)))()
-  for (const [name, t] of Object.entries(tools)) {
-    const inputSchema = await resolveInputSchema(t)
-    server.registerTool(
-      name,
-      {
-        ...(t.description !== undefined ? { description: t.description } : {}),
-        inputSchema
-      },
-      async (args) => {
-        const out = t.execute
-          ? await t.execute(args, { toolCallId: 'local-mcp', messages: [] })
-          : undefined
-        // Coerce a missing/void result to a stable JSON string. `JSON.stringify(undefined)` is the
-        // value `undefined` (not `"undefined"`), which would leave the text block without its `text`
-        // field over MCP; `out ?? null` yields `"null"` so the content is always a valid string.
-        const text = typeof out === 'string' ? out : JSON.stringify(out ?? null)
-        return { content: [{ type: 'text', text }] }
-      }
-    )
-  }
+	const server = await (makeServer ?? (() => defaultServerFactory(serverName)))();
+	for (const [name, t] of Object.entries(tools)) {
+		const inputSchema = await resolveInputSchema(t);
+		server.registerTool(
+			name,
+			{
+				...(t.description !== undefined ? { description: t.description } : {}),
+				inputSchema
+			},
+			async (args) => {
+				try {
+					const out = t.execute
+						? await t.execute(args, { toolCallId: "local-mcp", messages: [] })
+						: undefined;
+					// Coerce a missing/void result to a stable JSON string. `JSON.stringify(undefined)` is the
+					// value `undefined` (not `"undefined"`), which would leave the text block without its `text`
+					// field over MCP; `out ?? null` yields `"null"` so the content is always a valid string.
+					const text = typeof out === "string" ? out : JSON.stringify(out ?? null);
+					return { content: [{ type: "text", text }] };
+				} catch (error) {
+					// A tool that throws is a NORMAL event here - these proxy to the backend, so a refused or
+					// timed-out web tool call arrives as an exception. Reported as an `isError` RESULT (the same
+					// shape the unknown-tool branch returns), the model sees why and can retry or route around
+					// it; left to escape, MCP would turn it into a `-32603` protocol error the model never sees
+					// the reason for and the CLI blames on the whole server.
+					return {
+						content: [
+							{ type: "text", text: error instanceof Error ? error.message : String(error) }
+						],
+						isError: true
+					};
+				}
+			}
+		);
+	}
 
-  const handleRequest = await server.connect()
-  // Per-run unguessable path segment + Host allowlist. Loopback bind alone still
-  // exposes the tools to ANY local process; requiring a 128-bit token in the URL
-  // means another process would have to guess it, and the Host check blocks the
-  // browser DNS-rebinding vector (a rebound name arrives with a foreign Host).
-  const token = crypto.randomUUID()
-  let port = 0
-  const http = createServer((req, res) => {
-    const host = req.headers.host
-    // Accept ONLY the exact `127.0.0.1:port` the server binds and advertises. A
-    // `localhost:port` Host never arrives from the real client (the spec URL uses
-    // the literal IP), and accepting it would widen the DNS-rebinding surface a
-    // `localhost`-resolving rebind could exploit.
-    const hostOk = host === `127.0.0.1:${port}`
-    const pathOk = (req.url ?? '').startsWith(`/${token}/`)
-    if (!hostOk || !pathOk) {
-      res.writeHead(404).end()
-      return
-    }
-    handleRequest(req, res)
-  })
-  port = await new Promise<number>((resolve, reject) => {
-    http.on('error', reject)
-    http.listen(0, '127.0.0.1', () => {
-      const address = http.address()
-      if (address && typeof address === 'object') resolve(address.port)
-      else reject(new Error('Failed to bind local MCP server'))
-    })
-  })
+	const handleRequest = await server.connect();
+	// Per-run unguessable path segment + Host allowlist. Loopback bind alone still
+	// exposes the tools to ANY local process; requiring a 128-bit token in the URL
+	// means another process would have to guess it, and the Host check blocks the
+	// browser DNS-rebinding vector (a rebound name arrives with a foreign Host).
+	const token = crypto.randomUUID();
+	let port = 0;
+	const http = createServer((req, res) => {
+		const host = req.headers.host;
+		// Accept ONLY the exact `127.0.0.1:port` the server binds and advertises. A
+		// `localhost:port` Host never arrives from the real client (the spec URL uses
+		// the literal IP), and accepting it would widen the DNS-rebinding surface a
+		// `localhost`-resolving rebind could exploit.
+		const hostOk = host === `127.0.0.1:${port}`;
+		const pathOk = (req.url ?? "").startsWith(`/${token}/`);
+		if (!hostOk || !pathOk) {
+			res.writeHead(404).end();
+			return;
+		}
+		handleRequest(req, res);
+	});
+	port = await new Promise<number>((resolve, reject) => {
+		http.on("error", reject);
+		http.listen(0, "127.0.0.1", () => {
+			const address = http.address();
+			if (address && typeof address === "object") resolve(address.port);
+			else reject(new Error("Failed to bind local MCP server"));
+		});
+	});
 
-  return {
-    spec: { type: 'http', url: `http://127.0.0.1:${port}/${token}/mcp` },
-    close: async () => {
-      await server.close().catch(() => undefined)
-      await new Promise<void>((resolve) => http.close(() => resolve()))
-    }
-  }
+	return {
+		spec: { type: "http", url: `http://127.0.0.1:${port}/${token}/mcp` },
+		close: async () => {
+			await server.close().catch(() => undefined);
+			await new Promise<void>((resolve) => http.close(() => resolve()));
+		}
+	};
 }
 
 /**
@@ -271,9 +288,9 @@ export async function serveToolsOverHttp(
  * @returns True when a local MCP server should be served for this run.
  */
 export function shouldServeLocalTools(capabilities: AdapterCapabilities, tools: ToolSet): boolean {
-  return (
-    capabilities.kind === 'agentic' &&
-    capabilities.httpMcp === true &&
-    Object.keys(tools).length > 0
-  )
+	return (
+		capabilities.kind === "agentic" &&
+		capabilities.httpMcp === true &&
+		Object.keys(tools).length > 0
+	);
 }

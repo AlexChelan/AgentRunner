@@ -1,6 +1,6 @@
 # Verify a release
 
-Every OpenCompanion release publishes, alongside the per-platform `opencompanion-<os>-<arch>.tar.gz`
+Every AgentRunner release publishes, alongside the per-platform `agentrunner-<os>-<arch>.tar.gz`
 artifacts, a `SHA256SUMS` file and a build provenance attestation. Verifying both proves the
 artifact you downloaded is the exact, unmodified output of this repository's public build, not
 something swapped in transit or on the release page.
@@ -31,7 +31,7 @@ The release artifacts are published with a signed provenance attestation that ti
 GitHub Actions workflow and commit that built them. Verify it with the GitHub CLI:
 
 ```sh
-gh attestation verify opencompanion-<os>-<arch>.tar.gz --repo AlexChelan/OpenCompanion
+gh attestation verify agentrunner-<os>-<arch>.tar.gz --repo AlexChelan/AgentRunner
 ```
 
 A successful check confirms the artifact was built by this repository's release workflow from a

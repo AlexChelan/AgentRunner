@@ -50,7 +50,7 @@ export interface UpdateCheck {
 
 /**
  * Whether a release channel is configured. An empty (or whitespace-only) release base means no releases
- * repository has been set up yet - a freshly-exported companion that has not published - so update checks
+ * repository has been set up yet - a freshly-exported runner that has not published - so update checks
  * are a friendly no-op rather than a failed fetch against a malformed URL.
  *
  * @param releaseBase - The resolved release download base.
@@ -81,12 +81,12 @@ function versionsDir(installDir: string): string {
   return join(installDir, 'versions')
 }
 
-/** The per-version launcher basename for a platform (`opencompanion` on POSIX, `opencompanion.cmd` on Windows). */
+/** The per-version launcher basename for a platform (`agentrunner` on POSIX, `agentrunner.cmd` on Windows). */
 function launcherName(platform: NodeJS.Platform): string {
   return platform === 'win32' ? `${BRAND.binary}.cmd` : BRAND.binary
 }
 
-/** The release artifact name for a platform/arch (e.g. `opencompanion-linux-x64.tar.gz`). */
+/** The release artifact name for a platform/arch (e.g. `agentrunner-linux-x64.tar.gz`). */
 function artifactName(platform: NodeJS.Platform, arch: string): string {
   const os = platform === 'win32' ? 'win32' : platform === 'darwin' ? 'darwin' : 'linux'
   return `${BRAND.binary}-${os}-${arch}.tar.gz`

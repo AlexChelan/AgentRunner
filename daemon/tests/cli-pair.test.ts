@@ -1,16 +1,18 @@
 import { describe, expect, it } from 'vitest'
 import { writeFileSync } from 'node:fs'
 import { join } from 'node:path'
+import { DEFAULT_CLIENT_ID } from '@agentrunner/core/runtime/backend-url'
 import {
-  run,
-  out,
-  tempAppData,
-  pairBackend,
-  createStateStore,
   BRAND,
+  createStateStore,
+  out,
+  pairBackend,
+  run,
+  runEnroll,
   runPair,
   runPairWithToken,
-  runUnpair
+  runUnpair,
+  tempAppData
 } from './cli-harness'
 
 describe('cli routing - pair / unpair / backends', () => {
@@ -21,9 +23,9 @@ describe('cli routing - pair / unpair / backends', () => {
   })
 
   it('"pair" with no --url and nothing paired requires an explicit backend', async () => {
-    // Pairing DEFINES the backend URL, so with no --url and an empty pairing set the companion
+    // Pairing DEFINES the backend URL, so with no --url and an empty pairing set the runner
     // (which no longer carries a baked-in default) must refuse rather than invent one.
-    const solo = tempAppData('pairreq')
+    tempAppData('pairreq')
     await run(['pair'])
     expect(runPair).not.toHaveBeenCalled()
     expect(out.stdout).toContain('Not paired with any backend')
@@ -31,9 +33,9 @@ describe('cli routing - pair / unpair / backends', () => {
   })
 
   it('passes --url and --client-id through to runPair', async () => {
-    await run(['pair', '--url', 'https://b.example', '--client-id', 'companion'])
+    await run(['pair', '--url', 'https://b.example', '--client-id', 'runner'])
     expect(runPair).toHaveBeenCalledWith(
-      { backendUrl: 'https://b.example', clientId: 'companion' },
+      { backendUrl: 'https://b.example', clientId: 'runner' },
       expect.anything()
     )
   })
@@ -46,6 +48,24 @@ describe('cli routing - pair / unpair / backends', () => {
     )
     expect(runPair).not.toHaveBeenCalled()
     expect(out.exitCode).toBe(0)
+  })
+
+  it('routes "pair --enroll <code>" to runEnroll (never the interactive runPair) and exits 0', async () => {
+    // The recovery path for a container whose boot-time redemption failed: a fresh one-time code is
+    // redeemed with zero terminal interaction, so the device-authorization flow must never start.
+    await run(['pair', '--url', 'https://b.example', '--enroll', 'ENROLL_DEVICE_CODE'])
+    expect(runEnroll).toHaveBeenCalledWith(
+      { backendUrl: 'https://b.example', enrollCode: 'ENROLL_DEVICE_CODE', clientId: DEFAULT_CLIENT_ID },
+      expect.anything()
+    )
+    expect(runPair).not.toHaveBeenCalled()
+    expect(out.exitCode).toBe(0)
+  })
+
+  it('"pair --enroll" exits 1 when the enrollment code is refused', async () => {
+    runEnroll.mockResolvedValueOnce({ ok: false })
+    await run(['pair', '--url', 'https://b.example', '--enroll', 'STALE_CODE'])
+    expect(out.exitCode).toBe(1)
   })
 
   it('routes "unpair" to runUnpair', async () => {
@@ -76,7 +96,7 @@ describe('cli routing - pair / unpair / backends', () => {
   })
 
   it('"backends" prints the pair hint when nothing is paired', async () => {
-    const solo = tempAppData('backends-empty')
+    tempAppData('backends-empty')
     await run(['backends'])
     expect(out.stdout).toContain(`${BRAND.binary} pair`)
   })

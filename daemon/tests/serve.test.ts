@@ -1,28 +1,32 @@
+import { Buffer } from 'node:buffer'
 import { existsSync, mkdtempSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import type { AgentRuntimeRegistry, RuntimeToolAdapter } from '@opencompanion/core'
-import type { AdapterCapabilities, AuthStatus } from '@opencompanion/core'
+import type { AdapterCapabilities, AgentRuntimeRegistry, AuthStatus, RuntimeToolAdapter  } from '@agentrunner/core'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { accountScope } from '@opencompanion/core/runtime/account-scope'
-import type { AuthHealthMonitor, AuthHealthMonitorDeps } from '@opencompanion/core/runtime/auth-health'
-import * as backendSessionModule from '@opencompanion/core/runtime/backend-session'
+import { accountScope } from '@agentrunner/core/runtime/account-scope'
+import type { AuthHealthMonitor, AuthHealthMonitorDeps } from '@agentrunner/core/runtime/auth-health'
+import * as backendSessionModule from '@agentrunner/core/runtime/backend-session'
 import { BRAND } from '../src/brand'
-import { bearerKey } from '@opencompanion/core/runtime/pair'
-import type { StreamOpener } from '@opencompanion/core/runtime/backend-http'
-import type { HttpClient } from '@opencompanion/core/runtime/stream-client'
-import { createRecordingHttp, streamFrom, type RecordedRequest } from './support/fake-backend'
-import { startDaemon, type ServeDeps } from '../src/serve'
+import { bearerKey } from '@agentrunner/core/runtime/pair'
+import type { StreamOpener } from '@agentrunner/core/runtime/backend-http'
+import type { HttpClient } from '@agentrunner/core/runtime/stream-client'
+import { createRecordingHttp,  streamFrom } from './support/fake-backend'
+import type {RecordedRequest} from './support/fake-backend';
+import {  startDaemon } from '../src/serve'
+import type {ServeDeps} from '../src/serve';
 import * as autoUpdateModule from '../src/update/auto-update'
 import type { UpdaterDeps } from '../src/update/updater'
-import { createFileSecretStore, type SecretStore } from '@opencompanion/core/runtime/storage/secret-store'
-import { createStateStore, type StateStore } from '@opencompanion/core/runtime/storage/state-store'
+import { createFileSecretStore  } from '@agentrunner/core/runtime/storage/secret-store'
+import type {SecretStore} from '@agentrunner/core/runtime/storage/secret-store';
+import { createStateStore  } from '@agentrunner/core/runtime/storage/state-store'
+import type {StateStore} from '@agentrunner/core/runtime/storage/state-store';
 
 const BACKEND = 'https://buyer.example'
 
 /** A fresh app-data root + real (temp-backed) state + secret stores. */
 function fixtures(): { appDataRoot: string; state: StateStore; secrets: SecretStore } {
-  const appDataRoot = mkdtempSync(join(tmpdir(), 'companion-serve-'))
+  const appDataRoot = mkdtempSync(join(tmpdir(), 'runner-serve-'))
   const state = createStateStore({ cwd: appDataRoot })
   const secrets = createFileSecretStore({
     dir: join(appDataRoot, 'secrets'),
@@ -37,7 +41,7 @@ function fakeHttp(): { http: HttpClient; openStream: StreamOpener; calls: Record
     if (recorded.url.endsWith('/connect')) {
       return {
         status: 200,
-        json: async () => ({ companionId: 'u1:d1', wireToken: 'wire-token' })
+        json: async () => ({ runnerId: 'u1:d1', wireToken: 'wire-token' })
       }
     }
     if (recorded.url.includes('/poll')) {
@@ -174,8 +178,8 @@ describe('startDaemon (serve)', () => {
     expect(startup).toContain(BACKEND)
     expect(startup).toContain(BACKEND2)
     // Both backends were connected: one session per backend, each against its own origin.
-    expect(calls.some((c) => c.url === `${BACKEND}/companion/connect`)).toBe(true)
-    expect(calls.some((c) => c.url === `${BACKEND2}/companion/connect`)).toBe(true)
+    expect(calls.some((c) => c.url === `${BACKEND}/runner/connect`)).toBe(true)
+    expect(calls.some((c) => c.url === `${BACKEND2}/runner/connect`)).toBe(true)
     await daemon?.stop()
   })
 
@@ -302,6 +306,109 @@ describe('startDaemon (serve)', () => {
     await reboot?.stop()
   })
 
+  it('redeems an --enroll code BEFORE the no-backend refusal, then serves the backend it just paired', async () => {
+    // The container path end to end: a fresh volume owns no pairing, so the daemon would refuse to boot.
+    // The one-time enrollment code is redeemed first, and the recomputed pairing set is what boot reads.
+    const { appDataRoot, state, secrets } = fixtures()
+    vi.stubGlobal('fetch', async (url: string) => {
+      if (url.endsWith('/auth/get-session')) {
+        return { ok: true, status: 200, json: async () => ({ user: { id: 'u1' } }) }
+      }
+      if (url.endsWith('/auth/device/token')) {
+        return { ok: true, status: 200, json: async () => ({ access_token: 'enrolled-bearer' }) }
+      }
+      throw new Error(`unexpected request to ${url}`)
+    })
+    const { http, calls } = fakeHttp()
+    const lines: string[] = []
+    const daemon = await startDaemon({
+      appDataRoot,
+      state,
+      secrets,
+      filterUrl: BACKEND,
+      enrollCode: 'ENROLL_DEVICE_CODE',
+      // A LIVE liveness probe: the lock taken for the redemption must be HELD into the rest of boot. A
+      // second acquire would find this boot's own live pid file and refuse ("already running"), so a
+      // daemon that boots here is one that took the single-instance lock exactly once.
+      isAlive: () => true,
+      registry: { getAdapters: () => [], getAdapter: () => undefined, requireAdapter: () => { throw new Error('x') } },
+      http,
+      openStream: streamFrom(http),
+      write: (line) => void lines.push(line)
+    })
+    expect(daemon).not.toBeNull()
+    // The pairing landed under the enrolled account's scope, bearer included, exactly as a hand-pair would.
+    const scope = accountScope(BACKEND, 'u1')
+    const after = createStateStore({ cwd: appDataRoot })
+    expect(after.getPairedBackend(scope)?.deviceId).toBe(state.getDeviceId())
+    expect(secrets.get(bearerKey(scope))).toBe('enrolled-bearer')
+    expect(lines.join('')).not.toContain('Not paired with')
+    await tick()
+    expect(calls.some((c) => c.url === `${BACKEND}/runner/connect`)).toBe(true)
+    await daemon?.stop()
+  })
+
+  it('a REFUSED --enroll code leaves the daemon refusing to boot without throwing, lock released', async () => {
+    // Redemption is best-effort on the boot path: a stale/expired code must never crash the container
+    // (the restart loop would burn the code's whole TTL), and it must never leave the single-instance
+    // lock behind - `docker exec … pair --enroll <new>` plus a restart has to win.
+    const { appDataRoot, state, secrets } = fixtures()
+    vi.stubGlobal('fetch', async (url: string) => {
+      if (url.endsWith('/auth/device/token')) {
+        return { ok: false, status: 400, json: async () => ({ error: 'expired_token' }) }
+      }
+      throw new Error(`unexpected request to ${url}`)
+    })
+    const { http } = fakeHttp()
+    const lines: string[] = []
+    const daemon = await startDaemon({
+      appDataRoot,
+      state,
+      secrets,
+      filterUrl: BACKEND,
+      enrollCode: 'STALE_DEVICE_CODE',
+      isAlive: () => false,
+      registry: { getAdapters: () => [], getAdapter: () => undefined, requireAdapter: () => { throw new Error('x') } },
+      http,
+      openStream: streamFrom(http),
+      write: (line) => void lines.push(line)
+    })
+    expect(daemon).toBeNull()
+    expect(lines.join('')).toContain('Enrollment failed')
+    expect(lines.join('')).toContain(`Not paired with ${BACKEND}`)
+    expect(createStateStore({ cwd: appDataRoot }).listPairedBackends()).toEqual([])
+    expect(existsSync(join(appDataRoot, `${BRAND.binary}.pid`))).toBe(false)
+  })
+
+  it('never redeems an --enroll code while ANOTHER live daemon holds the lock (the code is one-shot)', async () => {
+    // Redemption spends the code, so it must sit INSIDE the single-instance lock: two containers racing
+    // one volume would otherwise have one burn the code and the other find it spent.
+    const { appDataRoot, state, secrets } = fixtures()
+    writeFileSync(join(appDataRoot, `${BRAND.binary}.pid`), String(process.pid))
+    const redemptions: string[] = []
+    vi.stubGlobal('fetch', async (url: string) => {
+      redemptions.push(url)
+      throw new Error('the lock holder owns the enrollment code')
+    })
+    const { http } = fakeHttp()
+    const lines: string[] = []
+    const daemon = await startDaemon({
+      appDataRoot,
+      state,
+      secrets,
+      filterUrl: BACKEND,
+      enrollCode: 'ENROLL_DEVICE_CODE',
+      isAlive: () => true,
+      registry: { getAdapters: () => [], getAdapter: () => undefined, requireAdapter: () => { throw new Error('x') } },
+      http,
+      openStream: streamFrom(http),
+      write: (line) => void lines.push(line)
+    })
+    expect(daemon).toBeNull()
+    expect(lines.join('')).toContain('already running')
+    expect(redemptions).toEqual([])
+  })
+
   it('refuses to boot when another instance holds the single-instance lock', async () => {
     const { deps } = bootDeps()
     // The first boot wins and HOLDS the lock (no stop). A second boot on the same dir with a live
@@ -325,9 +432,9 @@ describe('startDaemon (serve)', () => {
     expect(connect?.headers.authorization).toBe('Bearer bearer-xyz')
     expect(JSON.parse(connect?.body ?? '{}').deviceId).toBe(state.getDeviceId())
     expect(JSON.stringify(calls)).not.toContain('secret')
-    // The daemon appends the companion path to the API base it was paired with (relative, not a
+    // The daemon appends the runner path to the API base it was paired with (relative, not a
     // hardcoded /api on the origin), so it reaches the transport wherever the API is mounted.
-    expect(connect?.url).toBe(`${BACKEND}/companion/connect`)
+    expect(connect?.url).toBe(`${BACKEND}/runner/connect`)
     await daemon?.stop()
   })
 
@@ -342,7 +449,7 @@ describe('startDaemon (serve)', () => {
   })
 
   it('reports a mid-session connect: a SEPARATE store write reaches the next poll (fresh reads)', async () => {
-    // Boot with NO connection recorded, then simulate a separate `companion connect` process writing
+    // Boot with NO connection recorded, then simulate a separate `runner connect` process writing
     // the state file after the daemon is already running. The daemon reads connections through a fresh
     // store per call, so the new connection must ride the NEXT poll's `connections` query - proving the
     // captured-store staleness bug is fixed and an external connect propagates without restarting serve.
@@ -354,7 +461,7 @@ describe('startDaemon (serve)', () => {
       if (url.endsWith('/connect')) {
         // The daemon's 1s floor is the fastest cadence it will honor (it clamps anything smaller), so
         // advance past a full 1s window below to make the second poll fire.
-        return { status: 200, json: async () => ({ companionId: 'u1:d1', wireToken: 'wt', pollIntervalMs: 1000 }) }
+        return { status: 200, json: async () => ({ runnerId: 'u1:d1', wireToken: 'wt', pollIntervalMs: 1000 }) }
       }
       if (url.includes('/poll')) {
         pollUrls.push(url)
@@ -379,8 +486,11 @@ describe('startDaemon (serve)', () => {
     expect(pollUrls.length).toBeGreaterThan(0)
     expect(new URL(pollUrls[0]!).searchParams.get('connections')).toBe('[]')
     // A separate process connects a CLI (a fresh store writing the SAME state file the daemon captured).
+    // The sample CLI is deliberately NOT the sandbox-bound one: a reported snapshot is narrowed to what
+    // THIS host can dispatch with, and codex is withheld wherever its sandbox is not OS-enforced (see the
+    // pinned-platform pair below), which would make this propagation assertion pass or fail by machine.
     createStateStore({ cwd: appDataRoot }).upsertConnection(BACKEND, {
-      toolId: 'codex',
+      toolId: 'claude-code',
       source: 'reused',
       authHealth: 'healthy'
     })
@@ -391,9 +501,82 @@ describe('startDaemon (serve)', () => {
     await vi.advanceTimersByTimeAsync(2100)
     const last = pollUrls[pollUrls.length - 1]!
     expect(JSON.parse(new URL(last).searchParams.get('connections') ?? '[]')).toEqual([
-      { toolId: 'codex', authHealth: 'healthy' }
+      { toolId: 'claude-code', authHealth: 'healthy' }
     ])
     await daemon?.stop()
+  })
+
+  /**
+   * The tool ids a booted daemon advertised on its first poll, with `process.platform` pinned for the
+   * WHOLE boot.
+   *
+   * The pin has to outlive every `await`: the connections projection is read asynchronously, off the
+   * poll, so a pin that lifts at the first suspension would measure the REAL machine and read as a pass
+   * on any host that happens to agree with it. `win32` is the deterministic unconfined host - it is
+   * refused without probing for `bwrap`, so this asserts the same thing on a Linux CI box whether or not
+   * bubblewrap is installed there.
+   */
+  async function polledConnections(
+    platform: NodeJS.Platform,
+    over: Partial<ServeDeps> = {}
+  ): Promise<string[]> {
+    const real = Object.getOwnPropertyDescriptor(process, 'platform')
+    Object.defineProperty(process, 'platform', { value: platform, configurable: true })
+    try {
+      const { appDataRoot, state, secrets } = fixtures()
+      state.upsertPairedBackend(BACKEND, { backendUrl: BACKEND, deviceId: state.getDeviceId(), userId: 'u1' })
+      secrets.set(bearerKey(BACKEND), 'bearer-xyz')
+      for (const toolId of ['claude-code', 'codex']) {
+        state.upsertConnection(BACKEND, { toolId, source: 'reused', authHealth: 'healthy' })
+      }
+      const pollUrls: string[] = []
+      const http: HttpClient = async (url) => {
+        if (url.endsWith('/connect')) {
+          return { status: 200, json: async () => ({ runnerId: 'u1:d1', wireToken: 'wt' }) }
+        }
+        if (url.includes('/poll')) {
+          pollUrls.push(url)
+          return { status: 200, json: async () => ({ runs: [], cancel: [] }) }
+        }
+        return { status: 200, json: async () => ({ cancel: [] }) }
+      }
+      const daemon = await startDaemon({
+        appDataRoot,
+        state,
+        secrets,
+        isAlive: () => false,
+        registry: { getAdapters: () => [], getAdapter: () => undefined, requireAdapter: () => { throw new Error('x') } },
+        http,
+        openStream: streamFrom(http),
+        write: () => undefined,
+        ...over
+      })
+      await tick()
+      await daemon?.stop()
+      const reported = JSON.parse(
+        new URL(pollUrls[0] ?? `${BACKEND}/poll`).searchParams.get('connections') ?? '[]'
+      ) as { toolId: string }[]
+      return reported.map((connection) => connection.toolId)
+    } finally {
+      if (real) Object.defineProperty(process, 'platform', real)
+    }
+  }
+
+  // A dispatched codex run is REFUSED where its sandbox is not OS-enforced, so the daemon withholds the
+  // CLI rather than offering a picker entry whose every turn fails. Asserted THROUGH startDaemon because
+  // the profile is assembled here and handed to each session: this is what makes every other assertion in
+  // this suite host-dependent if it names codex, which is exactly how two of them passed on macOS and
+  // failed on a Linux CI box for weeks.
+  it('withholds codex from its poll on a host that cannot confine a dispatched run', async () => {
+    expect(await polledConnections('win32')).toEqual(['claude-code'])
+  })
+
+  // The CONTAINED daemon is the other arm, and the one only startDaemon can get wrong: the container IS
+  // the boundary, so codex is dispatchable again on the very host that withholds it above - but only
+  // because serve assembles the containment and hands it to every session. Dropping that hand-off would
+  // silently strip a containerized fleet's codex from every picker.
+  it('advertises codex again when the daemon is contained (the container is the boundary)', async () => {
+    expect(await polledConnections('win32', { contained: true })).toEqual(['claude-code', 'codex'])
   })
 
   it('creates the local audit log directory under the app-data root (every run is auditable)', async () => {
@@ -462,13 +645,14 @@ describe('startDaemon (serve)', () => {
     // A poll delivers ONE connect instruction for an authed CLI. The daemon must hand it to the connect
     // runner, which drives the (real) headless connect against the fake adapter, records the connection,
     // and posts the mapped result back through the poll client - proving runner + client + registry are
-    // wired together inside startDaemon (not just unit-tested in isolation).
-    const instruction = { requestId: 'req-1', toolId: 'codex', install: false }
+    // wired together inside startDaemon (not just unit-tested in isolation). The CLI is the host-neutral
+    // one for the same reason the mid-session test uses it: the echoed snapshot is host-narrowed.
+    const instruction = { requestId: 'req-1', toolId: 'claude-code', install: false }
     const { http, calls } = createRecordingHttp((recorded) => {
       if (recorded.url.endsWith('/connect')) {
         return {
           status: 200,
-          json: async () => ({ companionId: 'u1:d1', wireToken: 'wire-token' })
+          json: async () => ({ runnerId: 'u1:d1', wireToken: 'wire-token' })
         }
       }
       if (recorded.url.includes('/poll')) {
@@ -476,13 +660,13 @@ describe('startDaemon (serve)', () => {
       }
       return { status: 200, json: async () => ({ cancel: [] }) }
     })
-    const registry = fakeRegistry({ codex: fakeAdapter('codex', true) })
+    const registry = fakeRegistry({ 'claude-code': fakeAdapter('claude-code', true) })
     const { deps } = bootDeps({ http, registry })
     const daemon = await startDaemon(deps)
     expect(daemon).not.toBeNull()
     await tick()
     await drainRunner()
-    const result = calls.find((c) => c.url.endsWith('/companion/connects/req-1/result'))
+    const result = calls.find((c) => c.url.endsWith('/runner/connects/req-1/result'))
     expect(result).toBeDefined()
     expect(result?.method).toBe('POST')
     expect(result?.headers.authorization).toBe('Bearer wire-token')
@@ -492,7 +676,7 @@ describe('startDaemon (serve)', () => {
       connections: Array<{ toolId: string; authHealth: string }>
     }
     expect(body.status).toBe('connected')
-    expect(body.connections).toEqual([{ toolId: 'codex', authHealth: 'healthy' }])
+    expect(body.connections).toEqual([{ toolId: 'claude-code', authHealth: 'healthy' }])
     await daemon?.stop()
   })
 
@@ -520,7 +704,7 @@ describe('startDaemon (serve)', () => {
     const pollUrls: string[] = []
     const http: HttpClient = async (url) => {
       if (url.endsWith('/connect')) {
-        return { status: 200, json: async () => ({ companionId: 'u1:d1', wireToken: 'wt', pollIntervalMs: 10 }) }
+        return { status: 200, json: async () => ({ runnerId: 'u1:d1', wireToken: 'wt', pollIntervalMs: 10 }) }
       }
       if (url.includes('/poll')) {
         pollUrls.push(url)
@@ -582,7 +766,7 @@ describe('startDaemon (serve)', () => {
       registry: { getAdapters: () => [], getAdapter: () => undefined, requireAdapter: () => { throw new Error('x') } },
       http: async (url) => {
         if (url.endsWith('/connect')) {
-          return { status: 200, json: async () => ({ companionId: 'u1:d1', wireToken: 'wt', pollIntervalMs: 10 }) }
+          return { status: 200, json: async () => ({ runnerId: 'u1:d1', wireToken: 'wt', pollIntervalMs: 10 }) }
         }
         if (url.includes('/poll')) return { status: 200, json: async () => ({ runs: [], cancel: [] }) }
         return { status: 200, json: async () => ({ cancel: [] }) }

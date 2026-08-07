@@ -12,13 +12,14 @@ import {
   pruneVersions,
   readCurrent,
   rollbackTarget,
-  stageVersion,
-  type UpdaterDeps
+  stageVersion
+  
 } from '../src/update/updater'
+import type {UpdaterDeps} from '../src/update/updater';
 
 /** A fresh temp install root under the OS temp dir. */
 function freshInstall(): string {
-  return mkdtempSync(join(tmpdir(), 'opencompanion-update-'))
+  return mkdtempSync(join(tmpdir(), 'agentrunner-update-'))
 }
 
 /** Writes the `current` pointer directly (POSIX form, trailing newline), as an installed daemon would. */
@@ -311,9 +312,9 @@ describe('pruneVersions', () => {
 
 describe('hasReleaseBase', () => {
   it('is true for a configured base and false for an empty or whitespace one', () => {
-    // An empty base is how a freshly-exported companion signals it has no releases repo yet, so the
+    // An empty base is how a freshly-exported runner signals it has no releases repo yet, so the
     // update commands and the daemon's auto-check treat it as a friendly no-op rather than a failed fetch.
-    expect(hasReleaseBase('https://github.com/acme/companion/releases/latest/download')).toBe(true)
+    expect(hasReleaseBase('https://github.com/acme/runner/releases/latest/download')).toBe(true)
     expect(hasReleaseBase('')).toBe(false)
     expect(hasReleaseBase('   ')).toBe(false)
   })

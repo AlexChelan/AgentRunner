@@ -1,20 +1,20 @@
 import { describe, expect, it } from 'vitest'
 import {
-  run,
+  createStateStore,
   out,
-  tempAppData,
-  createStateStore
+  run,
+  tempAppData
 } from './cli-harness'
 
 describe('cli routing - limits show / set', () => {
   it('"limits show" prints the current concurrent-run cap (default 2)', async () => {
-    const solo = tempAppData('limshow')
+    tempAppData('limshow')
     await run(['limits', 'show'])
     expect(out.stdout).toContain('max concurrent runs: 2')
   })
 
   it('"limits" with no subcommand shows the cap', async () => {
-    const solo = tempAppData('limbare')
+    tempAppData('limbare')
     await run(['limits'])
     expect(out.stdout).toContain('max concurrent runs: 2')
   })
@@ -46,7 +46,7 @@ describe('cli routing - limits show / set', () => {
   })
 
   it('"limits set" without the flag is a friendly error', async () => {
-    const solo = tempAppData('limnoflag')
+    tempAppData('limnoflag')
     await run(['limits', 'set'])
     expect(out.exitCode).toBe(1)
     expect(out.stdout).toContain('--max-concurrent-runs')

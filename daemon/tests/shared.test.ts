@@ -2,14 +2,15 @@ import { mkdtempSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { describe, expect, it } from 'vitest'
-import { accountScope } from '@opencompanion/core/runtime/account-scope'
+import { accountScope } from '@agentrunner/core/runtime/account-scope'
 import { positionalArgs, resolveCommandScope } from '../src/commands/shared'
-import { LOCAL_SCOPE } from '@opencompanion/core/runtime/local/scope'
-import { createStateStore, type StateStore } from '@opencompanion/core/runtime/storage/state-store'
+import { LOCAL_SCOPE } from '@agentrunner/core/runtime/local/scope'
+import { createStateStore  } from '@agentrunner/core/runtime/storage/state-store'
+import type {StateStore} from '@agentrunner/core/runtime/storage/state-store';
 
 /** A fresh temp-backed state store under the OS temp root. */
 function freshState(): StateStore {
-  return createStateStore({ cwd: mkdtempSync(join(tmpdir(), 'companion-shared-')) })
+  return createStateStore({ cwd: mkdtempSync(join(tmpdir(), 'runner-shared-')) })
 }
 
 describe('positionalArgs', () => {

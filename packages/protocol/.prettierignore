@@ -1,0 +1,9 @@
+# Frozen wire captures - see the root .prettierignore for the full reasoning.
+#
+# This file exists because the root .prettierignore ALONE does not protect them: Prettier resolves
+# .prettierignore relative to the CURRENT WORKING DIRECTORY, not the repo root. `pnpm format` runs
+# from the root and is covered, but a per-package run (`cd packages/runner-protocol && prettier
+# --write .`, which is how these got reformatted in the first place, and the shape every package
+# `lint`/format script takes) never sees the root file. Verified: without this, such a run
+# re-flattens all 133 frozen fixtures.
+tests/fixtures/

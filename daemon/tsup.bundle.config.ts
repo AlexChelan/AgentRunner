@@ -13,7 +13,7 @@ export default defineConfig({
   entry: ['./src/cli.ts'],
   format: ['esm'],
   // Inject the daemon build version so the shipped binary's `daemonVersion()` reports the real semver.
-  define: { __OPENCOMPANION_VERSION__: JSON.stringify(pkg.version) },
+  define: { __AGENTRUNNER_VERSION__: JSON.stringify(pkg.version) },
   noExternal: [/.*/],
   external: ['@anthropic-ai/claude-agent-sdk'],
   outDir: 'dist-bundle',

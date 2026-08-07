@@ -1,5 +1,5 @@
-import { createHash } from 'node:crypto'
-import { parseAccountScope } from './account-scope'
+import { createHash } from "node:crypto";
+import { parseAccountScope } from "./account-scope";
 
 /**
  * Derives a stable, filesystem-safe key for an account scope (or a legacy bare backend URL), used to
@@ -27,19 +27,19 @@ import { parseAccountScope } from './account-scope'
  * @throws When the scope's backend URL is not a valid absolute URL.
  */
 export function backendKey(scope: string): string {
-  const parsed = parseAccountScope(scope)
-  const url = new URL(parsed?.backendUrl ?? scope)
-  const path = url.pathname.replace(/\/+$/, '')
-  const normalized = parsed
-    ? `${url.protocol}//${url.host}${path}|${parsed.userId}`
-    : `${url.protocol}//${url.host}${path}`
-  // Cap the readable prefix at 64 chars, then re-strip a trailing dash in case the slice landed
-  // mid-separator (so the `${host}-${digest}` join never yields a `--`).
-  const host = url.hostname
-    .replace(/[^a-z0-9]+/g, '-')
-    .replace(/^-+|-+$/g, '')
-    .slice(0, 64)
-    .replace(/-+$/, '')
-  const digest = createHash('sha256').update(normalized).digest('hex').slice(0, 8)
-  return `${host}-${digest}`
+	const parsed = parseAccountScope(scope);
+	const url = new URL(parsed?.backendUrl ?? scope);
+	const path = url.pathname.replace(/\/+$/, "");
+	const normalized = parsed
+		? `${url.protocol}//${url.host}${path}|${parsed.userId}`
+		: `${url.protocol}//${url.host}${path}`;
+	// Cap the readable prefix at 64 chars, then re-strip a trailing dash in case the slice landed
+	// mid-separator (so the `${host}-${digest}` join never yields a `--`).
+	const host = url.hostname
+		.replace(/[^a-z0-9]+/g, "-")
+		.replace(/^-+|-+$/g, "")
+		.slice(0, 64)
+		.replace(/-+$/, "");
+	const digest = createHash("sha256").update(normalized).digest("hex").slice(0, 8);
+	return `${host}-${digest}`;
 }

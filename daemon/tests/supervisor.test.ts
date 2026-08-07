@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import type { BackendSession } from '@opencompanion/core/runtime/backend-session'
+import type { BackendSession } from '@agentrunner/core/runtime/backend-session'
 import { createSessionSupervisor } from '../src/supervisor'
 
 /** A fake {@link BackendSession} that records its start/stop calls and reports a settable run count. */
@@ -128,7 +128,7 @@ describe('createSessionSupervisor', () => {
     })
     supervisor.reconcile()
     expect(supervisor.running()).toEqual(['https://a.example'])
-    // A separate `companion pair` writes a second backend; the interval reconcile must pick it up.
+    // A separate `runner pair` writes a second backend; the interval reconcile must pick it up.
     urls.push('https://b.example')
     await vi.advanceTimersByTimeAsync(1000)
     expect(supervisor.running().sort()).toEqual(['https://a.example', 'https://b.example'])

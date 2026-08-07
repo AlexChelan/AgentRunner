@@ -1,11 +1,11 @@
 {
-  "name": "opencompanion",
+  "name": "agentrunner",
   "type": "module",
-  "version": "0.2.0",
+  "version": "1.0.0",
   "private": true,
   "main": "dist/cli.js",
   "bin": {
-    "opencompanion": "dist/cli.js"
+    "agentrunner": "dist/cli.js"
   },
   "scripts": {
     "dev": "tsx --env-file-if-exists=../../.env ./src/cli.ts serve --if-paired",
@@ -13,18 +13,20 @@
     "build": "tsup",
     "standalone": "node scripts/build-standalone.mjs",
     "start": "node dist/cli.js",
+    "lint": "eslint --cache .",
     "check-types": "tsc --noEmit",
     "test": "vitest run"
   },
   "dependencies": {
     "@clack/prompts": "^1.3.0",
-    "@opencompanion/core": "workspace:*",
-    "@opencompanion/protocol": "workspace:*",
+    "@agentrunner/core": "workspace:*",
+    "@agentrunner/protocol": "workspace:*",
     "picocolors": "^1.1.1",
     "zod": "4.4.3"
   },
   "devDependencies": {
     "@types/node": "25.6.0",
+    "eslint": "^10.2.0",
     "tsup": "^8.5.1",
     "tsx": "4.21.0",
     "typescript": "6.0.3",

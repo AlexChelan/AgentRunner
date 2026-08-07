@@ -3,7 +3,7 @@ const SEMVER_CORE = /^\d+\.\d+\.\d+/
 
 /**
  * Parses a version's leading numeric triple, tolerating (and discarding) any `-pre-release` suffix so
- * `1.2.3-rc.1` reads as `[1, 2, 3]`. Releases are compared by the triple alone: OpenCompanion ships
+ * `1.2.3-rc.1` reads as `[1, 2, 3]`. Releases are compared by the triple alone: AgentRunner ships
  * plain `major.minor.patch` tags, so a suffix (if one ever appears) is informational, not ordering.
  *
  * @param version - The version string to parse.

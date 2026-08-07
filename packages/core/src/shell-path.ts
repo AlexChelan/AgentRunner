@@ -1,6 +1,6 @@
-import { execFileSync } from 'node:child_process'
-import { delimiter, dirname } from 'node:path'
-import { binaryCandidateDirs } from './binaries'
+import { execFileSync } from "node:child_process";
+import { delimiter, dirname } from "node:path";
+import { binaryCandidateDirs } from "./binaries";
 
 /**
  * Builds a `:`-joined PATH from three sources in priority order: the current
@@ -14,26 +14,26 @@ import { binaryCandidateDirs } from './binaries'
  * @returns The merged, deduped `PATH` string.
  */
 export function mergePaths(
-  currentPath: string,
-  shellPath: string | null,
-  curatedDirs: string[]
+	currentPath: string,
+	shellPath: string | null,
+	curatedDirs: string[]
 ): string {
-  const seen = new Set<string>()
-  const merged: string[] = []
-  const sources = [currentPath.split(delimiter), (shellPath ?? '').split(delimiter), curatedDirs]
-  for (const source of sources) {
-    for (const dir of source) {
-      if (!dir || seen.has(dir)) continue
-      seen.add(dir)
-      merged.push(dir)
-    }
-  }
-  return merged.join(delimiter)
+	const seen = new Set<string>();
+	const merged: string[] = [];
+	const sources = [currentPath.split(delimiter), (shellPath ?? "").split(delimiter), curatedDirs];
+	for (const source of sources) {
+		for (const dir of source) {
+			if (!dir || seen.has(dir)) continue;
+			seen.add(dir);
+			merged.push(dir);
+		}
+	}
+	return merged.join(delimiter);
 }
 
 /** Wraps the captured PATH so it can be extracted even when shell startup files
  * (e.g. `.zshrc`) print banners or version-manager output to stdout alongside it. */
-const PATH_MARKER = '__GENERATESAAS_PATH__'
+const PATH_MARKER = "__GENERATESAAS_PATH__";
 
 /**
  * Best-effort capture of the PATH a user's login shell exports. A GUI-launched
@@ -51,21 +51,21 @@ const PATH_MARKER = '__GENERATESAAS_PATH__'
  * @returns The login shell's exported `PATH`, or `null` when unavailable.
  */
 export function captureLoginShellPath(): string | null {
-  if (process.platform === 'win32') return null
-  try {
-    const shell = process.env.SHELL || '/bin/zsh'
-    const out = execFileSync(
-      shell,
-      ['-ilc', `printf "%s%s%s" "${PATH_MARKER}" "$PATH" "${PATH_MARKER}"`],
-      { timeout: 5000, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }
-    )
-    const start = out.indexOf(PATH_MARKER)
-    const end = out.indexOf(PATH_MARKER, start + PATH_MARKER.length)
-    if (start === -1 || end === -1) return null
-    return out.slice(start + PATH_MARKER.length, end).trim() || null
-  } catch {
-    return null
-  }
+	if (process.platform === "win32") return null;
+	try {
+		const shell = process.env.SHELL || "/bin/zsh";
+		const out = execFileSync(
+			shell,
+			["-ilc", `printf "%s%s%s" "${PATH_MARKER}" "$PATH" "${PATH_MARKER}"`],
+			{ timeout: 5000, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }
+		);
+		const start = out.indexOf(PATH_MARKER);
+		const end = out.indexOf(PATH_MARKER, start + PATH_MARKER.length);
+		if (start === -1 || end === -1) return null;
+		return out.slice(start + PATH_MARKER.length, end).trim() || null;
+	} catch {
+		return null;
+	}
 }
 
 /**
@@ -75,7 +75,7 @@ export function captureLoginShellPath(): string | null {
  * @returns The deduped enhanced `PATH` string.
  */
 export function enhancedPath(): string {
-  return mergePaths(process.env.PATH ?? '', captureLoginShellPath(), binaryCandidateDirs())
+	return mergePaths(process.env.PATH ?? "", captureLoginShellPath(), binaryCandidateDirs());
 }
 
 /**
@@ -90,13 +90,13 @@ export function enhancedPath(): string {
  * @returns A copy of `env` with the node dir on `PATH`.
  */
 export function nodeDirOnPath(
-  env: Record<string, string | undefined>,
-  nodeDir: string = dirname(process.execPath)
+	env: Record<string, string | undefined>,
+	nodeDir: string = dirname(process.execPath)
 ): Record<string, string | undefined> {
-  const current = env.PATH ?? ''
-  const parts = current.split(delimiter).filter(Boolean)
-  if (parts.includes(nodeDir)) return { ...env }
-  return { ...env, PATH: [nodeDir, ...parts].join(delimiter) }
+	const current = env.PATH ?? "";
+	const parts = current.split(delimiter).filter(Boolean);
+	if (parts.includes(nodeDir)) return { ...env };
+	return { ...env, PATH: [nodeDir, ...parts].join(delimiter) };
 }
 
 /**
@@ -107,12 +107,12 @@ export function nodeDirOnPath(
  * child env drops them.
  */
 export const INSPECTOR_ENV_VARS: readonly string[] = [
-  'BUN_INSPECT',
-  'BUN_INSPECT_CONNECT_TO',
-  'BUN_INSPECT_NOTIFY',
-  'BUN_INSPECT_PRELOAD',
-  'NODE_INSPECT_RESUME_ON_START'
-]
+	"BUN_INSPECT",
+	"BUN_INSPECT_CONNECT_TO",
+	"BUN_INSPECT_NOTIFY",
+	"BUN_INSPECT_PRELOAD",
+	"NODE_INSPECT_RESUME_ON_START"
+];
 
 /**
  * Removes `--inspect*` flags from a `NODE_OPTIONS` value, preserving any other options.
@@ -122,11 +122,11 @@ export const INSPECTOR_ENV_VARS: readonly string[] = [
  * @returns The sanitized `NODE_OPTIONS`, or `undefined` when nothing remains.
  */
 export function sanitizeNodeOptions(nodeOptions: string | undefined): string | undefined {
-  if (!nodeOptions) return undefined
-  const kept = nodeOptions
-    .split(/\s+/)
-    .filter((opt) => opt.length > 0 && !opt.startsWith('--inspect'))
-  return kept.length > 0 ? kept.join(' ') : undefined
+	if (!nodeOptions) return undefined;
+	const kept = nodeOptions
+		.split(/\s+/)
+		.filter((opt) => opt.length > 0 && !opt.startsWith("--inspect"));
+	return kept.length > 0 ? kept.join(" ") : undefined;
 }
 
 /**
@@ -140,12 +140,12 @@ export function sanitizeNodeOptions(nodeOptions: string | undefined): string | u
  * @returns A copy of `env` with inspector vars dropped and `NODE_OPTIONS` sanitized.
  */
 export function stripInspectorEnv(
-  env: Record<string, string | undefined>
+	env: Record<string, string | undefined>
 ): Record<string, string | undefined> {
-  const out = { ...env }
-  for (const name of INSPECTOR_ENV_VARS) delete out[name]
-  const sanitized = sanitizeNodeOptions(out.NODE_OPTIONS)
-  if (sanitized === undefined) delete out.NODE_OPTIONS
-  else out.NODE_OPTIONS = sanitized
-  return out
+	const out = { ...env };
+	for (const name of INSPECTOR_ENV_VARS) delete out[name];
+	const sanitized = sanitizeNodeOptions(out.NODE_OPTIONS);
+	if (sanitized === undefined) delete out.NODE_OPTIONS;
+	else out.NODE_OPTIONS = sanitized;
+	return out;
 }

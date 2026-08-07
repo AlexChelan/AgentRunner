@@ -10,7 +10,7 @@ const PID_FILE = `${BRAND.binary}.pid`
 
 /** A fresh temp lock dir under the OS temp root. */
 function dir(): string {
-  return mkdtempSync(join(tmpdir(), 'companion-lock-'))
+  return mkdtempSync(join(tmpdir(), 'runner-lock-'))
 }
 
 describe('single-instance lock', () => {

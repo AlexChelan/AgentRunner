@@ -1,5 +1,5 @@
-import { scopeBackendUrl } from '@opencompanion/core/runtime/account-scope'
-import type { BackendSession } from '@opencompanion/core/runtime/backend-session'
+import { scopeBackendUrl } from '@agentrunner/core/runtime/account-scope'
+import type { BackendSession } from '@agentrunner/core/runtime/backend-session'
 import { BRAND } from './brand'
 
 /** The default reconcile cadence (ms): how often the supervisor re-syncs sessions to the pairing set. */
@@ -54,7 +54,7 @@ export interface SessionSupervisorDeps {
  * Builds the session supervisor: the daemon's single control loop that keeps exactly one
  * {@link BackendSession} running per paired ACCOUNT SCOPE (so two SaaS logins on one backend get two). It reconciles on demand (via {@link
  * SessionSupervisor.reconcile}) and on a recurring interval, so a backend paired or unpaired by a
- * SEPARATE `companion pair`/`unpair` process is picked up (or dropped) within one cadence WITHOUT
+ * SEPARATE `runner pair`/`unpair` process is picked up (or dropped) within one cadence WITHOUT
  * restarting the daemon. A `makeSession` that returns `null` (a corrupt pairing with no bearer) is
  * simply skipped and RETRIED on the next reconcile, so one broken pairing never blocks the others.
  *

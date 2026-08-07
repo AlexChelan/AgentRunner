@@ -1,9 +1,9 @@
-import { scopeBackendUrl } from '@opencompanion/core/runtime/account-scope'
-import { canonicalizeBackendUrl } from '@opencompanion/core/runtime/backend-url'
-import { mcpEnvKey } from '@opencompanion/core/runtime/mcp-secrets'
-import { bearerKey } from '@opencompanion/core/runtime/pair'
-import type { SecretStore } from '@opencompanion/core/runtime/storage/secret-store'
-import type { PairingStateSnapshot, StateStore } from '@opencompanion/core/runtime/storage/state-store'
+import { scopeBackendUrl } from '@agentrunner/core/runtime/account-scope'
+import { canonicalizeBackendUrl } from '@agentrunner/core/runtime/backend-url'
+import { mcpEnvKey } from '@agentrunner/core/runtime/mcp-secrets'
+import { bearerKey } from '@agentrunner/core/runtime/pair'
+import type { SecretStore } from '@agentrunner/core/runtime/storage/secret-store'
+import type { PairingStateSnapshot, StateStore } from '@agentrunner/core/runtime/storage/state-store'
 
 /**
  * One-time canonicalization migration: earlier daemons keyed pairing state AND the pairing bearer

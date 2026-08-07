@@ -1,16 +1,23 @@
 import {
-  existsSync,
-  lstatSync,
-  mkdirSync,
-  readFileSync,
-  readlinkSync,
-  rmSync,
-  symlinkSync,
-  writeFileSync
-} from 'node:fs'
-import { homedir } from 'node:os'
-import { join } from 'node:path'
-import { codexHomeDir } from './paths'
+	closeSync,
+	existsSync,
+	fchmodSync,
+	fchownSync,
+	constants as fsConstants,
+	lstatSync,
+	mkdirSync,
+	openSync,
+	readFileSync,
+	readlinkSync,
+	rmSync,
+	symlinkSync,
+	writeFileSync
+} from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
+import { AGENT_WRITE_MODE, shareWithAgent } from "../agent-share";
+import type { AgentIdentity, AgentShareSeams } from "../agent-share";
+import { codexHomeDir } from "./paths";
 
 /**
  * The `config.toml` written into the isolated home. Deliberately minimal - the ONLY thing that
@@ -19,34 +26,138 @@ import { codexHomeDir } from './paths'
  * per turn over the app-server protocol, not from this file.
  */
 const ISOLATED_CONFIG_TOML =
-  '# Isolated Codex home, managed by the companion for headless chat/schedule runs.\n' +
-  '# Intentionally declares no external servers: a run sees only the app tools plus Codex built-ins.\n'
+	"# Isolated Codex home, managed by the runner for headless chat/schedule runs.\n" +
+	"# Intentionally declares no external servers: a run sees only the app tools plus Codex built-ins.\n";
+
+/** The isolated `config.toml`'s mode: readable by every identity that may load it, writable by none. */
+const CONFIG_MODE = 0o644;
+
+/**
+ * The mode of the isolated `auth.json` COPY a contained host seeds (see {@link ensureIsolatedCodexHome}).
+ * Owner (the daemon) read/write, the agent's GROUP read, everyone else nothing: the Codex run child
+ * drops to the agent uid and must read the credential, and the container's root has no
+ * `CAP_DAC_OVERRIDE`, so an owner-only `0600` copy is a credential neither identity can share.
+ */
+const CONTAINED_AUTH_MODE = 0o640;
+
+/** Optional containment inputs for {@link ensureIsolatedCodexHome}. */
+export interface CodexHomeOwnerOpts extends AgentShareSeams {
+	/**
+	 * The identity the isolated home is SHARED with, set ONLY on a contained host (the runner in its own
+	 * container). There the daemon seeds the home as root but the Codex child drops to an unprivileged
+	 * uid, so a root-owned `0755` home is traversable but NOT writable - and Codex writes its session
+	 * state, history, and token refreshes there. Unset off a contained host, where the daemon already
+	 * runs as the user the CLI does.
+	 *
+	 * Setting it ALSO switches auth seeding from a symlink to a group-readable COPY, because on a
+	 * contained host the login and the run are two different identities - see
+	 * {@link ensureIsolatedCodexHome}.
+	 */
+	agent?: AgentIdentity;
+}
 
 /** The user's real Codex home (`$CODEX_HOME` or `~/.codex`) - the source of the login a run authenticates with. */
 function realCodexHome(): string {
-  return process.env.CODEX_HOME ?? join(homedir(), '.codex')
+	return process.env.CODEX_HOME ?? join(homedir(), ".codex");
+}
+
+/**
+ * Writes `contents` to `path` WITHOUT ever following a symlink, replacing a hostile or corrupt entry.
+ *
+ * Once the isolated home is group-shared, everything in it is agent-writable - so a plain
+ * `writeFileSync` here is a confused deputy: a run that replaces `config.toml` with a symlink to
+ * `secrets/master.key` gets the daemon to truncate the master key for it, which is irreversible and
+ * takes every stored credential with it. `O_NOFOLLOW` refuses the link (`ELOOP`) instead.
+ *
+ * A refused entry is then REMOVED and the write retried: `rm` unlinks the entry itself and never
+ * follows it, so whatever the link pointed at is untouched, and the isolated home self-heals rather
+ * than wedging. `recursive` covers the other plantable shape, a DIRECTORY named `config.toml`.
+ *
+ * `group` pins the result's group and mode on the DESCRIPTOR (`fchown`/`fchmod`), never on the path,
+ * so the identity that lands on the file is bound to the very inode the no-follow open validated.
+ *
+ * @param path - The file to write.
+ * @param contents - The bytes to write.
+ * @param mode - The mode for a freshly created file; also FORCED on the descriptor when `group` is set.
+ * @param group - Group to hand the file to (the owner stays this process). Omit to leave both alone.
+ * @throws When the write fails even after the hostile entry was cleared. Fail-closed AT THIS CALL: it
+ *   guarantees the bytes this function wrote were the last ones IT wrote, not that they are the bytes
+ *   Codex will read - the isolated home is agent-writable, so a run can replace the file afterwards
+ *   (see {@link ensureIsolatedCodexHome}'s residual note).
+ */
+function writeNoFollow(
+	path: string,
+	contents: string | Uint8Array,
+	mode: number,
+	group?: number
+): void {
+	const flags =
+		fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_TRUNC | fsConstants.O_NOFOLLOW;
+	const write = (): void => {
+		const fd = openSync(path, flags, mode);
+		try {
+			if (group !== undefined) {
+				// The owner stays this process; only the GROUP moves, exactly as a directory share does.
+				fchownSync(fd, process.getuid?.() ?? 0, group);
+				// An existing file keeps its old mode through `O_CREAT`, so the mode is set explicitly.
+				fchmodSync(fd, mode);
+			}
+			writeFileSync(fd, contents);
+		} finally {
+			closeSync(fd);
+		}
+	};
+	try {
+		write();
+	} catch {
+		rmSync(path, { recursive: true, force: true });
+		write();
+	}
+}
+
+/**
+ * Re-authors the isolated home's `config.toml`, for a caller that is about to spawn Codex against it.
+ *
+ * The isolated home is agent-writable on a contained host (Codex writes its session state there), so
+ * the seeded `config.toml` can be UNLINKED and replaced by the very run that is about to read it - and
+ * a replacement carrying an `[mcp_servers.*]` table would give that run tool processes outside the
+ * sandbox. The `-c` overrides passed at spawn do NOT rescue this: Codex DEEP-MERGES them into the file
+ * config, so `-c mcp_servers.x=...` adds a server without removing the ones the file declares (verified
+ * against `codex-cli 0.146.1` - `codex mcp list -c mcp_servers.good...` still lists a `config.toml`
+ * server, and even a whole-table `-c mcp_servers={}` does not clear it).
+ *
+ * So this exists to NARROW the window, not to close it: called immediately before the spawn, it leaves
+ * only the child's own startup between the write and Codex's read, instead of the whole run-setup path.
+ * A determined agent that wins that remaining race still gets its file read. Documented, not claimed
+ * away - see {@link ensureIsolatedCodexHome}.
+ *
+ * @param home - The isolated `CODEX_HOME` (from {@link ensureIsolatedCodexHome}).
+ * @throws When the config cannot be authored at all - a run must not proceed with no isolation file.
+ */
+export function reseedIsolatedCodexConfig(home: string): void {
+	writeNoFollow(join(home, "config.toml"), ISOLATED_CONFIG_TOML, CONFIG_MODE);
 }
 
 /** True when `path` is a symlink (never throws for a missing path). */
 function isSymlink(path: string): boolean {
-  try {
-    return lstatSync(path).isSymbolicLink()
-  } catch {
-    return false
-  }
+	try {
+		return lstatSync(path).isSymbolicLink();
+	} catch {
+		return false;
+	}
 }
 
 /** The symlink target of `path`, or `null` when `path` is not a readable symlink. */
 function symlinkTarget(path: string): string | null {
-  try {
-    return readlinkSync(path)
-  } catch {
-    return null
-  }
+	try {
+		return readlinkSync(path);
+	} catch {
+		return null;
+	}
 }
 
 /**
- * Ensures the companion-managed ISOLATED `CODEX_HOME` exists and returns its path, for a headless
+ * Ensures the runner-managed ISOLATED `CODEX_HOME` exists and returns its path, for a headless
  * chat/schedule Codex run. Codex reads its `config.toml` (the user's personal `mcp_servers`, profiles)
  * from `CODEX_HOME` and exposes NO strict-MCP flag, so a run's tool surface is isolated by pointing
  * `CODEX_HOME` at this home, whose `config.toml` declares no personal MCP servers - the run then sees
@@ -58,45 +169,100 @@ function symlinkTarget(path: string): string | null {
  * original file, a non-Codex run cannot read a fresh copy of the token, and whatever confinement covers
  * `~/.codex` covers the link target too.
  *
+ * A CONTAINED host is the ONE exception, and it is a deliberate trade (see the `agent` paragraph below).
+ * There the login child and the daemon are ROOT while the Codex run child drops to the agent uid, so the
+ * real `~/.codex/auth.json` is a root-owned `0600` file the run cannot read - and root has no
+ * `CAP_DAC_OVERRIDE` to lend it. A symlink would therefore authenticate nothing. So the credential is
+ * COPIED into this home at {@link CONTAINED_AUTH_MODE} (`0640`, group = the agent): the run reads it, the
+ * user's real login stays root-only, and the copy is re-seeded from that real login on every run. The
+ * exposure this adds is bounded and pre-existing in shape: every contained run shares one agent uid, so
+ * any Codex run can read it - exactly as they could read the symlink's target before.
+ *
  * Caveats (documented deliberately):
  * - Keyring auth (no `auth.json` on disk) needs no symlink - the keyring is global, so auth resolves
  *   regardless of `CODEX_HOME`; seeding is a no-op there.
- * - Refresh desync: if Codex refreshes the token via a temp-file rename it replaces the symlink with a
- *   file inside this home (the user's real login keeps its own token). This function self-heals - it
- *   re-points the symlink on the next run - so the divergence is transient and re-synced each run.
+ * - Refresh desync: if Codex refreshes the token via a temp-file rename it replaces this home's entry
+ *   with its own file (the user's real login keeps its own token). This function self-heals - it
+ *   re-points the symlink (or re-copies) on the next run - so the divergence is transient and re-synced
+ *   each run.
  * - Symlink-forbidden platforms (e.g. non-elevated Windows): it falls back to COPYING `auth.json` so
  *   file-based auth still works; that copy is a credential at rest, confined to this home and re-seeded
- *   each run. POSIX (the macOS/Linux desktop + server targets) always takes the symlink path.
+ *   each run. Non-contained POSIX (the macOS/Linux desktop targets) always takes the symlink path.
  *
  * Idempotent and best-effort: it never throws for a missing real home and always returns the isolated
  * path, so the caller isolates the config even when auth seeding is a no-op.
  *
+ * An `agent` group-shares the home itself with that identity at {@link AGENT_WRITE_MODE}. On a contained
+ * host the daemon seeds it as root while the Codex child runs as an unprivileged uid, which can traverse
+ * a root-owned `0755` dir but not WRITE it - and Codex writes its session state, history, and token
+ * refreshes INTO `CODEX_HOME`. Ownership deliberately stays with the daemon, which re-seeds `config.toml`
+ * and re-seeds the credential on EVERY call (see {@link shareWithAgent}: without CAP_DAC_OVERRIDE, a
+ * home handed to the agent is one the daemon can no longer write, so the very next run would throw).
+ * Only the home DIR is shared through {@link shareWithAgent}: never the app-data root above it (that parent
+ * holds the store and secrets) and never `auth.json` as a path (a `chown` would follow a symlink to the
+ * user's real login - the contained copy gets its group on the descriptor instead). The share runs on every
+ * call, so a home left unshared by a pre-fix run self-heals. Best-effort by design - `chown`/`chmod` are
+ * POSIX-only and may be denied - so a failure never fails the run.
+ *
+ * RESIDUAL, stated plainly: a shared home is an agent-WRITABLE home, so a run can unlink either seeded file
+ * and put its own there. `config.toml` is the one that matters - a replacement declaring `[mcp_servers.*]`
+ * buys the run tool processes outside its sandbox, and Codex's `-c` overrides deep-merge rather than
+ * replace, so the spawn-time flags cannot override it away. Sticky would stop the unlink but also stops
+ * Codex's own rename-based `auth.json` refresh, so it is not free. The mitigation is
+ * {@link reseedIsolatedCodexConfig}, called immediately before the spawn to narrow the window - it does not
+ * close it.
+ *
  * @param appDataRoot - The daemon's app-data root.
+ * @param opts - Optional agent identity and its injectable `chown`/`chmod` seams.
  * @returns The absolute isolated `CODEX_HOME`.
  */
-export function ensureIsolatedCodexHome(appDataRoot: string): string {
-  const home = codexHomeDir(appDataRoot)
-  mkdirSync(home, { recursive: true })
-  writeFileSync(join(home, 'config.toml'), ISOLATED_CONFIG_TOML)
+export function ensureIsolatedCodexHome(
+	appDataRoot: string,
+	opts: CodexHomeOwnerOpts = {}
+): string {
+	const home = codexHomeDir(appDataRoot);
+	mkdirSync(home, { recursive: true });
+	if (opts.agent) {
+		shareWithAgent([home], opts.agent, AGENT_WRITE_MODE, opts.share ? { share: opts.share } : {});
+	}
+	// {@link CONFIG_MODE}: the Codex child runs as the agent and MUST be able to read this file - an
+	// unreadable config.toml is a run that loads no isolation at all. It carries no secret, only the
+	// deliberate absence of an `[mcp_servers.*]` table. Re-authored again just before the spawn.
+	reseedIsolatedCodexConfig(home);
 
-  const realAuth = join(realCodexHome(), 'auth.json')
-  const isoAuth = join(home, 'auth.json')
-  if (!existsSync(realAuth)) return home
+	const realAuth = join(realCodexHome(), "auth.json");
+	const isoAuth = join(home, "auth.json");
+	if (!existsSync(realAuth)) return home;
 
-  // (Re)point auth.json at the user's real login. Skip when it already links there; otherwise remove
-  // any stale entry (a prior run's in-home refresh can replace the symlink with a file) and re-link.
-  if (isSymlink(isoAuth) && symlinkTarget(isoAuth) === realAuth) return home
-  rmSync(isoAuth, { force: true })
-  try {
-    symlinkSync(realAuth, isoAuth)
-  } catch {
-    // A platform that forbids symlinks: copy so file-based auth still works (see the caveats above).
-    // Owner-only mode - this branch is the one case that puts a credential at rest.
-    try {
-      writeFileSync(isoAuth, readFileSync(realAuth), { mode: 0o600 })
-    } catch {
-      // Auth seeding is best-effort - a keyring-auth run needs no file.
-    }
-  }
-  return home
+	// CONTAINED: the login wrote a root-owned 0600 credential, and the run child is another uid entirely,
+	// so a symlink resolves to a file it cannot open. Copy it in group-readable instead - re-copied every
+	// call, so a token the run refreshed in place is re-synced from the real login (see the caveats).
+	if (opts.agent) {
+		try {
+			writeNoFollow(isoAuth, readFileSync(realAuth), CONTAINED_AUTH_MODE, opts.agent.gid);
+		} catch {
+			// Auth seeding is best-effort - a keyring-auth run needs no file, and a run that ends up
+			// unauthenticated reports it; it must never take the whole dispatch down.
+		}
+		return home;
+	}
+
+	// (Re)point auth.json at the user's real login. Skip when it already links there; otherwise remove
+	// any stale entry (a prior run's in-home refresh can replace the symlink with a file) and re-link.
+	if (isSymlink(isoAuth) && symlinkTarget(isoAuth) === realAuth) return home;
+	// `recursive` matters on a contained host: the isolated home is agent-writable, and a DIRECTORY
+	// planted at `auth.json` would make a non-recursive rm throw EISDIR out of every single run.
+	rmSync(isoAuth, { recursive: true, force: true });
+	try {
+		symlinkSync(realAuth, isoAuth);
+	} catch {
+		// A platform that forbids symlinks: copy so file-based auth still works (see the caveats above).
+		// Owner-only mode - this branch is the one case that puts a credential at rest.
+		try {
+			writeFileSync(isoAuth, readFileSync(realAuth), { mode: 0o600 });
+		} catch {
+			// Auth seeding is best-effort - a keyring-auth run needs no file.
+		}
+	}
+	return home;
 }

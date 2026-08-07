@@ -1,4 +1,4 @@
-import type { ConnectionRef } from '@opencompanion/core-types'
+import type { ConnectionRef } from "@agentrunner/core-types";
 
 /**
  * Per-run execution context: the identity (productId, userId, runId) and the
@@ -9,16 +9,16 @@ import type { ConnectionRef } from '@opencompanion/core-types'
  * deliberately NOT carried over).
  */
 export interface RunContext {
-  /** The product this run executes on behalf of (isolation boundary). */
-  productId: string
-  /** The end user who owns the subscription this run uses. */
-  userId: string
-  /** Unique id for this run (acked over the relay; tags emitted events). */
-  runId: string
-  /** Resolved, validated working directory (the confined per-product folder). */
-  cwd: string
-  /** Optional resolved connection handle for this run. */
-  connection?: ConnectionRef
+	/** The product this run executes on behalf of (isolation boundary). */
+	productId: string;
+	/** The end user who owns the subscription this run uses. */
+	userId: string;
+	/** Unique id for this run (acked over the relay; tags emitted events). */
+	runId: string;
+	/** Resolved, validated working directory (the confined per-product folder). */
+	cwd: string;
+	/** Optional resolved connection handle for this run. */
+	connection?: ConnectionRef;
 }
 
 /**
@@ -27,10 +27,10 @@ export interface RunContext {
  * global. A single resolver object can therefore serve concurrent interleaved runs.
  */
 export interface RunContextResolvers {
-  /** Loads the BYOK key for `connectionId` in the context of THIS run, or `null`. */
-  loadApiKey: (ctx: RunContext, connectionId: string) => string | null
-  /** Resolves a tool binary for THIS run, or `null`. */
-  resolveBinary: (ctx: RunContext, name: string) => string | null
+	/** Loads the BYOK key for `connectionId` in the context of THIS run, or `null`. */
+	loadApiKey: (ctx: RunContext, connectionId: string) => string | null;
+	/** Resolves a tool binary for THIS run, or `null`. */
+	resolveBinary: (ctx: RunContext, name: string) => string | null;
 }
 
 /**
@@ -41,17 +41,17 @@ export interface RunContextResolvers {
  * @returns The constructed run context.
  */
 export function makeRunContext(input: {
-  productId: string
-  userId: string
-  cwd: string
-  runId?: string
-  connection?: ConnectionRef
+	productId: string;
+	userId: string;
+	cwd: string;
+	runId?: string;
+	connection?: ConnectionRef;
 }): RunContext {
-  return {
-    productId: input.productId,
-    userId: input.userId,
-    cwd: input.cwd,
-    runId: input.runId ?? crypto.randomUUID(),
-    ...(input.connection ? { connection: input.connection } : {})
-  }
+	return {
+		productId: input.productId,
+		userId: input.userId,
+		cwd: input.cwd,
+		runId: input.runId ?? crypto.randomUUID(),
+		...(input.connection ? { connection: input.connection } : {})
+	};
 }

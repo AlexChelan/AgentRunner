@@ -1,16 +1,16 @@
 import { describe, expect, it } from 'vitest'
 import { existsSync } from 'node:fs'
 import {
-  run,
   out,
+  run,
   tempAppData
 } from './cli-harness'
 
 describe('cli routing - log', () => {
   it('"log" pretty-prints the newest audit entries oldest-first, one line each', async () => {
     const solo = tempAppData('log')
-    const { createAuditLog } = await import('@opencompanion/core/runtime/audit-log')
-    const { auditDir } = await import('@opencompanion/core/runtime/paths')
+    const { createAuditLog } = await import('@agentrunner/core/runtime/audit-log')
+    const { auditDir } = await import('@agentrunner/core/runtime/paths')
     const log = createAuditLog({ dir: auditDir(solo) })
     log.append({
       backendUrl: 'https://logbk.example',
@@ -42,8 +42,8 @@ describe('cli routing - log', () => {
 
   it('"log" surfaces a refused run and its origin-denied reason on the line', async () => {
     const solo = tempAppData('log-refused')
-    const { createAuditLog } = await import('@opencompanion/core/runtime/audit-log')
-    const { auditDir } = await import('@opencompanion/core/runtime/paths')
+    const { createAuditLog } = await import('@agentrunner/core/runtime/audit-log')
+    const { auditDir } = await import('@agentrunner/core/runtime/paths')
     createAuditLog({ dir: auditDir(solo) }).append({
       backendUrl: 'https://logref.example',
       event: 'refused',
@@ -58,8 +58,8 @@ describe('cli routing - log', () => {
 
   it('"log --json" prints raw JSONL with no pretty decoration', async () => {
     const solo = tempAppData('logjson')
-    const { createAuditLog } = await import('@opencompanion/core/runtime/audit-log')
-    const { auditDir } = await import('@opencompanion/core/runtime/paths')
+    const { createAuditLog } = await import('@agentrunner/core/runtime/audit-log')
+    const { auditDir } = await import('@agentrunner/core/runtime/paths')
     createAuditLog({ dir: auditDir(solo) }).append({
       backendUrl: 'https://j.example',
       event: 'dispatched',
@@ -74,9 +74,9 @@ describe('cli routing - log', () => {
   })
 
   it('"log --json" on an empty log emits nothing (pipe-safe, exit 0)', async () => {
-    // A never-used machine: `opencompanion log --json | jq .` must receive empty input, not the human
+    // A never-used machine: `agentrunner log --json | jq .` must receive empty input, not the human
     // empty-state prose that would make jq choke.
-    const solo = tempAppData('logjsonempty')
+    tempAppData('logjsonempty')
     await run(['log', '--json'])
     expect(out.exitCode).toBeUndefined()
     expect(out.stdout).toBe('')
@@ -84,8 +84,8 @@ describe('cli routing - log', () => {
 
   it('"log -n" limits to the newest N entries', async () => {
     const solo = tempAppData('logn')
-    const { createAuditLog } = await import('@opencompanion/core/runtime/audit-log')
-    const { auditDir } = await import('@opencompanion/core/runtime/paths')
+    const { createAuditLog } = await import('@agentrunner/core/runtime/audit-log')
+    const { auditDir } = await import('@agentrunner/core/runtime/paths')
     const log = createAuditLog({ dir: auditDir(solo) })
     for (let i = 0; i < 5; i++) {
       log.append({ backendUrl: 'https://n.example', event: 'dispatched', runId: `run-${i}` })
@@ -101,8 +101,8 @@ describe('cli routing - log', () => {
 
   it('"log --url" filters to entries for that backend', async () => {
     const solo = tempAppData('logurl')
-    const { createAuditLog } = await import('@opencompanion/core/runtime/audit-log')
-    const { auditDir } = await import('@opencompanion/core/runtime/paths')
+    const { createAuditLog } = await import('@agentrunner/core/runtime/audit-log')
+    const { auditDir } = await import('@agentrunner/core/runtime/paths')
     const log = createAuditLog({ dir: auditDir(solo) })
     log.append({ backendUrl: 'https://keep.example', event: 'pair' })
     log.append({ backendUrl: 'https://drop.example', event: 'pair' })
@@ -113,8 +113,8 @@ describe('cli routing - log', () => {
 
   it('"log -n <garbage>" exits 1 without printing entries', async () => {
     const solo = tempAppData('logbadn')
-    const { createAuditLog } = await import('@opencompanion/core/runtime/audit-log')
-    const { auditDir } = await import('@opencompanion/core/runtime/paths')
+    const { createAuditLog } = await import('@agentrunner/core/runtime/audit-log')
+    const { auditDir } = await import('@agentrunner/core/runtime/paths')
     createAuditLog({ dir: auditDir(solo) }).append({ backendUrl: 'https://g.example', event: 'pair' })
     await run(['log', '-n', 'abc'])
     expect(out.exitCode).toBe(1)
@@ -124,8 +124,8 @@ describe('cli routing - log', () => {
 
   it('"log -n 0" is rejected (a count must be a positive integer)', async () => {
     const solo = tempAppData('logzero')
-    const { createAuditLog } = await import('@opencompanion/core/runtime/audit-log')
-    const { auditDir } = await import('@opencompanion/core/runtime/paths')
+    const { createAuditLog } = await import('@agentrunner/core/runtime/audit-log')
+    const { auditDir } = await import('@agentrunner/core/runtime/paths')
     createAuditLog({ dir: auditDir(solo) }).append({ backendUrl: 'https://z.example', event: 'pair' })
     await run(['log', '-n', '0'])
     expect(out.exitCode).toBe(1)
@@ -134,7 +134,7 @@ describe('cli routing - log', () => {
 
   it('"log" on a machine with no audit dir prints a friendly empty state and creates no dir', async () => {
     const solo = tempAppData('logempty')
-    const { auditDir } = await import('@opencompanion/core/runtime/paths')
+    const { auditDir } = await import('@agentrunner/core/runtime/paths')
     const dir = auditDir(solo)
     expect(existsSync(dir)).toBe(false)
     await run(['log'])

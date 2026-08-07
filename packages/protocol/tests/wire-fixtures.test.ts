@@ -1,46 +1,52 @@
-import { readdirSync, readFileSync } from 'node:fs'
-import { join } from 'node:path'
-import { fileURLToPath } from 'node:url'
-import { describe, expect, it } from 'vitest'
-import { z } from 'zod'
-import * as protocol from '../src/index'
+import { readdirSync, readFileSync } from "node:fs";
+import { join } from "node:path";
+import { fileURLToPath } from "node:url";
+import { describe, expect, it } from "vitest";
+import type { z } from "zod";
+import * as protocol from "../src/index";
 import {
-  AuthHealthSchema,
-  CliConnectionInfoSchema,
-  CliModelInfoSchema,
-  COMPANION_PROTOCOL_VERSION,
-  ConnectInstructionSchema,
-  ConnectResponseSchema,
-  ConnectResultBodySchema,
-  ConnectResultStatusSchema,
-  CONNECTABLE_TOOL_IDS,
-  DisconnectInstructionSchema,
-  DisconnectResultBodySchema,
-  DisconnectResultStatusSchema,
-  EventsResponseSchema,
-  McpServerSpecSchema,
-  PermissionModeSchema,
-  PollResponseSchema,
-  ReasoningEffortSchema,
-  RunConversationMsgSchema,
-  RunEventEnvelopeSchema,
-  RunImageSchema,
-  RunPolicySchema,
-  RunStartSchema,
-  ToolCallSchema,
-  ToolResultSchema,
-  WebToolManifestEntrySchema
-} from '../src/index'
+	AuthHealthSchema,
+	CliConnectionInfoSchema,
+	CliModelInfoSchema,
+	CONNECTABLE_TOOL_IDS,
+	ConnectInstructionSchema,
+	ConnectResponseSchema,
+	ConnectResultBodySchema,
+	ConnectResultStatusSchema,
+	DisconnectInstructionSchema,
+	DisconnectResultBodySchema,
+	DisconnectResultStatusSchema,
+	EventsResponseSchema,
+	LoginEventFrameSchema,
+	LoginEventKindSchema,
+	LoginInputInstructionSchema,
+	LoginResultBodySchema,
+	LoginResultStatusSchema,
+	LoginStartInstructionSchema,
+	McpServerSpecSchema,
+	PermissionModeSchema,
+	PollResponseSchema,
+	ReasoningEffortSchema,
+	RunConversationMsgSchema,
+	RunEventEnvelopeSchema,
+	RunImageSchema,
+	RUNNER_PROTOCOL_VERSION,
+	RunPolicySchema,
+	RunStartSchema,
+	ToolCallSchema,
+	ToolResultSchema,
+	WebToolManifestEntrySchema
+} from "../src/index";
 
 /**
- * PERMANENT per-version wire-shape freeze for the companion protocol. Every exported schema is pinned
+ * PERMANENT per-version wire-shape freeze for the runner protocol. Every exported schema is pinned
  * against a hand-written JSON fixture under `tests/fixtures/v<N>/`, one directory per protocol version
  * that has ever shipped, and every one of those directories must keep parsing under the schema THIS
  * source tree declares - forever. That is what makes the compatibility rules testable rather than
  * merely stated.
  *
  * The assertion is two-tier:
- * - the CURRENT version ({@link COMPANION_PROTOCOL_VERSION}) must parse AND round-trip deep-equal, so
+ * - the CURRENT version ({@link RUNNER_PROTOCOL_VERSION}) must parse AND round-trip deep-equal, so
  *   nothing is stripped and nothing is coerced;
  * - an OLDER version must parse and round-trip equal on every field the current schema still declares.
  *   A field the major has since retired is stripped by `zod`'s non-strict parse, which is precisely
@@ -55,17 +61,17 @@ import {
  * fixture per branch instead.
  */
 
-const fixturesDir = fileURLToPath(new URL('./fixtures/', import.meta.url))
+const fixturesDir = fileURLToPath(new URL("./fixtures/", import.meta.url));
 
 /**
  * The frozen protocol versions, oldest first. The LAST entry is the version this source tree speaks
- * ({@link COMPANION_PROTOCOL_VERSION}); every earlier entry is a permanent baseline.
+ * ({@link RUNNER_PROTOCOL_VERSION}); every earlier entry is a permanent baseline.
  *
  * RULE 4: a directory under `tests/fixtures/` is APPEND-ONLY. Once a version ships, no file in its
  * directory is ever edited or deleted - those bytes are what some daemon in the field actually sends,
  * and this suite is the only thing that proves the current schema still accepts them.
  */
-const FROZEN_VERSIONS = [1, 2, 3, 4] as const
+const FROZEN_VERSIONS = [1, 2, 3, 4, 5, 6, 7] as const;
 
 /**
  * Reads and JSON-parses a wire fixture from a version's fixture directory.
@@ -75,12 +81,12 @@ const FROZEN_VERSIONS = [1, 2, 3, 4] as const
  * @returns The parsed JSON value, before any schema validation.
  */
 function loadFixture(version: number, file: string): unknown {
-  return JSON.parse(readFileSync(join(fixturesDir, `v${version}`, file), 'utf8'))
+	return JSON.parse(readFileSync(join(fixturesDir, `v${version}`, file), "utf8"));
 }
 
 /** Every fixture filename present for a version (so a version may freeze a subset). */
 function fixtureFiles(version: number): Set<string> {
-  return new Set(readdirSync(join(fixturesDir, `v${version}`)))
+	return new Set(readdirSync(join(fixturesDir, `v${version}`)));
 }
 
 /**
@@ -94,20 +100,20 @@ function fixtureFiles(version: number): Set<string> {
  * @returns The fixture with any key absent from `parsed` removed.
  */
 function retainedKeys(fixture: unknown, parsed: unknown): unknown {
-  if (Array.isArray(fixture) && Array.isArray(parsed)) {
-    return fixture.map((item, i) => retainedKeys(item, parsed[i]))
-  }
-  if (!isPlainObject(fixture) || !isPlainObject(parsed)) return fixture
-  return Object.fromEntries(
-    Object.entries(fixture)
-      .filter(([key]) => key in parsed)
-      .map(([key, value]) => [key, retainedKeys(value, parsed[key])])
-  )
+	if (Array.isArray(fixture) && Array.isArray(parsed)) {
+		return fixture.map((item, i) => retainedKeys(item, parsed[i]));
+	}
+	if (!isPlainObject(fixture) || !isPlainObject(parsed)) return fixture;
+	return Object.fromEntries(
+		Object.entries(fixture)
+			.filter(([key]) => key in parsed)
+			.map(([key, value]) => [key, retainedKeys(value, parsed[key])])
+	);
 }
 
 /** Whether a value is a plain JSON object (not null, not an array). */
 function isPlainObject(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null && !Array.isArray(value)
+	return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 /**
@@ -126,189 +132,381 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
  * with. This is the ONLY way a fixture may become caseless.
  */
 const cases: ReadonlyArray<{ schema: z.ZodType; name: string; file: string; since?: number }> = [
-  { schema: RunStartSchema, name: 'RunStartSchema', file: 'run-start.json' },
-  // v3's loosening, frozen as bytes: a run whose `effort` is outside the universal ladder (Codex
-  // `xhigh`). It must decode with the level INTACT - a strict enum here would fail the whole parse and
-  // the daemon would drop the run over one level it has not heard of.
-  { schema: RunStartSchema, name: 'RunStartSchema', file: 'run-start.unknown-effort.json', since: 3 },
-  { schema: RunImageSchema, name: 'RunImageSchema', file: 'run-image.json' },
-  { schema: ToolResultSchema, name: 'ToolResultSchema', file: 'tool-result.json' },
-  { schema: ToolCallSchema, name: 'ToolCallSchema', file: 'tool-call.json' },
-  { schema: RunConversationMsgSchema, name: 'RunConversationMsgSchema', file: 'run-conversation.json' },
-  { schema: CliConnectionInfoSchema, name: 'CliConnectionInfoSchema', file: 'cli-connection-info.json' },
-  // The daemon-REPORTED catalog, frozen as bytes: a connection carrying its device's real model list.
-  // The bare fixture above stays the record of a snapshot that reports none - which must keep decoding
-  // to the backend's own fixed answer - so both halves of the additive field are pinned.
-  {
-    schema: CliConnectionInfoSchema,
-    name: 'CliConnectionInfoSchema',
-    file: 'cli-connection-info.models.json',
-    since: 3
-  },
-  { schema: CliModelInfoSchema, name: 'CliModelInfoSchema', file: 'cli-model-info.json', since: 3 },
-  { schema: ConnectInstructionSchema, name: 'ConnectInstructionSchema', file: 'connect-instruction.json' },
-  { schema: ConnectResultBodySchema, name: 'ConnectResultBodySchema', file: 'connect-result-body.json' },
-  { schema: DisconnectInstructionSchema, name: 'DisconnectInstructionSchema', file: 'disconnect-instruction.json' },
-  { schema: DisconnectResultBodySchema, name: 'DisconnectResultBodySchema', file: 'disconnect-result-body.json' },
-  // The `/connect` handshake response, ENRICHED with the additive `protocolVersion`: freezing it here
-  // proves the versioned response both parses and round-trips (no field dropped), while the frozen
-  // baseline fixtures above stay untouched.
-  { schema: ConnectResponseSchema, name: 'ConnectResponseSchema', file: 'connect-response.json' },
-  // The BARE pre-versioning response (only the required `wireToken`, no `protocolVersion` or other
-  // optionals): freezing it locks the backward-compat guarantee - a body from a backend that predates
-  // the additive field still parses and round-trips with nothing injected.
-  { schema: ConnectResponseSchema, name: 'ConnectResponseSchema', file: 'connect-response.bare.json' },
-  { schema: WebToolManifestEntrySchema, name: 'WebToolManifestEntrySchema', file: 'web-tool-manifest-entry.json' },
-  { schema: RunPolicySchema, name: 'RunPolicySchema', file: 'run-policy.json' },
-  { schema: McpServerSpecSchema, name: 'McpServerSpecSchema', file: 'mcp-server-spec.stdio.json' },
-  { schema: McpServerSpecSchema, name: 'McpServerSpecSchema', file: 'mcp-server-spec.sse.json' },
-  { schema: McpServerSpecSchema, name: 'McpServerSpecSchema', file: 'mcp-server-spec.http.json' },
-  { schema: AuthHealthSchema, name: 'AuthHealthSchema', file: 'auth-health.healthy.json' },
-  { schema: AuthHealthSchema, name: 'AuthHealthSchema', file: 'auth-health.needs-reauth.json' },
-  { schema: AuthHealthSchema, name: 'AuthHealthSchema', file: 'auth-health.unknown.json' },
-  { schema: ConnectResultStatusSchema, name: 'ConnectResultStatusSchema', file: 'connect-result-status.connected.json' },
-  { schema: ConnectResultStatusSchema, name: 'ConnectResultStatusSchema', file: 'connect-result-status.needs-login.json' },
-  {
-    schema: ConnectResultStatusSchema,
-    name: 'ConnectResultStatusSchema',
-    file: 'connect-result-status.installed-needs-login.json'
-  },
-  {
-    schema: ConnectResultStatusSchema,
-    name: 'ConnectResultStatusSchema',
-    file: 'connect-result-status.not-installed.json'
-  },
-  { schema: ConnectResultStatusSchema, name: 'ConnectResultStatusSchema', file: 'connect-result-status.failed.json' },
-  { schema: ReasoningEffortSchema, name: 'ReasoningEffortSchema', file: 'reasoning-effort.default.json' },
-  { schema: ReasoningEffortSchema, name: 'ReasoningEffortSchema', file: 'reasoning-effort.off.json' },
-  { schema: ReasoningEffortSchema, name: 'ReasoningEffortSchema', file: 'reasoning-effort.low.json' },
-  { schema: ReasoningEffortSchema, name: 'ReasoningEffortSchema', file: 'reasoning-effort.medium.json' },
-  { schema: ReasoningEffortSchema, name: 'ReasoningEffortSchema', file: 'reasoning-effort.high.json' },
-  { schema: PermissionModeSchema, name: 'PermissionModeSchema', file: 'permission-mode.read-only.json' },
-  { schema: PermissionModeSchema, name: 'PermissionModeSchema', file: 'permission-mode.auto-edit.json' },
-  { schema: PermissionModeSchema, name: 'PermissionModeSchema', file: 'permission-mode.full.json' },
-  {
-    schema: DisconnectResultStatusSchema,
-    name: 'DisconnectResultStatusSchema',
-    file: 'disconnect-result-status.disconnected.json'
-  },
-  {
-    schema: DisconnectResultStatusSchema,
-    name: 'DisconnectResultStatusSchema',
-    file: 'disconnect-result-status.not-connected.json'
-  },
-  {
-    schema: DisconnectResultStatusSchema,
-    name: 'DisconnectResultStatusSchema',
-    file: 'disconnect-result-status.failed.json'
-  },
-  // The three ENVELOPES the daemon validates on its hot paths - every poll, every frame flush. They are
-  // the shapes most likely to be "tidied" by a later refactor and the ones whose looseness is load-bearing
-  // (`runs`/`connects`/`disconnects` stay `unknown[]` for per-item skip; `event` stays a loose object so a
-  // newer runtime event cannot poison an older consumer), so freezing them is what keeps that looseness.
-  { schema: PollResponseSchema, name: 'PollResponseSchema', file: 'poll-response.json' },
-  { schema: EventsResponseSchema, name: 'EventsResponseSchema', file: 'events-response.json' },
-  { schema: RunEventEnvelopeSchema, name: 'RunEventEnvelopeSchema', file: 'run-event-envelope.json' }
-]
+	{ schema: RunStartSchema, name: "RunStartSchema", file: "run-start.json" },
+	// v3's loosening, frozen as bytes: a run whose `effort` is outside the universal ladder (Codex
+	// `xhigh`). It must decode with the level INTACT - a strict enum here would fail the whole parse and
+	// the daemon would drop the run over one level it has not heard of.
+	{
+		schema: RunStartSchema,
+		name: "RunStartSchema",
+		file: "run-start.unknown-effort.json",
+		since: 3
+	},
+	{ schema: RunImageSchema, name: "RunImageSchema", file: "run-image.json" },
+	{ schema: ToolResultSchema, name: "ToolResultSchema", file: "tool-result.json" },
+	{ schema: ToolCallSchema, name: "ToolCallSchema", file: "tool-call.json" },
+	{
+		schema: RunConversationMsgSchema,
+		name: "RunConversationMsgSchema",
+		file: "run-conversation.json"
+	},
+	{
+		schema: CliConnectionInfoSchema,
+		name: "CliConnectionInfoSchema",
+		file: "cli-connection-info.json"
+	},
+	// The daemon-REPORTED catalog, frozen as bytes: a connection carrying its device's real model list.
+	// The bare fixture above stays the record of a snapshot that reports none - which must keep decoding
+	// to the backend's own fixed answer - so both halves of the additive field are pinned.
+	{
+		schema: CliConnectionInfoSchema,
+		name: "CliConnectionInfoSchema",
+		file: "cli-connection-info.models.json",
+		since: 3
+	},
+	{ schema: CliModelInfoSchema, name: "CliModelInfoSchema", file: "cli-model-info.json", since: 3 },
+	{
+		schema: ConnectInstructionSchema,
+		name: "ConnectInstructionSchema",
+		file: "connect-instruction.json"
+	},
+	{
+		schema: ConnectResultBodySchema,
+		name: "ConnectResultBodySchema",
+		file: "connect-result-body.json"
+	},
+	{
+		schema: DisconnectInstructionSchema,
+		name: "DisconnectInstructionSchema",
+		file: "disconnect-instruction.json"
+	},
+	{
+		schema: DisconnectResultBodySchema,
+		name: "DisconnectResultBodySchema",
+		file: "disconnect-result-body.json"
+	},
+	// The `/connect` handshake response, ENRICHED with the additive `protocolVersion`: freezing it here
+	// proves the versioned response both parses and round-trips (no field dropped), while the frozen
+	// baseline fixtures above stay untouched.
+	{ schema: ConnectResponseSchema, name: "ConnectResponseSchema", file: "connect-response.json" },
+	// The BARE pre-versioning response (only the required `wireToken`, no `protocolVersion` or other
+	// optionals): freezing it locks the backward-compat guarantee - a body from a backend that predates
+	// the additive field still parses and round-trips with nothing injected.
+	{
+		schema: ConnectResponseSchema,
+		name: "ConnectResponseSchema",
+		file: "connect-response.bare.json"
+	},
+	{
+		schema: WebToolManifestEntrySchema,
+		name: "WebToolManifestEntrySchema",
+		file: "web-tool-manifest-entry.json"
+	},
+	{ schema: RunPolicySchema, name: "RunPolicySchema", file: "run-policy.json" },
+	{ schema: McpServerSpecSchema, name: "McpServerSpecSchema", file: "mcp-server-spec.stdio.json" },
+	{ schema: McpServerSpecSchema, name: "McpServerSpecSchema", file: "mcp-server-spec.sse.json" },
+	{ schema: McpServerSpecSchema, name: "McpServerSpecSchema", file: "mcp-server-spec.http.json" },
+	{ schema: AuthHealthSchema, name: "AuthHealthSchema", file: "auth-health.healthy.json" },
+	{ schema: AuthHealthSchema, name: "AuthHealthSchema", file: "auth-health.needs-reauth.json" },
+	{ schema: AuthHealthSchema, name: "AuthHealthSchema", file: "auth-health.unknown.json" },
+	{
+		schema: ConnectResultStatusSchema,
+		name: "ConnectResultStatusSchema",
+		file: "connect-result-status.connected.json"
+	},
+	{
+		schema: ConnectResultStatusSchema,
+		name: "ConnectResultStatusSchema",
+		file: "connect-result-status.needs-login.json"
+	},
+	{
+		schema: ConnectResultStatusSchema,
+		name: "ConnectResultStatusSchema",
+		file: "connect-result-status.installed-needs-login.json"
+	},
+	{
+		schema: ConnectResultStatusSchema,
+		name: "ConnectResultStatusSchema",
+		file: "connect-result-status.not-installed.json"
+	},
+	{
+		schema: ConnectResultStatusSchema,
+		name: "ConnectResultStatusSchema",
+		file: "connect-result-status.failed.json"
+	},
+	{
+		schema: ReasoningEffortSchema,
+		name: "ReasoningEffortSchema",
+		file: "reasoning-effort.default.json"
+	},
+	{
+		schema: ReasoningEffortSchema,
+		name: "ReasoningEffortSchema",
+		file: "reasoning-effort.off.json"
+	},
+	{
+		schema: ReasoningEffortSchema,
+		name: "ReasoningEffortSchema",
+		file: "reasoning-effort.low.json"
+	},
+	{
+		schema: ReasoningEffortSchema,
+		name: "ReasoningEffortSchema",
+		file: "reasoning-effort.medium.json"
+	},
+	{
+		schema: ReasoningEffortSchema,
+		name: "ReasoningEffortSchema",
+		file: "reasoning-effort.high.json"
+	},
+	{
+		schema: PermissionModeSchema,
+		name: "PermissionModeSchema",
+		file: "permission-mode.read-only.json"
+	},
+	{
+		schema: PermissionModeSchema,
+		name: "PermissionModeSchema",
+		file: "permission-mode.auto-edit.json"
+	},
+	{ schema: PermissionModeSchema, name: "PermissionModeSchema", file: "permission-mode.full.json" },
+	{
+		schema: DisconnectResultStatusSchema,
+		name: "DisconnectResultStatusSchema",
+		file: "disconnect-result-status.disconnected.json"
+	},
+	{
+		schema: DisconnectResultStatusSchema,
+		name: "DisconnectResultStatusSchema",
+		file: "disconnect-result-status.not-connected.json"
+	},
+	{
+		schema: DisconnectResultStatusSchema,
+		name: "DisconnectResultStatusSchema",
+		file: "disconnect-result-status.failed.json"
+	},
+	// The three ENVELOPES the daemon validates on its hot paths - every poll, every frame flush. They are
+	// the shapes most likely to be "tidied" by a later refactor and the ones whose looseness is load-bearing
+	// (`runs`/`connects`/`disconnects` stay `unknown[]` for per-item skip; `event` stays a loose object so a
+	// newer runtime event cannot poison an older consumer), so freezing them is what keeps that looseness.
+	{ schema: PollResponseSchema, name: "PollResponseSchema", file: "poll-response.json" },
+	{ schema: EventsResponseSchema, name: "EventsResponseSchema", file: "events-response.json" },
+	{
+		schema: RunEventEnvelopeSchema,
+		name: "RunEventEnvelopeSchema",
+		file: "run-event-envelope.json"
+	},
+	// v7's web-driven CLI login. Every shape below arrived with that version, so `since: 7` keeps the
+	// older directories the honest record of what they actually put on the wire (rule 4).
+	{
+		schema: LoginStartInstructionSchema,
+		name: "LoginStartInstructionSchema",
+		file: "login-start-instruction.json",
+		since: 7
+	},
+	// One frame fixture per relayed kind. `login-event-frame.line.json` is the MAXIMAL one (both optionals
+	// at once, which no real `line` frame carries); the rest freeze the field set each kind really sends.
+	{
+		schema: LoginEventFrameSchema,
+		name: "LoginEventFrameSchema",
+		file: "login-event-frame.line.json",
+		since: 7
+	},
+	{
+		schema: LoginEventFrameSchema,
+		name: "LoginEventFrameSchema",
+		file: "login-event-frame.url.json",
+		since: 7
+	},
+	{
+		schema: LoginEventFrameSchema,
+		name: "LoginEventFrameSchema",
+		file: "login-event-frame.code.json",
+		since: 7
+	},
+	{
+		schema: LoginEventFrameSchema,
+		name: "LoginEventFrameSchema",
+		file: "login-event-frame.done.json",
+		since: 7
+	},
+	{
+		schema: LoginEventFrameSchema,
+		name: "LoginEventFrameSchema",
+		file: "login-event-frame.failed.json",
+		since: 7
+	},
+	{
+		schema: LoginEventKindSchema,
+		name: "LoginEventKindSchema",
+		file: "login-event-kind.line.json",
+		since: 7
+	},
+	{
+		schema: LoginEventKindSchema,
+		name: "LoginEventKindSchema",
+		file: "login-event-kind.url.json",
+		since: 7
+	},
+	{
+		schema: LoginEventKindSchema,
+		name: "LoginEventKindSchema",
+		file: "login-event-kind.code.json",
+		since: 7
+	},
+	{
+		schema: LoginEventKindSchema,
+		name: "LoginEventKindSchema",
+		file: "login-event-kind.done.json",
+		since: 7
+	},
+	{
+		schema: LoginEventKindSchema,
+		name: "LoginEventKindSchema",
+		file: "login-event-kind.failed.json",
+		since: 7
+	},
+	{
+		schema: LoginInputInstructionSchema,
+		name: "LoginInputInstructionSchema",
+		file: "login-input-instruction.json",
+		since: 7
+	},
+	{
+		schema: LoginResultBodySchema,
+		name: "LoginResultBodySchema",
+		file: "login-result-body.json",
+		since: 7
+	},
+	{
+		schema: LoginResultStatusSchema,
+		name: "LoginResultStatusSchema",
+		file: "login-result-status.connected.json",
+		since: 7
+	},
+	{
+		schema: LoginResultStatusSchema,
+		name: "LoginResultStatusSchema",
+		file: "login-result-status.failed.json",
+		since: 7
+	},
+	{
+		schema: LoginResultStatusSchema,
+		name: "LoginResultStatusSchema",
+		file: "login-result-status.cancelled.json",
+		since: 7
+	}
+];
 
 /**
  * Exported schemas deliberately absent from {@link cases}, each with the reason it needs no fixture of
  * its own. EMPTY today: every exported `*Schema` is frozen by at least one fixture. An entry here is a
  * considered exception, never a shortcut for "not written yet".
  */
-const UNFROZEN_BY_DESIGN: readonly string[] = []
+const UNFROZEN_BY_DESIGN: readonly string[] = [];
 
 describe.each(FROZEN_VERSIONS.map((version) => ({ version })))(
-  'protocol v$version fixtures',
-  ({ version }) => {
-    const present = fixtureFiles(version)
-    const isCurrent = version === COMPANION_PROTOCOL_VERSION
+	"protocol v$version fixtures",
+	({ version }) => {
+		const present = fixtureFiles(version);
+		const isCurrent = version === RUNNER_PROTOCOL_VERSION;
 
-    it('has the fixture file every case names', () => {
-      // A version directory that silently lost a fixture would make this suite pass by testing less.
-      // A case introduced by a LATER version is exempt (see `since`) - and only that case, so a v1 shape
-      // that vanished from v1 still fails here.
-      const missing = cases
-        .filter((c) => (c.since ?? 1) <= version && !present.has(c.file))
-        .map((c) => c.file)
-      expect(missing).toEqual([])
-    })
+		it("has the fixture file every case names", () => {
+			// A version directory that silently lost a fixture would make this suite pass by testing less.
+			// A case introduced by a LATER version is exempt (see `since`) - and only that case, so a v1 shape
+			// that vanished from v1 still fails here.
+			const missing = cases
+				.filter((c) => (c.since ?? 1) <= version && !present.has(c.file))
+				.map((c) => c.file);
+			expect(missing).toEqual([]);
+		});
 
-    describe.each(cases.filter((c) => present.has(c.file)))('$name ($file)', ({ schema, file }) => {
-      it('still parses under the CURRENT schema', () => {
-        // RULE 2 + RULE 3, as a test: whatever this version put on the wire must still decode today.
-        // A removed or tightened field fails here, which is the entire point of keeping the bytes.
-        expect(() => schema.parse(loadFixture(version, file))).not.toThrow()
-      })
+		describe.each(cases.filter((c) => present.has(c.file)))("$name ($file)", ({ schema, file }) => {
+			it("still parses under the CURRENT schema", () => {
+				// RULE 2 + RULE 3, as a test: whatever this version put on the wire must still decode today.
+				// A removed or tightened field fails here, which is the entire point of keeping the bytes.
+				expect(() => schema.parse(loadFixture(version, file))).not.toThrow();
+			});
 
-      it(
-        isCurrent
-          ? 'round-trips deep-equal (nothing dropped, nothing coerced)'
-          : 'round-trips equal on every field the current schema still declares',
-        () => {
-          const fixture = loadFixture(version, file)
-          const parsed: unknown = schema.parse(fixture)
-          if (isCurrent) {
-            expect(parsed).toEqual(fixture)
-            return
-          }
-          // An OLDER version may carry a field this major has since dropped, which zod's non-strict
-          // parse strips. So the assertion narrows to the surviving keys: every field the current
-          // schema still declares must come back byte-identical, and only a genuinely retired field
-          // may go missing. A COERCED value still fails, which is what we care about.
-          expect(parsed).toEqual(retainedKeys(fixture, parsed))
-        }
-      )
-    })
-  }
-)
+			it(
+				isCurrent
+					? "round-trips deep-equal (nothing dropped, nothing coerced)"
+					: "round-trips equal on every field the current schema still declares",
+				() => {
+					const fixture = loadFixture(version, file);
+					const parsed: unknown = schema.parse(fixture);
+					if (isCurrent) {
+						expect(parsed).toEqual(fixture);
+						return;
+					}
+					// An OLDER version may carry a field this major has since dropped, which zod's non-strict
+					// parse strips. So the assertion narrows to the surviving keys: every field the current
+					// schema still declares must come back byte-identical, and only a genuinely retired field
+					// may go missing. A COERCED value still fails, which is what we care about.
+					expect(parsed).toEqual(retainedKeys(fixture, parsed));
+				}
+			);
+		});
+	}
+);
 
-describe('fixture coverage of the exported surface', () => {
-  it('freezes every exported wire schema', () => {
-    // The OTHER direction from the per-version file check, and the one that actually catches a gap: that
-    // check walks cases -> files, so it is blind to a schema missing from `cases` ENTIRELY - which is
-    // exactly how four hot-path schemas (the poll/events/run-event envelopes and RunImage) went unfrozen
-    // while the suite stayed green. Enumerating the module's own exports is what closes that hole: adding
-    // a schema to `src/index.ts` without a fixture now fails here, by name.
-    const exported = Object.keys(protocol)
-      .filter((name) => name.endsWith('Schema'))
-      .sort()
-    const covered = new Set(cases.map((c) => c.name))
-    const unfrozen = exported.filter(
-      (name) => !covered.has(name) && !UNFROZEN_BY_DESIGN.includes(name)
-    )
-    expect(unfrozen, `exported schemas with no frozen fixture: ${unfrozen.join(', ')}`).toEqual([])
-  })
+describe("fixture coverage of the exported surface", () => {
+	// A version bump that does not extend `FROZEN_VERSIONS` leaves the new version's fixtures unread AND
+	// silently retires the strict `isCurrent` tier - `version === RUNNER_PROTOCOL_VERSION` is then never
+	// true, so NO version is asserted to round-trip deep-equal. That is how v6 shipped untested.
+	it("freezes the version this source tree speaks, as the last entry", () => {
+		expect(FROZEN_VERSIONS.at(-1)).toBe(RUNNER_PROTOCOL_VERSION);
+	});
 
-  it('names a real exported schema in every case (so a rename cannot orphan one)', () => {
-    // `cases` carries the schema NAME as a string for the test title; if a schema is renamed and the
-    // string is not, the coverage check above would silently pass on a name nothing exports.
-    const exported = new Set(Object.keys(protocol))
-    const unknown = [...new Set(cases.map((c) => c.name))].filter((name) => !exported.has(name))
-    expect(unknown, `case names that no longer exist: ${unknown.join(', ')}`).toEqual([])
-  })
-})
+	it("freezes every exported wire schema", () => {
+		// The OTHER direction from the per-version file check, and the one that actually catches a gap: that
+		// check walks cases -> files, so it is blind to a schema missing from `cases` ENTIRELY - which is
+		// exactly how four hot-path schemas (the poll/events/run-event envelopes and RunImage) went unfrozen
+		// while the suite stayed green. Enumerating the module's own exports is what closes that hole: adding
+		// a schema to `src/index.ts` without a fixture now fails here, by name.
+		const exported = Object.keys(protocol)
+			.filter((name) => name.endsWith("Schema"))
+			.sort();
+		const covered = new Set(cases.map((c) => c.name));
+		const unfrozen = exported.filter(
+			(name) => !covered.has(name) && !UNFROZEN_BY_DESIGN.includes(name)
+		);
+		expect(unfrozen, `exported schemas with no frozen fixture: ${unfrozen.join(", ")}`).toEqual([]);
+	});
 
-describe('connectable tool id set', () => {
-  it('freezes CONNECTABLE_TOOL_IDS to its v1.42.0 value', () => {
-    expect(CONNECTABLE_TOOL_IDS).toEqual(['claude-code', 'codex', 'opencode', 'hermes'])
-  })
-})
+	it("names a real exported schema in every case (so a rename cannot orphan one)", () => {
+		// `cases` carries the schema NAME as a string for the test title; if a schema is renamed and the
+		// string is not, the coverage check above would silently pass on a name nothing exports.
+		const exported = new Set(Object.keys(protocol));
+		const unknown = [...new Set(cases.map((c) => c.name))].filter((name) => !exported.has(name));
+		expect(unknown, `case names that no longer exist: ${unknown.join(", ")}`).toEqual([]);
+	});
+});
 
-describe('the fixture harness itself', () => {
-  it('fails a fixture whose value the schema would COERCE, not just one it would reject', () => {
-    // A harness that only asserted `not.toThrow()` would pass a schema that quietly rewrote a value.
-    // `retainedKeys` projects key PRESENCE only, so a changed value still surfaces.
-    const fixture = { type: 'run.conversation', runId: 'r1', retired: 'gone' }
-    const parsed = { type: 'run.conversation', runId: 'DIFFERENT' }
-    expect(retainedKeys(fixture, parsed)).toEqual({ type: 'run.conversation', runId: 'r1' })
-    expect(retainedKeys(fixture, parsed)).not.toEqual(parsed)
-  })
+describe("connectable tool id set", () => {
+	// NARROWED at protocol v5 (2026-08-02), which is why the version moved: opencode and hermes were
+	// removed because their capability floor could not be enforced. This is the one direction a
+	// narrowing is safe - a peer that still offers a removed CLI is REFUSED a dispatch, which fails
+	// closed. Old daemons keep reporting them; the backend simply will not dispatch to them.
+	it("freezes CONNECTABLE_TOOL_IDS to its v5 value", () => {
+		expect(CONNECTABLE_TOOL_IDS).toEqual(["claude-code", "codex"]);
+	});
+});
 
-  it('drops only the keys the current schema retired', () => {
-    expect(retainedKeys({ a: 1, gone: 2 }, { a: 1 })).toEqual({ a: 1 })
-    expect(retainedKeys({ nested: { keep: 1, gone: 2 } }, { nested: { keep: 1 } })).toEqual({
-      nested: { keep: 1 }
-    })
-  })
-})
+describe("the fixture harness itself", () => {
+	it("fails a fixture whose value the schema would COERCE, not just one it would reject", () => {
+		// A harness that only asserted `not.toThrow()` would pass a schema that quietly rewrote a value.
+		// `retainedKeys` projects key PRESENCE only, so a changed value still surfaces.
+		const fixture = { type: "run.conversation", runId: "r1", retired: "gone" };
+		const parsed = { type: "run.conversation", runId: "DIFFERENT" };
+		expect(retainedKeys(fixture, parsed)).toEqual({ type: "run.conversation", runId: "r1" });
+		expect(retainedKeys(fixture, parsed)).not.toEqual(parsed);
+	});
+
+	it("drops only the keys the current schema retired", () => {
+		expect(retainedKeys({ a: 1, gone: 2 }, { a: 1 })).toEqual({ a: 1 });
+		expect(retainedKeys({ nested: { keep: 1, gone: 2 } }, { nested: { keep: 1 } })).toEqual({
+			nested: { keep: 1 }
+		});
+	});
+});

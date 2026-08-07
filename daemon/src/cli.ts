@@ -1,6 +1,7 @@
 import { realpathSync } from 'node:fs'
 import { argv as processArgv } from 'node:process'
 import { fileURLToPath } from 'node:url'
+import { CONNECTABLE_TOOL_IDS } from '@agentrunner/core/runtime/connect'
 import { BRAND } from './brand'
 import { cmdApprovals } from './commands/approvals'
 import { cmdBackends, cmdStatus } from './commands/backends'
@@ -17,21 +18,47 @@ import { cmdTerminal } from './commands/terminal'
 import { cmdUpdate } from './commands/update'
 import { daemonVersion } from './version'
 
+/**
+ * The column the usage banner's descriptions start at. Nearly every hand-written row below sits here,
+ * and a few long ones land a character or two off it - not enumerated on purpose, because a list of
+ * exceptions rots exactly the way the hardcoded CLI list below it did. This is what the DERIVED rows
+ * pad to, so they cannot drift as that list changes.
+ */
+const USAGE_DESCRIPTION_COL = 47
+
+/**
+ * The `connect` banner row, whose CLI list is DERIVED from the one allowlist the command enforces
+ * rather than retyped: the hardcoded list that stood here still advertised `opencode|hermes` months
+ * after both left {@link CONNECTABLE_TOOL_IDS}, so a user who followed the help got "Unknown CLI" back
+ * from the command it told them to run. The padding is computed for the same reason - a derived list
+ * that changes length must not shift the description column with it.
+ */
+const CONNECT_ROW = `  connect [${CONNECTABLE_TOOL_IDS.join('|')}] [--local]`.padEnd(
+  USAGE_DESCRIPTION_COL
+)
+
+/** The `disconnect` banner row, derived and padded exactly as {@link CONNECT_ROW}. */
+const DISCONNECT_ROW = `  disconnect <${CONNECTABLE_TOOL_IDS.join('|')}> [--local]`.padEnd(
+  USAGE_DESCRIPTION_COL
+)
+
 /** The usage banner printed for an unknown or missing command. */
 const USAGE =
   `Usage: ${BRAND.binary} <command>\n` +
   '  setup [--url <backend>] [--app-scoped]       pair + connect the CLIs, then install the service (one-shot)\n' +
-  '                                               (--app-scoped: skip the service; the app supervises the daemon)\n' +
+  '        [--enroll <code>]                      (--app-scoped: skip the service; the app supervises the daemon)\n' +
+  '                                               (--enroll: pair with a one-time enrollment code, no browser step)\n' +
   '  uninstall                                    remove the service, drop pairings, delete all data\n' +
   '  pair [--url <backend>] [--client-id <id>]   pair with a buyer backend (device authorization)\n' +
   '       [--token <value|->]                     pair with a pre-authorized bearer instead (`-` reads it from stdin)\n' +
+  '       [--enroll <code>]                       pair with a one-time enrollment code instead (no browser step)\n' +
   '  unpair [--url <backend>] [--user <id>]       remove a backend pairing and its stored bearer\n' +
   '  (--user <id>)                                two SaaS logins can share this machine: each pairs, connects and\n' +
   '                                               runs on its own. Every command that names a pairing takes --user,\n' +
   '                                               and asks for it when one backend has two accounts\n' +
-  '  connect [claude-code|codex|opencode|hermes] [--local]  detect / install / log in the coding CLIs\n' +
+  `${CONNECT_ROW}detect / install / log in the coding CLIs\n` +
   '                                               (--local: connect for purely-local use, no backend pairing)\n' +
-  `  disconnect <claude-code|codex|opencode|hermes> [--local]  stop ${BRAND.name} driving a CLI (keeps it installed)\n` +
+  `${DISCONNECT_ROW}stop ${BRAND.name} driving a CLI (keeps it installed)\n` +
   '  status [--json]                              print pairing + per-CLI connection state (--json: machine-readable)\n' +
   '  backends                                     list paired backends (device id, connected CLIs, daemon state)\n' +
   '  log [--url <backend>] [--json] [-n <count>]  print the local audit trail (oldest-first; --json for piping)\n' +
@@ -55,6 +82,7 @@ const USAGE =
   '           [--cwd <path>]                      run the session in one of YOUR folders instead\n' +
   '  terminal --local --app-config <path>         open that session with no backend at all - composed on this device\n' +
   '  serve [--url <backend>] [--if-paired]        pair + connect a CLI if needed, then run the daemon\n' +
+  '        [--enroll <code>]                      (--enroll: redeem a one-time enrollment code at boot instead of pairing)\n' +
   '                                               (--if-paired: run only when already paired, else print a hint and exit 0)\n' +
   '  service <install|uninstall|status>           manage the always-on OS service\n' +
   '  update [--check|--rollback|--auto on|off]     update to the latest release (default: on, checked periodically)\n' +
@@ -85,34 +113,34 @@ const RETIRED_COMMANDS: Record<string, string> = {
 }
 
 /**
- * The OpenCompanion headless CLI entry. `opencompanion setup` pairs, connects the CLIs, and installs the
- * always-on service in one step (what the installer runs); `opencompanion pair` runs the RFC-8628 device-authorization
- * grant against a buyer backend's Better Auth and stores the session bearer; `opencompanion connect`
- * detects / installs / logs in the user's subscription coding CLIs; `opencompanion disconnect <tool>` stops
- * the companion driving one CLI (leaving it installed + signed in); `opencompanion status` prints
- * the non-secret pairing + connection state; `opencompanion backends` lists each paired backend with its
- * device id, connected-CLI count, and daemon state; `opencompanion approvals show|set` decides whether an
+ * The AgentRunner headless CLI entry. `agentrunner setup` pairs, connects the CLIs, and installs the
+ * always-on service in one step (what the installer runs); `agentrunner pair` runs the RFC-8628 device-authorization
+ * grant against a buyer backend's Better Auth and stores the session bearer; `agentrunner connect`
+ * detects / installs / logs in the user's subscription coding CLIs; `agentrunner disconnect <tool>` stops
+ * the runner driving one CLI (leaving it installed + signed in); `agentrunner status` prints
+ * the non-secret pairing + connection state; `agentrunner backends` lists each paired backend with its
+ * device id, connected-CLI count, and daemon state; `agentrunner approvals show|set` decides whether an
  * interactive terminal session leaves the user's coding CLI its own approval prompts (per scope, `prompt`
- * by default when paired and `bypass` for the purely-local scope); `opencompanion limits show` prints
- * the local concurrent-run cap and `opencompanion limits set --max-concurrent-runs <n>` changes it (applied to the
- * next run, no restart); `opencompanion mcp list|add|remove` manages the user's OWN local MCP servers per backend -
+ * by default when paired and `bypass` for the purely-local scope); `agentrunner limits show` prints
+ * the local concurrent-run cap and `agentrunner limits set --max-concurrent-runs <n>` changes it (applied to the
+ * next run, no restart); `agentrunner mcp list|add|remove` manages the user's OWN local MCP servers per backend -
  * the servers a `terminal` session gets beside the app's tools, so a buyer's app can expose LOCAL data
  * (a private database, an internal service) to the CLI without any of it crossing the network; they come
  * ONLY from this local config (a backend can never add one - server-pushed MCP servers are always
  * dropped), an unsafe server name is refused at write time, and an `--env` VALUE is stored encrypted in
  * the secret store (never in the state file) and reaches the CLI through its environment, never its
- * argv; `opencompanion log` prints the
- * local audit trail read-only (pretty by default, `--json` for piping, `--url`/`-n` to filter); `opencompanion unpair` removes a
- * pairing (auditing the event, and a running daemon stops serving it within one reconcile); `opencompanion
+ * argv; `agentrunner log` prints the
+ * local audit trail read-only (pretty by default, `--json` for piping, `--url`/`-n` to filter); `agentrunner unpair` removes a
+ * pairing (auditing the event, and a running daemon stops serving it within one reconcile); `agentrunner
  * terminal` opens the user's OWN coding CLI as an interactive session wired to their product - the product's
  * tools served over a loopback MCP, the user's local MCP servers beside them, the backend's composed
  * instructions as the system prompt, and the
  * product's confined work folder as the cwd (`[<productId>]` names the workspace, `--cli` picks the CLI,
  * `--model` pins the model, and `--cwd` runs it in any folder the user names; the scope's `approvals`
  * setting decides whether the CLI keeps its own prompts, and the session is
- * audited fail-closed before the CLI starts); `opencompanion
- * serve` pairs + connects a CLI on demand then boots the daemon (foreground) so it receives + executes dispatched runs; `opencompanion
- * service` manages the always-on per-user OS service; `opencompanion update` applies the latest release
+ * audited fail-closed before the CLI starts); `agentrunner
+ * serve` pairs + connects a CLI on demand then boots the daemon (foreground) so it receives + executes dispatched runs; `agentrunner
+ * service` manages the always-on per-user OS service; `agentrunner update` applies the latest release
  * (staged + checksum-verified, with `--check`, `--rollback`, and `--auto on|off`). `--help`/`-h`/`help` prints the usage banner to
  * stdout and exits 0. Never throws to the top level: a failure prints a clear line and exits non-zero.
  *

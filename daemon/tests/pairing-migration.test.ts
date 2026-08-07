@@ -2,15 +2,16 @@ import { mkdtempSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { describe, expect, it, vi } from 'vitest'
-import { accountScope } from '@opencompanion/core/runtime/account-scope'
-import { canonicalizeBackendUrl } from '@opencompanion/core/runtime/backend-url'
-import { LOCAL_SCOPE } from '@opencompanion/core/runtime/local/scope'
-import { mcpEnvKey, readMcpEnv, writeMcpEnv } from '@opencompanion/core/runtime/mcp-secrets'
-import { bearerKey, readBearer } from '@opencompanion/core/runtime/pair'
+import { accountScope } from '@agentrunner/core/runtime/account-scope'
+import { LOCAL_SCOPE } from '@agentrunner/core/runtime/local/scope'
+import { mcpEnvKey, readMcpEnv, writeMcpEnv } from '@agentrunner/core/runtime/mcp-secrets'
+import { bearerKey, readBearer } from '@agentrunner/core/runtime/pair'
 import { migratePairingKeys } from '../src/pairing-migration'
-import { makeMasterKey } from '@opencompanion/core/runtime/master-key'
-import { createFileSecretStore, type SecretStore } from '@opencompanion/core/runtime/storage/secret-store'
-import { createStateStore, type StateStore } from '@opencompanion/core/runtime/storage/state-store'
+import { makeMasterKey } from '@agentrunner/core/runtime/master-key'
+import { createFileSecretStore  } from '@agentrunner/core/runtime/storage/secret-store'
+import type {SecretStore} from '@agentrunner/core/runtime/storage/secret-store';
+import { createStateStore  } from '@agentrunner/core/runtime/storage/state-store'
+import type {StateStore} from '@agentrunner/core/runtime/storage/state-store';
 
 /** The two raw URL variants an old daemon could have keyed for one physical backend. */
 const VARIANT_A = 'https://App.com/api' // uppercase host -> canonical differs
@@ -19,7 +20,7 @@ const CANONICAL = 'https://app.com/api'
 
 /** Real (temp-backed) state + secret stores under the OS temp root. */
 function harness(): { state: StateStore; secrets: SecretStore } {
-  const dir = mkdtempSync(join(tmpdir(), 'companion-migration-'))
+  const dir = mkdtempSync(join(tmpdir(), 'runner-migration-'))
   const state = createStateStore({ cwd: dir })
   const secrets = createFileSecretStore({
     dir: join(dir, 'secrets'),

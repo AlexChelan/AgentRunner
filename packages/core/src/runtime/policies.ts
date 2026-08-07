@@ -1,6 +1,6 @@
-import type { RunPolicy } from '@opencompanion/protocol'
-import { brand } from './brand'
-import { isLocalScope } from './local/scope'
+import type { RunPolicy } from "@agentrunner/protocol";
+import { brand } from "./brand";
+import { isLocalScope } from "./local/scope";
 
 /**
  * The run postures that replaced the per-backend capability ceiling STORE, and the ONE control that
@@ -28,11 +28,14 @@ import { isLocalScope } from './local/scope'
  *
  * `permissionMode: 'read-only'` is the BOTTOM of the ladder, so `clampPolicy` lands every dispatched run
  * there whatever it asked for - and the structural floor removes the filesystem and the shell besides,
- * which no mode expresses. `network: 'on'` lets a run that ASKS for egress have it, so the CLI's own web
- * tools stay available, while a run that asks for nothing keeps the unattended `off` default that
- * `clampPolicy` applies.
+ * which no mode expresses. `network: 'on'` is a CEILING, not a grant: `clampPolicy` takes egress from what
+ * the run asked for, and both sides must say `on`. In practice the chat and schedule lanes ask on EVERY
+ * run - their backend stamps a fixed `network: 'on'` policy onto each dispatch so the CLI's own web tools
+ * survive the floor - so those runs resolve to egress-on unconditionally. The unattended `off` default
+ * `clampPolicy` applies is reached only by a dispatch that carries no policy at all, which is the
+ * product-code dispatch seam.
  */
-export const DISPATCHED_POLICY: RunPolicy = { permissionMode: 'read-only', network: 'on' }
+export const DISPATCHED_POLICY: RunPolicy = { permissionMode: "read-only", network: "on" };
 
 /**
  * The posture every LOCAL surface runs under: the user's own machine, where they are sitting in front of
@@ -41,10 +44,10 @@ export const DISPATCHED_POLICY: RunPolicy = { permissionMode: 'read-only', netwo
  * It serves the desktop app's own chats and schedules driven through the local leg, and it is the
  * posture a terminal session records when it runs under {@link TerminalApproval} `bypass`.
  */
-export const LOCAL_TERMINAL_POLICY: RunPolicy = { permissionMode: 'full', network: 'on' }
+export const LOCAL_TERMINAL_POLICY: RunPolicy = { permissionMode: "full", network: "on" };
 
 /** The posture a terminal session records when it leaves the CLI its own approval prompts. */
-export const PROMPTING_TERMINAL_POLICY: RunPolicy = { permissionMode: 'auto-edit', network: 'on' }
+export const PROMPTING_TERMINAL_POLICY: RunPolicy = { permissionMode: "auto-edit", network: "on" };
 
 /**
  * Whether an interactive TERMINAL session spawns the user's coding CLI with its native approval prompts
@@ -54,7 +57,7 @@ export const PROMPTING_TERMINAL_POLICY: RunPolicy = { permissionMode: 'auto-edit
  * three-rung mode ladder: a terminal session only ever had two outcomes (the bypass flag is emitted, or
  * it is not), so a ladder here would ship a rung that decides nothing.
  */
-export type TerminalApproval = 'prompt' | 'bypass'
+export type TerminalApproval = "prompt" | "bypass";
 
 /**
  * The posture a terminal session records in the local audit log, so the trail says which one it actually
@@ -64,7 +67,7 @@ export type TerminalApproval = 'prompt' | 'bypass'
  * @returns The policy to record.
  */
 export function terminalSessionPolicy(approval: TerminalApproval): RunPolicy {
-  return approval === 'bypass' ? LOCAL_TERMINAL_POLICY : PROMPTING_TERMINAL_POLICY
+	return approval === "bypass" ? LOCAL_TERMINAL_POLICY : PROMPTING_TERMINAL_POLICY;
 }
 
 /**
@@ -79,7 +82,7 @@ export function terminalSessionPolicy(approval: TerminalApproval): RunPolicy {
  * @returns The default approval setting for that scope.
  */
 export function defaultTerminalApproval(scope: string): TerminalApproval {
-  return isLocalScope(scope) ? 'bypass' : 'prompt'
+	return isLocalScope(scope) ? "bypass" : "prompt";
 }
 
 /**
@@ -97,22 +100,25 @@ export function defaultTerminalApproval(scope: string): TerminalApproval {
  * because they did not want that backend's unattended runs on their machine.
  *
  * It also states what did NOT change, because the loss reads far worse without it: a dispatched run
- * still cannot touch the filesystem, the shell, or the user's local MCP servers, whatever it asks for,
- * and it reaches the network only when the run itself asks.
+ * still cannot touch the filesystem, the shell, or the user's local MCP servers, whatever it asks for.
+ * What it does NOT do is soften the egress loss into a conditional. Egress resolves from what the
+ * dispatching app requests, and its chat and schedule lanes request it on every run, so for a user who
+ * denied this scope the network the honest reading is that these runs reach it.
  *
  * @param scope - The account scope (or the local pseudo-scope) whose retired ceiling denied egress.
  * @returns The user-facing line, newline-terminated so a diagnostic sink can write it as-is.
  */
 export function retiredEgressNotice(scope: string): string {
-  const binary = brand().binary
-  const clearing = isLocalScope(scope)
-    ? 'This notice repeats while the retired setting is on disk.'
-    : 'This notice repeats while the retired setting is on disk; unpairing removes it.'
-  return (
-    `Network egress was denied for ${scope} by the retired policy command, and this build does not ` +
-    'enforce it. There is no egress setting here: a dispatched run reaches the network only when the ' +
-    'run itself asks for it, and it can never read, write or search a file, run a shell, or reach your ' +
-    'local MCP servers whatever it asks for. To refuse this scope\'s unattended work outright, run ' +
-    `'${binary} origin set' with --schedule deny --dispatch deny. ${clearing}\n`
-  )
+	const binary = brand().binary;
+	const clearing = isLocalScope(scope)
+		? "This notice repeats while the retired setting is on disk."
+		: "This notice repeats while the retired setting is on disk; unpairing removes it.";
+	return (
+		`Network egress was denied for ${scope} by the retired policy command, and this build does not ` +
+		"enforce it. There is no egress setting here: egress follows what the dispatching app requests, and " +
+		"its chat and schedule lanes request it on every run, so assume those runs reach the network. What " +
+		"they still cannot do is read, write or search a file, run a shell, or reach your local MCP servers, " +
+		"whatever they ask for. To refuse this scope's unattended work outright, run " +
+		`'${binary} origin set' with --schedule deny --dispatch deny. ${clearing}\n`
+	);
 }

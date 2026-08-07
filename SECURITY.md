@@ -1,6 +1,6 @@
 # Security policy
 
-OpenCompanion runs coding tools on your machine on behalf of a backend, so its security properties are
+AgentRunner runs coding tools on your machine on behalf of a backend, so its security properties are
 the whole point. We take reports seriously and want to hear about anything that weakens them.
 
 ## Reporting a vulnerability
@@ -17,12 +17,12 @@ credit you in the release notes.
 
 ## What is in scope
 
-The properties OpenCompanion is meant to guarantee, and where a break is most impactful:
+The properties AgentRunner is meant to guarantee, and where a break is most impactful:
 
-- **Confinement.** A run escaping its `work/<product>/` folder, or reaching OpenCompanion's own state or
+- **Confinement.** A run escaping its `work/<product>/` folder, or reaching AgentRunner's own state or
   secrets.
-- **Clamp-only ceilings.** A backend causing a run to execute above the configured permission or
-  network ceiling.
+- **Structural flooring.** A dispatched run gaining files, shell, or a backend-pushed MCP server -
+  capabilities it is never given, whatever a backend asks for.
 - **Fail-closed auditing.** A dispatched run that executes without a durable audit entry, or a way
   for a backend to write, alter, or hide audit entries.
 - **Pairing and credentials.** Extraction of the stored session bearer, or pairing with a backend

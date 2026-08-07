@@ -1,7 +1,8 @@
-import { existsSync, readFileSync } from 'node:fs'
-import { join } from 'node:path'
-import { isRecord, writeJsonFileAtomic } from './atomic-file'
-import { assertSessionKey } from './chat-store'
+import { existsSync, readFileSync } from "node:fs";
+import { join } from "node:path";
+import { writeJsonFileAtomic } from "./atomic-file";
+import { isRecord } from "./is-record";
+import { assertSessionKey } from "./chat-store";
 
 /**
  * One task's per-device override: the model the task runs on and the reasoning effort, both optional
@@ -10,10 +11,10 @@ import { assertSessionKey } from './chat-store'
  * frontend), so this is a deliberate local mirror.
  */
 export interface LocalTaskOverride {
-  /** The selection key the task runs on (the shared `<cli>@<device>[@<model>]` grammar), when set. */
-  modelKey?: string
-  /** The reasoning effort for the task, when set (an opaque string the daemon never interprets). */
-  effort?: string
+	/** The selection key the task runs on (the shared `<cli>@<device>[@<model>]` grammar), when set. */
+	modelKey?: string;
+	/** The reasoning effort for the task, when set (an opaque string the daemon never interprets). */
+	effort?: string;
 }
 
 /**
@@ -22,16 +23,16 @@ export interface LocalTaskOverride {
  * composes a task run from it in a later phase. This phase only stores + edits the map.
  */
 export interface LocalTaskOverrideStore {
-  /** Returns the full overrides map (an empty object when unset, unreadable, or corrupt - fail safe). */
-  read(): Record<string, LocalTaskOverride>
-  /**
-   * Replaces the WHOLE overrides document (atomic write). Every key must be a safe single path segment
-   * (the chat store's {@link assertSessionKey} rule), so a task id can never `join()` out of the store.
-   *
-   * @param overrides - The full map to persist (an empty object clears it).
-   * @throws When any key violates the safe-key rule.
-   */
-  write(overrides: Record<string, LocalTaskOverride>): void
+	/** Returns the full overrides map (an empty object when unset, unreadable, or corrupt - fail safe). */
+	read(): Record<string, LocalTaskOverride>;
+	/**
+	 * Replaces the WHOLE overrides document (atomic write). Every key must be a safe single path segment
+	 * (the chat store's {@link assertSessionKey} rule), so a task id can never `join()` out of the store.
+	 *
+	 * @param overrides - The full map to persist (an empty object clears it).
+	 * @throws When any key violates the safe-key rule.
+	 */
+	write(overrides: Record<string, LocalTaskOverride>): void;
 }
 
 /**
@@ -45,11 +46,11 @@ export interface LocalTaskOverrideStore {
  * @returns The sanitized override, or `null` when it is not a usable object.
  */
 function sanitizeOverride(value: unknown): LocalTaskOverride | null {
-  if (!isRecord(value)) return null
-  const override: LocalTaskOverride = {}
-  if (typeof value.modelKey === 'string') override.modelKey = value.modelKey
-  if (typeof value.effort === 'string') override.effort = value.effort
-  return override.modelKey === undefined && override.effort === undefined ? null : override
+	if (!isRecord(value)) return null;
+	const override: LocalTaskOverride = {};
+	if (typeof value.modelKey === "string") override.modelKey = value.modelKey;
+	if (typeof value.effort === "string") override.effort = value.effort;
+	return override.modelKey === undefined && override.effort === undefined ? null : override;
 }
 
 /**
@@ -64,36 +65,36 @@ function sanitizeOverride(value: unknown): LocalTaskOverride | null {
  * @returns A file-backed task-override store.
  */
 export function createLocalTaskOverrideStore(dir: string): LocalTaskOverrideStore {
-  const file = join(dir, 'task-overrides.json')
+	const file = join(dir, "task-overrides.json");
 
-  return {
-    read() {
-      if (!existsSync(file)) return {}
-      let parsed: unknown
-      try {
-        parsed = JSON.parse(readFileSync(file, 'utf8'))
-      } catch {
-        return {}
-      }
-      if (!isRecord(parsed)) return {}
-      const out: Record<string, LocalTaskOverride> = {}
-      for (const [key, value] of Object.entries(parsed)) {
-        const override = sanitizeOverride(value)
-        if (override !== null) out[key] = override
-      }
-      return out
-    },
-    write(overrides) {
-      // Validate every key BEFORE touching disk so a bad key is a clean throw, never a half-written file.
-      const sanitized: Record<string, LocalTaskOverride> = {}
-      for (const [key, value] of Object.entries(overrides)) {
-        assertSessionKey(key)
-        sanitized[key] = {
-          ...(value.modelKey !== undefined ? { modelKey: value.modelKey } : {}),
-          ...(value.effort !== undefined ? { effort: value.effort } : {})
-        }
-      }
-      writeJsonFileAtomic(file, sanitized)
-    }
-  }
+	return {
+		read() {
+			if (!existsSync(file)) return {};
+			let parsed: unknown;
+			try {
+				parsed = JSON.parse(readFileSync(file, "utf8"));
+			} catch {
+				return {};
+			}
+			if (!isRecord(parsed)) return {};
+			const out: Record<string, LocalTaskOverride> = {};
+			for (const [key, value] of Object.entries(parsed)) {
+				const override = sanitizeOverride(value);
+				if (override !== null) out[key] = override;
+			}
+			return out;
+		},
+		write(overrides) {
+			// Validate every key BEFORE touching disk so a bad key is a clean throw, never a half-written file.
+			const sanitized: Record<string, LocalTaskOverride> = {};
+			for (const [key, value] of Object.entries(overrides)) {
+				assertSessionKey(key);
+				sanitized[key] = {
+					...(value.modelKey !== undefined ? { modelKey: value.modelKey } : {}),
+					...(value.effort !== undefined ? { effort: value.effort } : {})
+				};
+			}
+			writeJsonFileAtomic(file, sanitized);
+		}
+	};
 }

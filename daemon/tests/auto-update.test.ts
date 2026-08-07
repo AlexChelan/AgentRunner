@@ -4,7 +4,8 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { BRAND } from '../src/brand'
-import { startAutoUpdate, type AutoUpdateDeps } from '../src/update/auto-update'
+import {  startAutoUpdate } from '../src/update/auto-update'
+import type {AutoUpdateDeps} from '../src/update/auto-update';
 import type { UpdaterDeps } from '../src/update/updater'
 
 /** The Linux x64 artifact name the fake updater deps resolve to (brand-derived, like `artifactName`). */
@@ -17,7 +18,7 @@ function sha256(content: string): string {
 
 /** A tmp install root carrying a `current` pointer + `versions/<current>` slot, as an install lays down. */
 function freshInstall(current: string): string {
-  const dir = mkdtempSync(join(tmpdir(), 'opencompanion-auto-'))
+  const dir = mkdtempSync(join(tmpdir(), 'agentrunner-auto-'))
   mkdirSync(join(dir, 'versions', current), { recursive: true })
   writeFileSync(join(dir, 'current'), `${current}\n`)
   return dir
@@ -236,7 +237,7 @@ describe('startAutoUpdate', () => {
     loop.stop()
   })
 
-  it('skips the check silently when no release base is configured (an unpublished companion)', async () => {
+  it('skips the check silently when no release base is configured (an unpublished runner)', async () => {
     const install = freshInstall('1.0.0')
     const shutdown = vi.fn()
     const { deps, downloads } = fakeUpdater({ installDir: install, latest: '1.1.0' })

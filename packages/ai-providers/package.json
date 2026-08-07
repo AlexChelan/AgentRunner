@@ -1,6 +1,6 @@
 {
-  "name": "@opencompanion/ai-providers",
-  "version": "0.2.0",
+  "name": "@agentrunner/ai-providers",
+  "version": "1.0.0",
   "private": false,
   "type": "module",
   "sideEffects": false,
@@ -9,6 +9,7 @@
     "./model-key": "./src/model-key.ts"
   },
   "scripts": {
+    "lint": "eslint --cache .",
     "test": "vitest run",
     "check-types": "tsc --noEmit"
   },
@@ -18,11 +19,12 @@
     "@ai-sdk/openai": "^3.0.69",
     "@ai-sdk/openai-compatible": "^2.0.48",
     "@openrouter/ai-sdk-provider": "^2.9.0",
-    "@opencompanion/core-types": "workspace:*",
+    "@agentrunner/core-types": "workspace:*",
     "ai": "6.0.208"
   },
   "devDependencies": {
     "@types/node": "25.6.0",
+    "eslint": "^10.2.0",
     "typescript": "6.0.3",
     "vitest": "4.1.5"
   }

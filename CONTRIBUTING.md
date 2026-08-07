@@ -1,10 +1,10 @@
 # Contributing
 
-Thanks for your interest in OpenCompanion. Issues and pull requests are welcome.
+Thanks for your interest in AgentRunner. Issues and pull requests are welcome.
 
 ## How this repository is maintained
 
-OpenCompanion is developed inside an upstream monorepo and exported here. This repository is the
+AgentRunner is developed inside an upstream monorepo and exported here. This repository is the
 canonical open-source source you build and run, but changes are integrated upstream and re-exported,
 rather than committed here in isolation. In practice:
 
@@ -23,7 +23,7 @@ The short version:
 
 ```sh
 pnpm install
-pnpm --filter opencompanion standalone   # build the self-contained daemon
+pnpm --filter agentrunner standalone   # build the self-contained daemon
 pnpm check-types
 pnpm test
 ```

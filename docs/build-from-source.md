@@ -1,6 +1,6 @@
 # Build from source
 
-You do not need the prebuilt release to run OpenCompanion. This repository is the full source; you can
+You do not need the prebuilt release to run AgentRunner. This repository is the full source; you can
 build and run the self-contained daemon yourself, and read exactly what it does before you do.
 
 For everyday use, see the [README](../README.md) and the guides alongside this one.
@@ -9,37 +9,37 @@ For everyday use, see the [README](../README.md) and the guides alongside this o
 
 Pin these tools for a clean build:
 
-- Node.js `>=22` (the build vendors your current Node into the artifact).
+- Node.js `>=22.18` (the build vendors your current Node into the artifact).
 - pnpm, managed by Corepack from the `packageManager` field: `pnpm@11.1.2`.
 
 ```sh
 corepack enable
 corepack prepare pnpm@11.1.2 --activate
-node --version   # confirm it satisfies >=22
+node --version   # confirm it satisfies >=22.18
 ```
 
 ## Build the daemon
 
 ```sh
-git clone https://github.com/AlexChelan/OpenCompanion.git
-cd opencompanion
+git clone https://github.com/AlexChelan/AgentRunner.git
+cd agentrunner
 pnpm install
-pnpm --filter opencompanion standalone
+pnpm --filter agentrunner standalone
 ```
 
 The `standalone` step produces the same self-contained payload the release ships, under:
 
 ```
-daemon/dist-standalone/opencompanion-<os>-<arch>/
+daemon/dist-standalone/agentrunner-<os>-<arch>/
   node[.exe]        the vendored Node runtime
   daemon/           the bundled daemon (an esbuild bundle + the Claude Agent SDK JS only)
-  opencompanion[.cmd]    the launcher
+  agentrunner[.cmd]    the launcher
 ```
 
 Run it straight from there:
 
 ```sh
-daemon/dist-standalone/opencompanion-<os>-<arch>/opencompanion setup --url https://your-saas.example/api
+daemon/dist-standalone/agentrunner-<os>-<arch>/agentrunner setup --url https://your-saas.example/api
 ```
 
 The build inlines all third-party JavaScript except the agentic SDKs, and it drives the coding CLI
@@ -59,10 +59,10 @@ architecture. To build for a different target, point it at an official Node bina
 for that target and name the target explicitly:
 
 ```sh
-OPENCOMPANION_VENDOR_NODE=/path/to/target/node \
-OPENCOMPANION_TARGET_OS=linux \
-OPENCOMPANION_TARGET_ARCH=arm64 \
-pnpm --filter opencompanion standalone
+AGENTRUNNER_VENDOR_NODE=/path/to/target/node \
+AGENTRUNNER_TARGET_OS=linux \
+AGENTRUNNER_TARGET_ARCH=arm64 \
+pnpm --filter agentrunner standalone
 ```
 
 ## Reproducibility

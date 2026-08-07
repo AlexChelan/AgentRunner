@@ -1,15 +1,15 @@
 {
-	"name": "opencompanion-workspace",
+	"name": "agentrunner-workspace",
 	"private": true,
-	"version": "0.2.0",
+	"version": "1.0.0",
 	"scripts": {
-		"build": "pnpm --filter opencompanion build",
-		"standalone": "pnpm --filter opencompanion standalone",
+		"build": "pnpm --filter agentrunner build",
+		"standalone": "pnpm --filter agentrunner standalone",
 		"check-types": "pnpm -r check-types",
 		"test": "pnpm -r test"
 	},
 	"packageManager": "pnpm@11.1.2",
 	"engines": {
-		"node": ">=22"
+		"node": ">=22.18"
 	}
 }

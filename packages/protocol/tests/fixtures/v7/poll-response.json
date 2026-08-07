@@ -1,0 +1,48 @@
+{
+  "runs": [
+    {
+      "type": "run.start",
+      "runId": "3d9a7c1e-2b4f-4a6d-9c8e-1f2a3b4c5d6e",
+      "agentId": "support-answerer",
+      "productId": "acme-notes",
+      "userId": "Kp3nQ7wRtY2xVzB8mL4jHs6dFgC1aE0u",
+      "connectionId": "claude-code",
+      "input": "Summarize the latest support tickets and draft a reply.",
+      "origin": "site-audit",
+      "webToolManifest": [],
+      "policy": {
+        "permissionMode": "auto-edit",
+        "network": "on"
+      }
+    }
+  ],
+  "cancel": [
+    "7f8e9d0c-1b2a-4c3d-8e9f-0a1b2c3d4e5f"
+  ],
+  "connects": [
+    {
+      "requestId": "c1d2e3f4-0516-4738-a95a-b6c7d8e9f001",
+      "toolId": "codex",
+      "install": true
+    }
+  ],
+  "disconnects": [
+    {
+      "requestId": "d1e2f304-1526-4748-b95b-c6d7e8f9a002",
+      "toolId": "opencode"
+    }
+  ],
+  "logins": [
+    {
+      "requestId": "9f4b2c10-7d38-4e51-a2c6-8b0d1e5f4a73",
+      "toolId": "codex"
+    }
+  ],
+  "loginInputs": [
+    {
+      "requestId": "9f4b2c10-7d38-4e51-a2c6-8b0d1e5f4a73",
+      "input": "BRA8-Z3UEZ"
+    }
+  ],
+  "wireToken": "wire.token.value"
+}

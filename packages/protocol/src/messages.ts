@@ -1,20 +1,31 @@
-import { z } from 'zod'
-import type { McpServerSpec, ReasoningEffort, RunEvent } from './vocab'
-import { RunPolicySchema, type RunPolicy } from './policy'
+import { z } from "zod";
+import type { McpServerSpec, ReasoningEffort, RunEvent } from "./vocab";
+import { RunPolicySchema } from "./policy";
+import type { RunPolicy } from "./policy";
 
 /**
- * The coding CLI ids the companion daemon can connect and drive - the single source of truth for
+ * The coding CLI ids the runner daemon can connect and drive - the single source of truth for
  * every `connectionId`/`toolId` allowlist on both ends of the wire (backend dispatch/enqueue,
- * daemon connect/run execution, the backend companion-key codec). Adding a CLI here is the one
+ * daemon connect/run execution, the backend runner-key codec). Adding a CLI here is the one
  * required list change; both packages import it, so the two ends can never drift.
  */
-export const CONNECTABLE_TOOL_IDS = ['claude-code', 'codex', 'opencode', 'hermes'] as const
+/**
+ * The CLIs a run may be dispatched to.
+ *
+ * `opencode` and `hermes` were REMOVED (2026-08-02). Both are driven over ACP, which exposes no
+ * tool-restriction control of any kind, so the capability floor could only be REQUESTED of them and
+ * never enforced. The adversarial suite settled what that meant on 2026-07-29 against the real
+ * binaries: a floored run read a file outside its work folder on both, and on Hermes it read the
+ * user's `~/.ssh` and printed the key material back to the paired backend. A CLI on this list must
+ * make "a dispatched run cannot touch this machine" TRUE, not merely ask for it.
+ */
+export const CONNECTABLE_TOOL_IDS = ["claude-code", "codex"] as const;
 
-/** A CLI tool id the companion daemon can connect and drive (see {@link CONNECTABLE_TOOL_IDS}). */
-export type ConnectableToolId = (typeof CONNECTABLE_TOOL_IDS)[number]
+/** A CLI tool id the runner daemon can connect and drive (see {@link CONNECTABLE_TOOL_IDS}). */
+export type ConnectableToolId = (typeof CONNECTABLE_TOOL_IDS)[number];
 
 /**
- * Whether a string is a CLI tool id the companion daemon can connect and drive - the shared
+ * Whether a string is a CLI tool id the runner daemon can connect and drive - the shared
  * allowlist predicate both the backend (dispatch, connect enqueue) and the daemon (connect-runner,
  * run execution) apply.
  *
@@ -22,8 +33,72 @@ export type ConnectableToolId = (typeof CONNECTABLE_TOOL_IDS)[number]
  * @returns True when it is a connectable CLI id.
  */
 export function isConnectableToolId(value: string): value is ConnectableToolId {
-  return (CONNECTABLE_TOOL_IDS as readonly string[]).includes(value)
+	return (CONNECTABLE_TOOL_IDS as readonly string[]).includes(value);
 }
+
+/**
+ * The CLIs a turn's image attachments actually reach.
+ *
+ * This describes what OUR DRIVER SENDS, per each adapter's declared `AdapterCapabilities.images` -
+ * Claude Code's Agent SDK takes a streamed user message with base64 image content blocks
+ * (`adapters/claude-code.ts`), so images ride the turn natively; Codex's driver params carry no images
+ * at all, so an attachment handed to it is discarded inside the adapter with nothing upstream saying so.
+ * It is deliberately NOT a claim about what the underlying MODEL can see: a Codex model may well be
+ * multimodal, and this list would still exclude it, because the gap is in the driver.
+ *
+ * Lives beside {@link CONNECTABLE_TOOL_IDS} so the ONE list is read by every layer that must agree -
+ * the backend's dispatch gate, and the web composer deciding whether to offer an attach control at all.
+ * A dispatcher that let an image through to a CLI outside this list would reproduce, one layer down,
+ * exactly the silent drop the backend's version gate exists to prevent.
+ */
+export const IMAGE_INPUT_CLIS = ["claude-code"] as const;
+
+/** A CLI tool id whose driver carries image attachments (see {@link IMAGE_INPUT_CLIS}). */
+export type ImageInputToolId = (typeof IMAGE_INPUT_CLIS)[number];
+
+/**
+ * Whether a connection's CLI actually carries image attachments to its model, the shared predicate
+ * both the backend dispatch gate and the web composer apply (see {@link IMAGE_INPUT_CLIS}).
+ *
+ * @param value - The candidate tool/connection id.
+ * @returns True when that CLI's driver sends images.
+ */
+export function acceptsImageInput(value: string): value is ImageInputToolId {
+	return (IMAGE_INPUT_CLIS as readonly string[]).includes(value);
+}
+
+/**
+ * How many images one turn may carry, matching the ceiling the shipped web composer already enforces
+ * client-side. A cap here is what makes the per-image ceiling below add up to a bounded total.
+ */
+export const MAX_RUN_IMAGES = 5;
+
+/**
+ * The largest single {@link RunImage.dataUrl}, in characters.
+ *
+ * Sized the same way the daemon's own two caps were, from the same client-side ceiling: the composer
+ * compresses each attachment to ~2 MiB, which base64 inflates to roughly 2.7 MiB of data-URL characters.
+ * 4 MiB per image leaves real headroom over that expansion while still bounding one attachment, and
+ * {@link MAX_RUN_IMAGES} of them come to {@link MAX_RUN_IMAGES_TOTAL_CHARS}.
+ */
+export const MAX_RUN_IMAGE_CHARS = 4 * 1024 * 1024;
+
+/**
+ * The largest total image payload one turn may carry, in characters of `dataUrl`.
+ *
+ * The arithmetic, sized the same way the daemon's local `CHAT_BODY_CAP` (20 MiB) was for this identical
+ * payload: five attachments at the composer's ~2 MiB ceiling inflate to about 13.5 MiB of base64, so
+ * 16 MiB clears every legitimate turn, and the daemon's `MAX_BUFFERED_FRAME_CHARS` (32 MiB) - the HARD
+ * limit, above which its SSE decoder THROWS - is twice that again, leaving the prompt, system prompt and
+ * tool manifest that share the frame plenty of room.
+ *
+ * Deliberately BELOW `MAX_RUN_IMAGES * MAX_RUN_IMAGE_CHARS` (20 MiB), so this bound actually binds:
+ * five images each just under the per-image ceiling are refused here rather than summing to a frame
+ * neither cap alone would have caught. Bounding at dispatch rather than only at the decoder is what
+ * keeps an oversized turn a single clean rejection instead of a payload that queues durably for 24h and
+ * knocks the device's stream over on every redelivery.
+ */
+export const MAX_RUN_IMAGES_TOTAL_CHARS = 16 * 1024 * 1024;
 
 /**
  * `zod` schema for the universal {@link ReasoningEffort} ladder - the floor every surface offers when
@@ -35,38 +110,38 @@ export function isConnectableToolId(value: string): value is ConnectableToolId {
  * reason {@link RunStartSchema} gives.
  */
 export const ReasoningEffortSchema = z.enum([
-  'default',
-  'off',
-  'low',
-  'medium',
-  'high'
-]) satisfies z.ZodType<ReasoningEffort>
+	"default",
+	"off",
+	"low",
+	"medium",
+	"high"
+]) satisfies z.ZodType<ReasoningEffort>;
 
 /**
  * `zod` schema for a {@link McpServerSpec} carried in a {@link RunStart}.
- * Mirrors the type field-for-field so a wire payload can be validated before the companion
+ * Mirrors the type field-for-field so a wire payload can be validated before the runner
  * launches the server. The schema is the runtime guard; the static type stays the source of truth.
  */
 export const McpServerSpecSchema = z.object({
-  type: z.enum(['stdio', 'sse', 'http']),
-  command: z.string().optional(),
-  args: z.array(z.string()).optional(),
-  url: z.string().optional(),
-  env: z.record(z.string(), z.string()).optional()
-}) satisfies z.ZodType<McpServerSpec>
+	type: z.enum(["stdio", "sse", "http"]),
+	command: z.string().optional(),
+	args: z.array(z.string()).optional(),
+	url: z.string().optional(),
+	env: z.record(z.string(), z.string()).optional()
+}) satisfies z.ZodType<McpServerSpec>;
 
 /**
  * One web-side tool the agent may call over the daemon transport (knowledge etc.), described as a
  * serializable manifest entry - NO live `ToolSet` (functions cannot cross the wire). The
- * companion turns each entry into a loopback-MCP tool whose `execute` proxies a `tool.call`.
+ * runner turns each entry into a loopback-MCP tool whose `execute` proxies a `tool.call`.
  */
 export interface WebToolManifestEntry {
-  /** Tool name the model invokes. */
-  name: string
-  /** Human-readable description surfaced to the model. */
-  description?: string
-  /** The tool's JSON Schema (object schema). */
-  inputSchema: Record<string, unknown>
+	/** Tool name the model invokes. */
+	name: string;
+	/** Human-readable description surfaced to the model. */
+	description?: string;
+	/** The tool's JSON Schema (object schema). */
+	inputSchema: Record<string, unknown>;
 }
 
 /**
@@ -80,14 +155,14 @@ export interface WebToolManifestEntry {
  * tool would kill an entire dispatch.
  */
 export const WebToolManifestEntrySchema = z.object({
-  name: z.string().min(1),
-  description: z.string().optional(),
-  inputSchema: z.record(z.string(), z.unknown())
-})
+	name: z.string().min(1),
+	description: z.string().optional(),
+	inputSchema: z.record(z.string(), z.unknown())
+});
 
 /**
- * DOWN (backend -> companion): start a fully-composed run. The backend composes the
- * grounded `systemPrompt`, model, web-tool manifest, and policy; the companion fills
+ * DOWN (backend -> runner): start a fully-composed run. The backend composes the
+ * grounded `systemPrompt`, model, web-tool manifest, and policy; the runner fills
  * only the local bits (cwd, binary, loopback MCP). Fully serializable - no `ToolSet`.
  */
 /**
@@ -96,87 +171,87 @@ export const WebToolManifestEntrySchema = z.object({
  * driver and never persists it (the transcript stores only a small thumbnail).
  */
 export interface RunImage {
-  /** The image as a `data:` URL (full-resolution, compressed client-side). */
-  dataUrl: string
-  /** IANA media type of the image. */
-  mediaType: string
-  /** Pixel width, when known. */
-  width?: number
-  /** Pixel height, when known. */
-  height?: number
+	/** The image as a `data:` URL (full-resolution, compressed client-side). */
+	dataUrl: string;
+	/** IANA media type of the image. */
+	mediaType: string;
+	/** Pixel width, when known. */
+	width?: number;
+	/** Pixel height, when known. */
+	height?: number;
 }
 
 /** `zod` schema for {@link RunImage}. */
 export const RunImageSchema = z.object({
-  dataUrl: z.string().min(1),
-  mediaType: z.string().min(1),
-  width: z.number().int().positive().optional(),
-  height: z.number().int().positive().optional()
-})
+	dataUrl: z.string().min(1),
+	mediaType: z.string().min(1),
+	width: z.number().int().positive().optional(),
+	height: z.number().int().positive().optional()
+});
 
 export interface RunStart {
-  type: 'run.start'
-  /** Idempotency key; the companion acks and dedupes by this. */
-  runId: string
-  /**
-   * The composed agent's id. A BACKEND-SIDE correlation id: every producer always sets it, the daemon
-   * carries it but reads nothing from it, and no consumer branches on it. Deliberately kept REQUIRED -
-   * relaxing it to optional would buy nothing (no producer wants to omit it) while making every
-   * consumer handle an absence that never occurs.
-   */
-  agentId: string
-  /** The product this run executes on behalf of (isolation boundary). */
-  productId: string
-  /** The end user whose subscription pays. */
-  userId: string
-  /** The connection (tool + auth mode) to drive. */
-  connectionId: string
-  /**
-   * The user prompt / task input. Deliberately allowed to be EMPTY (the schema has no `.min(1)`): a
-   * turn whose content is carried entirely by {@link RunStart.inputImages} is legitimate, and rejecting
-   * it would drop a valid dispatch.
-   */
-  input: string
-  /**
-   * Images attached to a chat turn, forwarded to an image-capable CLI (Claude Code) in-flight only.
-   * Additive within the frozen major: an older daemon's non-strict parse drops it, so a turn degrades
-   * to text-only rather than failing. Absent on scheduled/product-code dispatches.
-   */
-  inputImages?: RunImage[]
-  /**
-   * OPTIONAL attribution tag for a PRODUCT-CODE dispatch (`dispatchCompanionRun`'s `origin`), e.g.
-   * "site-audit". Absent on chat and scheduled dispatches. The daemon records it in the local audit
-   * log so an app-initiated run is attributable; it has no effect on execution. Additive within the
-   * frozen major: an older daemon's non-strict parse simply drops it.
-   */
-  origin?: string
-  /** The grounded system prompt the backend composed. */
-  systemPrompt?: string
-  /** Pinned model id for this run. */
-  modelId?: string
-  /**
-   * Reasoning effort for this run, mapped by the daemon onto the CLI's native reasoning knob (Claude
-   * Code adaptive thinking + effort, Codex `modelReasoningEffort`); a CLI without one ignores it.
-   * Absent/`"default"` leaves the model's native behaviour, so a default dispatch is unchanged.
-   *
-   * A plain string, NOT {@link ReasoningEffort}: each model advertises its OWN ladder (Codex reaches
-   * `xhigh`/`max`), so the wire carries whatever level the backend resolved and the adapter decides what
-   * its CLI accepts - see {@link RunStartSchema}.
-   */
-  effort?: string
-  /**
-   * The schedule this run finalizes, when the run was dispatched by a scheduled companion task.
-   * Set ONLY on scheduled dispatch; a chat/ad-hoc run omits it. The backend tags the
-   * run with it so the terminal-frame handler can record the schedule's last-run + assistant output
-   * and fire the schedule's notification, the same way the cloud schedule path does.
-   */
-  scheduleId?: string
-  /** SDK session/thread id to resume a multi-turn conversation. */
-  conversationId?: string
-  /** The web-side tools (knowledge etc.) the agent may call over the daemon transport. */
-  webToolManifest: WebToolManifestEntry[]
-  /** The requested policy (clamped by the per-backend ceiling on arrival). */
-  policy?: RunPolicy
+	type: "run.start";
+	/** Idempotency key; the runner acks and dedupes by this. */
+	runId: string;
+	/**
+	 * The composed agent's id. A BACKEND-SIDE correlation id: every producer always sets it, the daemon
+	 * carries it but reads nothing from it, and no consumer branches on it. Deliberately kept REQUIRED -
+	 * relaxing it to optional would buy nothing (no producer wants to omit it) while making every
+	 * consumer handle an absence that never occurs.
+	 */
+	agentId: string;
+	/** The product this run executes on behalf of (isolation boundary). */
+	productId: string;
+	/** The end user whose subscription pays. */
+	userId: string;
+	/** The connection (tool + auth mode) to drive. */
+	connectionId: string;
+	/**
+	 * The user prompt / task input. Deliberately allowed to be EMPTY (the schema has no `.min(1)`): a
+	 * turn whose content is carried entirely by {@link RunStart.inputImages} is legitimate, and rejecting
+	 * it would drop a valid dispatch.
+	 */
+	input: string;
+	/**
+	 * Images attached to a chat turn, forwarded to an image-capable CLI (Claude Code) in-flight only.
+	 * Additive within the frozen major: an older daemon's non-strict parse drops it, so a turn degrades
+	 * to text-only rather than failing. Absent on scheduled/product-code dispatches.
+	 */
+	inputImages?: RunImage[];
+	/**
+	 * OPTIONAL attribution tag for a PRODUCT-CODE dispatch (`dispatchRunnerRun`'s `origin`), e.g.
+	 * "site-audit". Absent on chat and scheduled dispatches. The daemon records it in the local audit
+	 * log so an app-initiated run is attributable; it has no effect on execution. Additive within the
+	 * frozen major: an older daemon's non-strict parse simply drops it.
+	 */
+	origin?: string;
+	/** The grounded system prompt the backend composed. */
+	systemPrompt?: string;
+	/** Pinned model id for this run. */
+	modelId?: string;
+	/**
+	 * Reasoning effort for this run, mapped by the daemon onto the CLI's native reasoning knob (Claude
+	 * Code adaptive thinking + effort, Codex `modelReasoningEffort`); a CLI without one ignores it.
+	 * Absent/`"default"` leaves the model's native behaviour, so a default dispatch is unchanged.
+	 *
+	 * A plain string, NOT {@link ReasoningEffort}: each model advertises its OWN ladder (Codex reaches
+	 * `xhigh`/`max`), so the wire carries whatever level the backend resolved and the adapter decides what
+	 * its CLI accepts - see {@link RunStartSchema}.
+	 */
+	effort?: string;
+	/**
+	 * The schedule this run finalizes, when the run was dispatched by a scheduled runner task.
+	 * Set ONLY on scheduled dispatch; a chat/ad-hoc run omits it. The backend tags the
+	 * run with it so the terminal-frame handler can record the schedule's last-run + assistant output
+	 * and fire the schedule's notification, the same way the cloud schedule path does.
+	 */
+	scheduleId?: string;
+	/** SDK session/thread id to resume a multi-turn conversation. */
+	conversationId?: string;
+	/** The web-side tools (knowledge etc.) the agent may call over the daemon transport. */
+	webToolManifest: WebToolManifestEntry[];
+	/** The requested policy (clamped by the per-backend ceiling on arrival). */
+	policy?: RunPolicy;
 }
 
 /**
@@ -193,36 +268,36 @@ export interface RunStart {
  * per-tool knowledge already lives.
  */
 export const RunStartSchema = z.object({
-  type: z.literal('run.start'),
-  runId: z.string().min(1),
-  agentId: z.string().min(1),
-  productId: z.string().min(1),
-  userId: z.string().min(1),
-  connectionId: z.string().min(1),
-  input: z.string(),
-  inputImages: z.array(RunImageSchema).optional(),
-  origin: z.string().min(1).optional(),
-  systemPrompt: z.string().optional(),
-  modelId: z.string().optional(),
-  effort: z.string().min(1).optional(),
-  scheduleId: z.string().optional(),
-  conversationId: z.string().optional(),
-  webToolManifest: z.array(WebToolManifestEntrySchema),
-  policy: RunPolicySchema.optional()
-})
+	type: z.literal("run.start"),
+	runId: z.string().min(1),
+	agentId: z.string().min(1),
+	productId: z.string().min(1),
+	userId: z.string().min(1),
+	connectionId: z.string().min(1),
+	input: z.string(),
+	inputImages: z.array(RunImageSchema).optional(),
+	origin: z.string().min(1).optional(),
+	systemPrompt: z.string().optional(),
+	modelId: z.string().optional(),
+	effort: z.string().min(1).optional(),
+	scheduleId: z.string().optional(),
+	conversationId: z.string().optional(),
+	webToolManifest: z.array(WebToolManifestEntrySchema),
+	policy: RunPolicySchema.optional()
+});
 
-/** DOWN: the reply to a web-side `tool.call` the companion proxied (knowledge result). */
+/** DOWN: the reply to a web-side `tool.call` the runner proxied (knowledge result). */
 export interface ToolResult {
-  type: 'tool.result'
-  runId: string
-  /** Correlates with the `ToolCall.callId` the companion sent up. */
-  callId: string
-  /** Whether the web-side tool succeeded. */
-  ok: boolean
-  /** The serialized tool result (when `ok`). */
-  result?: unknown
-  /** The error message (when not `ok`). */
-  error?: string
+	type: "tool.result";
+	runId: string;
+	/** Correlates with the `ToolCall.callId` the runner sent up. */
+	callId: string;
+	/** Whether the web-side tool succeeded. */
+	ok: boolean;
+	/** The serialized tool result (when `ok`). */
+	result?: unknown;
+	/** The error message (when not `ok`). */
+	error?: string;
 }
 
 /**
@@ -233,74 +308,74 @@ export interface ToolResult {
  * unrecognized future shape fail the whole parse instead of decoding the fields this end knows.
  */
 export const ToolResultSchema = z.object({
-  type: z.literal('tool.result'),
-  runId: z.string().min(1),
-  callId: z.string().min(1),
-  ok: z.boolean(),
-  result: z.unknown().optional(),
-  error: z.string().optional()
-})
+	type: z.literal("tool.result"),
+	runId: z.string().min(1),
+	callId: z.string().min(1),
+	ok: z.boolean(),
+	result: z.unknown().optional(),
+	error: z.string().optional()
+});
 
-/** UP (companion -> backend): one streamed run event, tagged with its run id. */
+/** UP (runner -> backend): one streamed run event, tagged with its run id. */
 export interface RunEventMsg {
-  type: 'run.event'
-  runId: string
-  /** The runtime event (the pure {@link RunEvent} union; the SDK session/thread id rides the separate {@link RunConversationMsg}). */
-  event: RunEvent
+	type: "run.event";
+	runId: string;
+	/** The runtime event (the pure {@link RunEvent} union; the SDK session/thread id rides the separate {@link RunConversationMsg}). */
+	event: RunEvent;
 }
 
 /**
- * UP (companion -> backend): the SDK session/thread id a run produced, carried up so the backend
+ * UP (runner -> backend): the SDK session/thread id a run produced, carried up so the backend
  * can persist it against the run and set `RunStart.conversationId` on the NEXT dispatch to resume
  * the multi-turn conversation. The runtime surfaces this once per run (Claude `session_id` /
  * Codex `thread_id`); the executor forwards it here instead of dropping it.
  */
 export interface RunConversationMsg {
-  type: 'run.conversation'
-  /** The run that produced the session/thread id (correlates with the dispatched `RunStart.runId`). */
-  runId: string
-  /** The SDK session/thread id to persist and replay as `conversationId` on the next turn. */
-  conversationId: string
+	type: "run.conversation";
+	/** The run that produced the session/thread id (correlates with the dispatched `RunStart.runId`). */
+	runId: string;
+	/** The SDK session/thread id to persist and replay as `conversationId` on the next turn. */
+	conversationId: string;
 }
 
 /** `zod` schema for {@link RunConversationMsg}. */
 export const RunConversationMsgSchema = z.object({
-  type: z.literal('run.conversation'),
-  runId: z.string().min(1),
-  conversationId: z.string().min(1)
-})
+	type: z.literal("run.conversation"),
+	runId: z.string().min(1),
+	conversationId: z.string().min(1)
+});
 
 /**
  * UP: the agent invoked a web-side tool; the backend resolves it and replies `tool.result`.
  *
  * There is deliberately NO `type` discriminant: this message rides its OWN route
- * (`POST /companion/tool-call`), so the ROUTE is the discriminant and a `type` field would be a second,
+ * (`POST /runner/tool-call`), so the ROUTE is the discriminant and a `type` field would be a second,
  * unvalidated copy of information the transport already carries. Do not re-add one - the daemon never
  * sent it and no backend ever declared it.
  */
 export interface ToolCall {
-  runId: string
-  /** Correlation id the backend echoes on `tool.result`. */
-  callId: string
-  /** The web-side tool name from the manifest. */
-  name: string
-  /** The tool arguments the model produced. */
-  args: Record<string, unknown>
+	runId: string;
+	/** Correlation id the backend echoes on `tool.result`. */
+	callId: string;
+	/** The web-side tool name from the manifest. */
+	name: string;
+	/** The tool arguments the model produced. */
+	args: Record<string, unknown>;
 }
 
 /** `zod` schema for {@link ToolCall}. */
 export const ToolCallSchema = z.object({
-  runId: z.string().min(1),
-  callId: z.string().min(1),
-  name: z.string().min(1),
-  args: z.record(z.string(), z.unknown())
-}) satisfies z.ZodType<ToolCall>
+	runId: z.string().min(1),
+	callId: z.string().min(1),
+	name: z.string().min(1),
+	args: z.record(z.string(), z.unknown())
+}) satisfies z.ZodType<ToolCall>;
 
 /** The daemon's lazily probed CLI-auth lifecycle state, carried up over presence. */
-export type AuthHealth = 'healthy' | 'needs-reauth' | 'unknown'
+export type AuthHealth = "healthy" | "needs-reauth" | "unknown";
 
 /** `zod` schema for {@link AuthHealth}. */
-export const AuthHealthSchema = z.enum(['healthy', 'needs-reauth', 'unknown'])
+export const AuthHealthSchema = z.enum(["healthy", "needs-reauth", "unknown"]);
 
 /**
  * One model a connected CLI advertises on the reporting device, in the picker's wire shape (the SAME
@@ -315,28 +390,28 @@ export const AuthHealthSchema = z.enum(['healthy', 'needs-reauth', 'unknown'])
  * poll. A LENGTH bound is not a value gate: an id this end has never seen still decodes, which is what
  * keeps the loose `toolId`/`effortLevels` rules intact.
  */
-const MAX_CLI_IDENTIFIER_CHARS = 256
+const MAX_CLI_IDENTIFIER_CHARS = 256;
 
 /** Length ceiling for one reasoning-effort level (`xhigh`, `minimal`); a level is a short word. */
-const MAX_EFFORT_LEVEL_CHARS = 32
+const MAX_EFFORT_LEVEL_CHARS = 32;
 
 /** The most effort levels one model may advertise - a ladder, not a catalog. */
-const MAX_EFFORT_LEVELS = 16
+const MAX_EFFORT_LEVELS = 16;
 
 export interface CliModelInfo {
-  /** The model id a run pins (the CLI's own id, e.g. an OpenCode `provider/model`). */
-  id: string
-  /** The human-readable display name (the id itself when the catalog carries no label). */
-  name: string
-  /** True for the CLI's newest/curated entry, so the picker can seed the default. */
-  recommended?: boolean
-  /**
-   * The reasoning-effort levels this model advertises, in the source's own ladder order. Absent when
-   * the catalog discovered none, which decodes to the shipped ladder (today's behaviour).
-   */
-  effortLevels?: string[]
-  /** The level the model applies to a turn that sends none, when the catalog advertises one. */
-  defaultEffort?: string
+	/** The model id a run pins (the CLI's own id, e.g. an OpenCode `provider/model`). */
+	id: string;
+	/** The human-readable display name (the id itself when the catalog carries no label). */
+	name: string;
+	/** True for the CLI's newest/curated entry, so the picker can seed the default. */
+	recommended?: boolean;
+	/**
+	 * The reasoning-effort levels this model advertises, in the source's own ladder order. Absent when
+	 * the catalog discovered none, which decodes to the shipped ladder (today's behaviour).
+	 */
+	effortLevels?: string[];
+	/** The level the model applies to a turn that sends none, when the catalog advertises one. */
+	defaultEffort?: string;
 }
 
 /**
@@ -347,12 +422,15 @@ export interface CliModelInfo {
  * field exists to carry, and tightening it would fail the whole connections snapshot over one model.
  */
 export const CliModelInfoSchema = z.object({
-  id: z.string().min(1).max(MAX_CLI_IDENTIFIER_CHARS),
-  name: z.string().min(1).max(MAX_CLI_IDENTIFIER_CHARS),
-  recommended: z.boolean().optional(),
-  effortLevels: z.array(z.string().min(1).max(MAX_EFFORT_LEVEL_CHARS)).max(MAX_EFFORT_LEVELS).optional(),
-  defaultEffort: z.string().min(1).max(MAX_EFFORT_LEVEL_CHARS).optional()
-}) satisfies z.ZodType<CliModelInfo>
+	id: z.string().min(1).max(MAX_CLI_IDENTIFIER_CHARS),
+	name: z.string().min(1).max(MAX_CLI_IDENTIFIER_CHARS),
+	recommended: z.boolean().optional(),
+	effortLevels: z
+		.array(z.string().min(1).max(MAX_EFFORT_LEVEL_CHARS))
+		.max(MAX_EFFORT_LEVELS)
+		.optional(),
+	defaultEffort: z.string().min(1).max(MAX_EFFORT_LEVEL_CHARS).optional()
+}) satisfies z.ZodType<CliModelInfo>;
 
 /**
  * The most models ONE CLI may report in a connections snapshot. A live probe measured OpenCode at 137
@@ -365,7 +443,7 @@ export const CliModelInfoSchema = z.object({
  * apply it: the daemon so the connect body stays small, the backend so a hostile daemon cannot bloat the
  * durable device record.
  */
-export const MAX_REPORTED_CLI_MODELS = 200
+export const MAX_REPORTED_CLI_MODELS = 200;
 
 /**
  * Projects a connections snapshot down to its CONNECTION-STATUS subset (`{ toolId, authHealth }`),
@@ -382,9 +460,9 @@ export const MAX_REPORTED_CLI_MODELS = 200
  * @returns The same connections without their model lists (empty when there are none).
  */
 export function toConnectionStatus(
-  connections: readonly CliConnectionInfo[] | undefined
+	connections: readonly CliConnectionInfo[] | undefined
 ): CliConnectionInfo[] {
-  return (connections ?? []).map((conn) => ({ toolId: conn.toolId, authHealth: conn.authHealth }))
+	return (connections ?? []).map((conn) => ({ toolId: conn.toolId, authHealth: conn.authHealth }));
 }
 
 /**
@@ -396,7 +474,7 @@ export function toConnectionStatus(
  * second - so a daemon reporting 5000 distinct tool ids, each with 200 models, would pin megabytes of it
  * and multiply every poll's read cost, which is exactly what that cap exists to prevent.
  */
-export const MAX_REPORTED_CLI_CONNECTIONS = 32
+export const MAX_REPORTED_CLI_CONNECTIONS = 32;
 
 /**
  * One coding CLI the daemon has connected on a device, with its last observed auth-health. Reported
@@ -406,23 +484,23 @@ export const MAX_REPORTED_CLI_CONNECTIONS = 32
  * (which also tracks reuse vs install) stays local; only this connection-status subset crosses the wire.
  */
 export interface CliConnectionInfo {
-  /** The connected CLI's tool id (one of {@link CONNECTABLE_TOOL_IDS}). */
-  toolId: string
-  /** The CLI's last observed auth-health, so the web can flag a connected-but-needs-reauth CLI. */
-  authHealth: AuthHealth
-  /**
-   * The models this CLI advertises ON THIS DEVICE, capped at {@link MAX_REPORTED_CLI_MODELS}. The
-   * backend cannot enumerate a device's per-install providers itself (OpenCode's catalog is whatever
-   * that machine ran `opencode auth` for; Hermes runs the user's own configured model), so the daemon
-   * REPORTS it and the web's per-CLI catalog route serves it.
-   *
-   * Additive within the frozen major, and absent means exactly what it meant before this field existed:
-   * the backend serves its own fixed per-CLI answer. So an older daemon (which never sends it), a
-   * snapshot the daemon has not probed yet, and a CLI whose probe found nothing all decode to today's
-   * behaviour. Reported on CONNECT and on CHANGE, never on the poll: the poll re-reports connections in
-   * a QUERY STRING, which cannot carry a catalog of this size.
-   */
-  models?: CliModelInfo[]
+	/** The connected CLI's tool id (one of {@link CONNECTABLE_TOOL_IDS}). */
+	toolId: string;
+	/** The CLI's last observed auth-health, so the web can flag a connected-but-needs-reauth CLI. */
+	authHealth: AuthHealth;
+	/**
+	 * The models this CLI advertises ON THIS DEVICE, capped at {@link MAX_REPORTED_CLI_MODELS}. The
+	 * backend cannot enumerate a device's per-install providers itself (OpenCode's catalog is whatever
+	 * that machine ran `opencode auth` for; Hermes runs the user's own configured model), so the daemon
+	 * REPORTS it and the web's per-CLI catalog route serves it.
+	 *
+	 * Additive within the frozen major, and absent means exactly what it meant before this field existed:
+	 * the backend serves its own fixed per-CLI answer. So an older daemon (which never sends it), a
+	 * snapshot the daemon has not probed yet, and a CLI whose probe found nothing all decode to today's
+	 * behaviour. Reported on CONNECT and on CHANGE, never on the poll: the poll re-reports connections in
+	 * a QUERY STRING, which cannot carry a catalog of this size.
+	 */
+	models?: CliModelInfo[];
 }
 
 /**
@@ -433,10 +511,10 @@ export interface CliConnectionInfo {
  * must have that ONE entry ignored, not its whole connections snapshot rejected.
  */
 export const CliConnectionInfoSchema = z.object({
-  toolId: z.string().min(1).max(MAX_CLI_IDENTIFIER_CHARS),
-  authHealth: AuthHealthSchema,
-  models: z.array(CliModelInfoSchema).optional()
-}) satisfies z.ZodType<CliConnectionInfo>
+	toolId: z.string().min(1).max(MAX_CLI_IDENTIFIER_CHARS),
+	authHealth: AuthHealthSchema,
+	models: z.array(CliModelInfoSchema).optional()
+}) satisfies z.ZodType<CliConnectionInfo>;
 
 /**
  * A connections snapshot that DROPS the entries it cannot parse instead of failing whole.
@@ -451,20 +529,20 @@ export const CliConnectionInfoSchema = z.object({
  * schemas below, not wire surface of its own, and every exported `*Schema` owes a frozen fixture.
  */
 export const CliConnectionsSchema = z.array(z.unknown()).transform((items) =>
-  items.flatMap((item) => {
-    const parsed = CliConnectionInfoSchema.safeParse(item)
-    return parsed.success ? [parsed.data] : []
-  })
-)
+	items.flatMap((item) => {
+		const parsed = CliConnectionInfoSchema.safeParse(item);
+		return parsed.success ? [parsed.data] : [];
+	})
+);
 
 /** An instruction (backend -> daemon) to run the headless connect flow for one coding CLI. */
 export interface ConnectInstruction {
-  /** The instruction's idempotency + result-correlation key (backend-minted UUID). */
-  requestId: string
-  /** The CLI to connect; the allowlist is enforced backend-side at enqueue AND daemon-side at execution. */
-  toolId: string
-  /** Whether a missing installable CLI may be managed-installed (set only by an explicit user action). */
-  install: boolean
+	/** The instruction's idempotency + result-correlation key (backend-minted UUID). */
+	requestId: string;
+	/** The CLI to connect; the allowlist is enforced backend-side at enqueue AND daemon-side at execution. */
+	toolId: string;
+	/** Whether a missing installable CLI may be managed-installed (set only by an explicit user action). */
+	install: boolean;
 }
 
 /**
@@ -477,37 +555,44 @@ export interface ConnectInstruction {
  * enqueue, daemon-side at execution), which is where it belongs.
  */
 export const ConnectInstructionSchema = z.object({
-  requestId: z.string().min(1),
-  toolId: z.string().min(1),
-  install: z.boolean()
-})
+	requestId: z.string().min(1),
+	toolId: z.string().min(1),
+	install: z.boolean()
+});
 
 /** The typed outcome of one daemon-side headless connect (the extensibility seam for future statuses). */
 export const ConnectResultStatusSchema = z.enum([
-  'connected',
-  'needs-login',
-  'installed-needs-login',
-  'not-installed',
-  'failed'
-])
+	"connected",
+	"needs-login",
+	"installed-needs-login",
+	"not-installed",
+	"failed"
+]);
 
 /** One headless connect outcome status. */
-export type ConnectResultStatus = z.infer<typeof ConnectResultStatusSchema>
+export type ConnectResultStatus = z.infer<typeof ConnectResultStatusSchema>;
 
 /** The result body the daemon POSTs back for one connect instruction. */
 export interface ConnectResultBody {
-  /** The CLI the instruction targeted. */
-  toolId: string
-  /** The typed outcome. */
-  status: ConnectResultStatus
-  /** The recorded auth health (present on `connected`). */
-  authHealth?: AuthHealth
-  /** Vendor install guidance (present on `not-installed` for a system-install-only CLI). */
-  guidance?: string
-  /** The failure reason (present on `failed`). */
-  reason?: string
-  /** The daemon's fresh per-CLI connections snapshot, so the backend can update the device registry. */
-  connections?: CliConnectionInfo[]
+	/** The CLI the instruction targeted. */
+	toolId: string;
+	/** The typed outcome. */
+	status: ConnectResultStatus;
+	/** The recorded auth health (present on `connected`). */
+	authHealth?: AuthHealth;
+	/**
+	 * Vendor install guidance an OLD daemon may still send on `not-installed`.
+	 *
+	 * Nothing produces this any more - it fed the system-install-only tier, which went with Hermes on
+	 * 2026-08-02. It stays PARSEABLE because this wire is additive-only: a daemon on its own update
+	 * cadence is still sending it, and dropping it from the schema would make a live message
+	 * round-trip lossily rather than harmlessly ignored.
+	 */
+	guidance?: string;
+	/** The failure reason (present on `failed`). */
+	reason?: string;
+	/** The daemon's fresh per-CLI connections snapshot, so the backend can update the device registry. */
+	connections?: CliConnectionInfo[];
 }
 
 /**
@@ -518,13 +603,14 @@ export interface ConnectResultBody {
  * reject a whole result whose status this end recognizes but whose optional field set it does not.
  */
 export const ConnectResultBodySchema = z.object({
-  toolId: z.string().min(1),
-  status: ConnectResultStatusSchema,
-  authHealth: AuthHealthSchema.optional(),
-  guidance: z.string().optional(),
-  reason: z.string().optional(),
-  connections: CliConnectionsSchema.optional()
-})
+	toolId: z.string().min(1),
+	status: ConnectResultStatusSchema,
+	authHealth: AuthHealthSchema.optional(),
+	// Accepted, never produced - see the field's note above.
+	guidance: z.string().optional(),
+	reason: z.string().optional(),
+	connections: CliConnectionsSchema.optional()
+});
 
 /**
  * An instruction (backend -> daemon) to stop driving one coding CLI: the daemon removes that CLI's
@@ -532,50 +618,151 @@ export const ConnectResultBodySchema = z.object({
  * command's semantics). Carries no `install` flag - disconnect never touches the install.
  */
 export interface DisconnectInstruction {
-  /** The instruction's idempotency + result-correlation key (backend-minted UUID). */
-  requestId: string
-  /** The CLI to disconnect; the allowlist is enforced backend-side at enqueue AND daemon-side at execution. */
-  toolId: string
+	/** The instruction's idempotency + result-correlation key (backend-minted UUID). */
+	requestId: string;
+	/** The CLI to disconnect; the allowlist is enforced backend-side at enqueue AND daemon-side at execution. */
+	toolId: string;
 }
 
 /** Runtime schema for {@link DisconnectInstruction} (validated per-item at the daemon's hostile edge). */
 export const DisconnectInstructionSchema = z.object({
-  requestId: z.string().min(1),
-  toolId: z.string().min(1)
-})
+	requestId: z.string().min(1),
+	toolId: z.string().min(1)
+});
 
 /**
  * The typed outcome of one daemon-side disconnect. `disconnected` = the connection record was removed;
  * `not-connected` = there was no record to remove (the CLI was already not driven - the same end
  * state, treated as success by the UI); `failed` = the removal errored.
  */
-export const DisconnectResultStatusSchema = z.enum(['disconnected', 'not-connected', 'failed'])
+export const DisconnectResultStatusSchema = z.enum(["disconnected", "not-connected", "failed"]);
 
 /** One disconnect outcome status. */
-export type DisconnectResultStatus = z.infer<typeof DisconnectResultStatusSchema>
+export type DisconnectResultStatus = z.infer<typeof DisconnectResultStatusSchema>;
 
 /** The result body the daemon POSTs back for one disconnect instruction. */
 export interface DisconnectResultBody {
-  /** The CLI the instruction targeted. */
-  toolId: string
-  /** The typed outcome. */
-  status: DisconnectResultStatus
-  /** The failure reason (present on `failed`). */
-  reason?: string
-  /** The daemon's fresh per-CLI connections snapshot, so the backend can update the device registry. */
-  connections?: CliConnectionInfo[]
+	/** The CLI the instruction targeted. */
+	toolId: string;
+	/** The typed outcome. */
+	status: DisconnectResultStatus;
+	/** The failure reason (present on `failed`). */
+	reason?: string;
+	/** The daemon's fresh per-CLI connections snapshot, so the backend can update the device registry. */
+	connections?: CliConnectionInfo[];
 }
 
 /** Runtime schema for {@link DisconnectResultBody} (the transport validates the daemon's POST with it). */
 export const DisconnectResultBodySchema = z.object({
-  toolId: z.string().min(1),
-  status: DisconnectResultStatusSchema,
-  reason: z.string().optional(),
-  connections: CliConnectionsSchema.optional()
-})
+	toolId: z.string().min(1),
+	status: DisconnectResultStatusSchema,
+	reason: z.string().optional(),
+	connections: CliConnectionsSchema.optional()
+});
+
+/** A web-driven CLI-login instruction: start the tool's own login and relay its output. */
+export interface LoginStartInstruction {
+	/** Idempotency + result-correlation key (backend-minted UUID). */
+	requestId: string;
+	/** The CLI to log in; loose string for the same reason as {@link ConnectInstruction.toolId}. */
+	toolId: string;
+}
 
 /**
- * The companion wire-protocol version, advertised by the BACKEND on its `/connect` response and echoed
+ * Runtime schema for {@link LoginStartInstruction} (validated per-item at the daemon's hostile edge).
+ *
+ * `toolId` stays a plain non-empty string, NOT `z.enum(CONNECTABLE_TOOL_IDS)`, for exactly the reason
+ * {@link ConnectInstructionSchema} spells out: a newer backend naming a CLI this daemon has not heard of
+ * must cost that one instruction its execution, never the whole parse. The allowlist is enforced
+ * independently on both ends (backend-side at enqueue, daemon-side at execution).
+ */
+export const LoginStartInstructionSchema = z.object({
+	requestId: z.string().min(1),
+	toolId: z.string().min(1)
+}) satisfies z.ZodType<LoginStartInstruction>;
+
+/** The kinds of frame the daemon relays up during a login session. */
+export const LoginEventKindSchema = z.enum(["line", "url", "code", "done", "failed"]);
+
+/** One relayed login-session frame kind. */
+export type LoginEventKind = z.infer<typeof LoginEventKindSchema>;
+
+/** One relayed login-session frame (daemon -> backend -> web). Values are already redacted daemon-side. */
+export interface LoginEventFrame {
+	/** The login session this frame belongs to (the {@link LoginStartInstruction.requestId}). */
+	requestId: string;
+	/** What the frame carries. */
+	kind: LoginEventKind;
+	/** The line text, URL, code, or failure reason. Absent for `done`. */
+	value?: string;
+	/** Present on `done`: the re-probed auth health. */
+	authHealth?: AuthHealth;
+}
+
+/** Runtime schema for {@link LoginEventFrame} (the transport validates each relayed frame with it). */
+export const LoginEventFrameSchema = z.object({
+	requestId: z.string().min(1),
+	kind: LoginEventKindSchema,
+	value: z.string().optional(),
+	authHealth: AuthHealthSchema.optional()
+}) satisfies z.ZodType<LoginEventFrame>;
+
+/** A paste-back the user submitted in the web UI, delivered to the daemon's live login child stdin. */
+export interface LoginInputInstruction {
+	/** The login session the input belongs to (the {@link LoginStartInstruction.requestId}). */
+	requestId: string;
+	/** The text to write to the live login child's stdin. */
+	input: string;
+}
+
+/** Runtime schema for {@link LoginInputInstruction} (validated per-item at the daemon's hostile edge). */
+export const LoginInputInstructionSchema = z.object({
+	requestId: z.string().min(1),
+	input: z.string().min(1)
+}) satisfies z.ZodType<LoginInputInstruction>;
+
+/**
+ * The terminal outcome of one daemon-side login session. `connected` = the CLI reports itself logged
+ * in; `failed` = the login errored or the CLI stayed signed out; `cancelled` = the session was aborted
+ * (by the user or by the daemon giving up on it).
+ */
+export const LoginResultStatusSchema = z.enum(["connected", "failed", "cancelled"]);
+
+/** One login outcome status. */
+export type LoginResultStatus = z.infer<typeof LoginResultStatusSchema>;
+
+/** The terminal outcome the daemon POSTs when a login session ends. */
+export interface LoginResultBody {
+	/** The CLI the login targeted. */
+	toolId: string;
+	/** The typed outcome. */
+	status: LoginResultStatus;
+	/** The re-probed auth health (present on `connected`). */
+	authHealth?: AuthHealth;
+	/** The failure reason (present on `failed`). */
+	reason?: string;
+	/** The daemon's fresh per-CLI connections snapshot, so the backend can update the device registry. */
+	connections?: CliConnectionInfo[];
+}
+
+/**
+ * Runtime schema for {@link LoginResultBody} (the transport validates the daemon's POST with it).
+ *
+ * A plain object, deliberately NOT a union discriminated on `status` - the same choice as
+ * {@link ConnectResultBodySchema} and {@link DisconnectResultBodySchema}, and for the same reason: a
+ * per-status union would reject a whole result whose status this end recognizes but whose optional
+ * field set it does not.
+ */
+export const LoginResultBodySchema = z.object({
+	toolId: z.string().min(1),
+	status: LoginResultStatusSchema,
+	authHealth: AuthHealthSchema.optional(),
+	reason: z.string().optional(),
+	connections: CliConnectionsSchema.optional()
+}) satisfies z.ZodType<LoginResultBody>;
+
+/**
+ * The runner wire-protocol version, advertised by the BACKEND on its `/connect` response and echoed
  * by the DAEMON on its `/connect` request, so either end can enable new behaviour when it knows the
  * peer supports it. Absent means the un-versioned baseline (1).
  *
@@ -584,7 +771,21 @@ export const DisconnectResultBodySchema = z.object({
  * contract is FROZEN under these rules, and `tests/fixtures/v*` is the machinery that enforces them:
  *
  * 1. SYMMETRIC TOLERANCE. New-to-old and old-to-new both work. This number is a capability signal for
- *    enabling behaviour, NEVER a gate for refusing a peer.
+ *    enabling behaviour, never a gate for refusing a peer - with ONE narrow exception, admitted
+ *    deliberately and fenced by four conditions that must ALL hold before a version may refuse
+ *    anything (the backend's `assertImagesDispatchable` is the only thing that meets them today):
+ *      a. the backend can PROVE the peer drops the payload, from the version it reported - not guess it;
+ *      b. the loss would be INVISIBLE to both the user and the backend, so nothing downstream could
+ *         detect or correct it (an image the daemon parses away leaves the CLI answering confidently
+ *         about a picture it never saw);
+ *      c. no honest DEGRADED form of the turn exists - if the request can be served one notch plainer
+ *         and still be truthful, it must be (that is what `effort` does, and why it never refuses);
+ *      d. the refusal is per-TURN, never per-peer. The connection, the handshake, and every other
+ *         message from that daemon are unaffected; only the one request carrying the undeliverable
+ *         payload is declined, and the same peer's next turn is served normally.
+ *    Anything failing even one of these degrades instead. A version that refused a PEER - dropping the
+ *    connection, or rejecting its unrelated traffic - would break symmetric tolerance outright, and no
+ *    payload is worth that.
  * 2. ADDITIVE ONLY within a major. Never remove a field, never repurpose one, never tighten a schema.
  * 3. ABSENT DECODES TO THE PREVIOUS BEHAVIOUR. Every new field's absence must mean exactly what the
  *    prior version did - that is what makes rule 2 safe rather than merely polite.
@@ -612,31 +813,31 @@ export const DisconnectResultBodySchema = z.object({
  * recording a new `tests/version-baseline.json`, and bumping this constant additionally requires freezing
  * a new `tests/fixtures/v<N>/` directory - that guard fails otherwise.
  */
-export const COMPANION_PROTOCOL_VERSION = 4
+export const RUNNER_PROTOCOL_VERSION = 7;
 
 /**
  * The `/connect` handshake response the backend returns to a pairing daemon. It carries the
  * short-lived wire token the daemon authenticates every subsequent poll/POST with, its resolved
- * companion id, the poll cadence, and - additive - the {@link COMPANION_PROTOCOL_VERSION} the backend
+ * runner id, the poll cadence, and - additive - the {@link RUNNER_PROTOCOL_VERSION} the backend
  * speaks so a daemon can detect the backend's capabilities. Only `wireToken` is required; every other
  * field is optional so a leaner or older backend response still connects, and a daemon that does not
  * know a field simply ignores it.
  */
 export interface ConnectResponse {
-  /** The daemon's resolved companion id (`<userId>:<deviceId>`). */
-  companionId?: string
-  /** The short-lived HMAC wire token that authenticates every subsequent request. */
-  wireToken: string
-  /** The wire protocol version the backend speaks; absent from a pre-versioning backend. */
-  protocolVersion?: number
+	/** The daemon's resolved runner id (`<userId>:<deviceId>`). */
+	runnerId?: string;
+	/** The short-lived HMAC wire token that authenticates every subsequent request. */
+	wireToken: string;
+	/** The wire protocol version the backend speaks; absent from a pre-versioning backend. */
+	protocolVersion?: number;
 }
 
 /** `zod` schema for {@link ConnectResponse} (the transport can validate the handshake body with it). */
 export const ConnectResponseSchema = z.object({
-  companionId: z.string().optional(),
-  wireToken: z.string().min(1),
-  protocolVersion: z.number().int().positive().optional()
-}) satisfies z.ZodType<ConnectResponse>
+	runnerId: z.string().optional(),
+	wireToken: z.string().min(1),
+	protocolVersion: z.number().int().positive().optional()
+}) satisfies z.ZodType<ConnectResponse>;
 
 /**
  * The batch of work the backend hands a daemon: the queued runs to execute, the runIds to cancel, the
@@ -648,21 +849,25 @@ export const ConnectResponseSchema = z.object({
  * which is both faster than the old 1s hot tier and free when idle.
  */
 export interface PollResponse {
-  /** The queued runs to execute, oldest-first. */
-  runs?: RunStart[]
-  /** The runIds whose cancellation is requested. */
-  cancel?: string[]
-  /** The CLI-connect instructions to run. */
-  connects?: ConnectInstruction[]
-  /** The CLI-disconnect instructions to run. */
-  disconnects?: DisconnectInstruction[]
-  /**
-   * A refreshed wire token, when the backend rotates it. Non-empty when present: an empty token is
-   * useless (every later request would 401 with it), so the schema fails loud rather than letting the
-   * daemon swap a working token for a dead one - matching {@link ConnectResponse.wireToken}, which is
-   * the SAME field on the other route and has always been `.min(1)`.
-   */
-  wireToken?: string
+	/** The queued runs to execute, oldest-first. */
+	runs?: RunStart[];
+	/** The runIds whose cancellation is requested. */
+	cancel?: string[];
+	/** The CLI-connect instructions to run. */
+	connects?: ConnectInstruction[];
+	/** The CLI-disconnect instructions to run. */
+	disconnects?: DisconnectInstruction[];
+	/** The web-driven CLI-login sessions to start. */
+	logins?: LoginStartInstruction[];
+	/** The paste-backs to deliver to already-running login sessions' stdin. */
+	loginInputs?: LoginInputInstruction[];
+	/**
+	 * A refreshed wire token, when the backend rotates it. Non-empty when present: an empty token is
+	 * useless (every later request would 401 with it), so the schema fails loud rather than letting the
+	 * daemon swap a working token for a dead one - matching {@link ConnectResponse.wireToken}, which is
+	 * the SAME field on the other route and has always been `.min(1)`.
+	 */
+	wireToken?: string;
 }
 
 /**
@@ -672,12 +877,14 @@ export interface PollResponse {
  * rather than a single bad item dropping the whole batch.
  */
 export const PollResponseSchema = z.object({
-  runs: z.array(z.unknown()).optional(),
-  cancel: z.array(z.string().min(1)).optional(),
-  connects: z.array(z.unknown()).optional(),
-  disconnects: z.array(z.unknown()).optional(),
-  wireToken: z.string().min(1).optional()
-})
+	runs: z.array(z.unknown()).optional(),
+	cancel: z.array(z.string().min(1)).optional(),
+	connects: z.array(z.unknown()).optional(),
+	disconnects: z.array(z.unknown()).optional(),
+	logins: z.array(z.unknown()).optional(),
+	loginInputs: z.array(z.unknown()).optional(),
+	wireToken: z.string().min(1).optional()
+});
 
 /**
  * The cancel-carrying `/events` response envelope: the backend hands pending cancels back on every
@@ -685,14 +892,14 @@ export const PollResponseSchema = z.object({
  * its next poll tick.
  */
 export interface EventsResponse {
-  /** The runIds whose cancellation is requested. */
-  cancel?: string[]
+	/** The runIds whose cancellation is requested. */
+	cancel?: string[];
 }
 
 /** `zod` schema for {@link EventsResponse}; consumers treat a malformed body as "no cancels". */
 export const EventsResponseSchema = z.object({
-  cancel: z.array(z.string().min(1)).optional()
-}) satisfies z.ZodType<EventsResponse>
+	cancel: z.array(z.string().min(1)).optional()
+}) satisfies z.ZodType<EventsResponse>;
 
 /**
  * Envelope-only `zod` schema for a `run.event` frame off the run-event log. Deliberately LENIENT on
@@ -701,7 +908,7 @@ export const EventsResponseSchema = z.object({
  * stream that predates it.
  */
 export const RunEventEnvelopeSchema = z.object({
-  type: z.literal('run.event'),
-  runId: z.string().min(1),
-  event: z.looseObject({ type: z.string() })
-})
+	type: z.literal("run.event"),
+	runId: z.string().min(1),
+	event: z.looseObject({ type: z.string() })
+});

@@ -1,9 +1,13 @@
 import { describe, expect, it, vi } from 'vitest'
 
-// A fake brand deliberately DIFFERENT from the boilerplate OpenCompanion identity. Every user-visible
+import { BRAND, envVar } from '../src/brand'
+import { appDataDir } from '@agentrunner/core/runtime/paths'
+import { buildSystemdUnit, SERVICE_LABEL, unitPath, windowsTaskName } from '../src/service'
+
+// A fake brand deliberately DIFFERENT from the boilerplate AgentRunner identity. Every user-visible
 // surface reads from brand.json, so mocking it here proves - at the unit level, without the full
 // playground export/regen battery - that the derivations track the brand rather than hardcoding
-// "opencompanion". A helper that baked in the boilerplate strings would fail these assertions.
+// "agentrunner". A helper that baked in the boilerplate strings would fail these assertions.
 vi.mock('../brand.json', () => ({
   default: {
     name: 'Acme Helper',
@@ -18,21 +22,17 @@ vi.mock('../brand.json', () => ({
   }
 }))
 
-import { BRAND, envVar } from '../src/brand'
-import { appDataDir } from '@opencompanion/core/runtime/paths'
-import { buildSystemdUnit, SERVICE_LABEL, unitPath, windowsTaskName } from '../src/service'
-
 describe('brand-agnostic derivation (fake brand)', () => {
-  it('BRAND loads from brand.json (here mocked to a non-OpenCompanion brand)', () => {
+  it('bRAND loads from brand.json (here mocked to a non-AgentRunner brand)', () => {
     expect(BRAND.name).toBe('Acme Helper')
     expect(BRAND.binary).toBe('acme-helper')
   })
 
-  it('envVar and the app-data dir derive from the fake brand, not "opencompanion"', () => {
+  it('envVar and the app-data dir derive from the fake brand, not "agentrunner"', () => {
     expect(envVar('RELEASE_BASE')).toBe('ACME_HELPER_RELEASE_BASE')
     const dir = appDataDir({ platform: 'linux', home: '/home/u', env: {} })
     expect(dir).toContain('acme-helper')
-    expect(dir).not.toContain('opencompanion')
+    expect(dir).not.toContain('agentrunner')
   })
 
   it('the OS service identity tracks the fake brand', () => {

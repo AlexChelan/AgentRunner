@@ -1,12 +1,14 @@
+import type { Buffer } from 'node:buffer'
 import { spawn } from 'node:child_process'
 import { writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { BRAND, envVar } from '../brand'
-import { appDataDir } from '@opencompanion/core/runtime/paths'
+import { isContained } from '../container'
+import { appDataDir } from '@agentrunner/core/runtime/paths'
 import { restartService } from '../service'
-import { createStateStore } from '@opencompanion/core/runtime/storage/state-store'
-import { messageOf } from '@opencompanion/core/runtime/error-message'
+import { createStateStore } from '@agentrunner/core/runtime/storage/state-store'
+import { messageOf } from '@agentrunner/core/runtime/error-message'
 import * as ui from '../ui'
 import {
   checkLatest,
@@ -16,9 +18,10 @@ import {
   pruneVersions,
   readCurrent,
   rollbackTarget,
-  stageVersion,
-  type UpdaterDeps
+  stageVersion
+  
 } from '../update/updater'
+import type {UpdaterDeps} from '../update/updater';
 import { flagValue } from './shared'
 
 /**
@@ -45,7 +48,7 @@ async function downloadFile(url: string, dest: string): Promise<void> {
  */
 function runCommand(cmd: string, args: string[]): Promise<{ ok: boolean; stdout: string }> {
   return new Promise((resolve) => {
-    const isBatch = process.platform === 'win32' && /\.(cmd|bat)$/i.test(cmd)
+    const isBatch = process.platform === 'win32' && /\.(?:cmd|bat)$/i.test(cmd)
     const child = spawn(cmd, args, { shell: isBatch, windowsHide: true })
     let stdout = ''
     if (child.stdout) child.stdout.on('data', (chunk: Buffer) => void (stdout += chunk.toString('utf8')))
@@ -94,11 +97,11 @@ export function buildUpdaterDeps(log: (line: string) => void = ui.line): Updater
 
 /**
  * Prints the not-yet-published notice and exits 0. Reached when no release base is configured - a
- * freshly-exported companion whose owner has not published a releases repo yet - so `update` and
+ * freshly-exported runner whose owner has not published a releases repo yet - so `update` and
  * `update --check` are a friendly no-op instead of a failed fetch.
  */
 function reportNoReleaseRepo(): void {
-  ui.line('No release repo configured yet - publish your companion first.')
+  ui.line('No release repo configured yet - publish your runner first.')
   process.exit(0)
 }
 
@@ -202,9 +205,19 @@ function cmdUpdateAuto(argv: string[]): void {
  * self-update. Each mode prints a clear line and exits with the appropriate code; it never throws to
  * the top level.
  *
+ * In CONTAINER MODE every mode is a no-op that names the real update path: the image is the update unit,
+ * so a staged release would land in a writable layer the next pull discards and flip a `current` pointer
+ * the entrypoint never reads. Refused before routing, so `--check` and `--auto` cannot imply otherwise.
+ *
  * @param argv - The process arguments (`argv[0]` is `"update"`).
  */
 export async function cmdUpdate(argv: string[]): Promise<void> {
+  if (isContained()) {
+    ui.line(`${BRAND.name} runs as a container here, so it does not update itself.`)
+    ui.line('Updates are delivered by pulling a new image: docker compose pull && docker compose up -d.')
+    process.exit(0)
+    return
+  }
   if (argv.includes('--auto')) return cmdUpdateAuto(argv)
   if (argv.includes('--check')) return cmdUpdateCheck()
   if (argv.includes('--rollback')) return cmdUpdateRollback()

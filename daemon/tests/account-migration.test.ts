@@ -4,15 +4,18 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { describe, expect, it, vi } from 'vitest'
 import { migrateAccountScopes } from '../src/account-migration'
-import { accountScope } from '@opencompanion/core/runtime/account-scope'
-import { backendKey } from '@opencompanion/core/runtime/backend-key'
-import { LOCAL_SCOPE } from '@opencompanion/core/runtime/local/scope'
-import { makeMasterKey } from '@opencompanion/core/runtime/master-key'
-import { workRoot } from '@opencompanion/core/runtime/paths'
-import { mcpEnvKey, readMcpEnv, writeMcpEnv } from '@opencompanion/core/runtime/mcp-secrets'
-import { bearerKey, readBearer, type FetchFn } from '@opencompanion/core/runtime/pair'
-import { createFileSecretStore, type SecretStore } from '@opencompanion/core/runtime/storage/secret-store'
-import { createStateStore, type StateStore } from '@opencompanion/core/runtime/storage/state-store'
+import { accountScope } from '@agentrunner/core/runtime/account-scope'
+import { backendKey } from '@agentrunner/core/runtime/backend-key'
+import { LOCAL_SCOPE } from '@agentrunner/core/runtime/local/scope'
+import { makeMasterKey } from '@agentrunner/core/runtime/master-key'
+import { workRoot } from '@agentrunner/core/runtime/paths'
+import { mcpEnvKey, readMcpEnv, writeMcpEnv } from '@agentrunner/core/runtime/mcp-secrets'
+import { bearerKey,  readBearer } from '@agentrunner/core/runtime/pair'
+import type {FetchFn} from '@agentrunner/core/runtime/pair';
+import { createFileSecretStore  } from '@agentrunner/core/runtime/storage/secret-store'
+import type {SecretStore} from '@agentrunner/core/runtime/storage/secret-store';
+import { createStateStore  } from '@agentrunner/core/runtime/storage/state-store'
+import type {StateStore} from '@agentrunner/core/runtime/storage/state-store';
 
 /** A legacy install's bare-URL key: what every pre-upgrade record (and its bearer) is stored under. */
 const LEGACY = 'https://app.test/api'
@@ -28,7 +31,7 @@ function legacyBearerKey(backendUrl: string): string {
 
 /** Real (temp-backed) state + secret stores under the OS temp root, plus the root they live in. */
 function harness(): { state: StateStore; secrets: SecretStore; appDataRoot: string } {
-  const dir = mkdtempSync(join(tmpdir(), 'companion-account-migration-'))
+  const dir = mkdtempSync(join(tmpdir(), 'runner-account-migration-'))
   const state = createStateStore({ cwd: dir })
   const secrets = createFileSecretStore({
     dir: join(dir, 'secrets'),
@@ -346,7 +349,7 @@ describe('migrateAccountScopes', () => {
   /**
    * THE concurrency regression. The owner lookups take up to 10s EACH, and `replacePairingState` replaces
    * every map wholesale - so composing the write-back from the pre-lookup snapshot deleted anything a
-   * `companion pair` in another terminal wrote during that window. That process is outside the daemon's
+   * `runner pair` in another terminal wrote during that window. That process is outside the daemon's
    * single-instance lock, and the daemon advertises that a separate `pair` is picked up live.
    */
   it('keeps a pairing written by another process WHILE the owner lookups were running', async () => {

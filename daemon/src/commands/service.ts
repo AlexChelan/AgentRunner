@@ -1,13 +1,14 @@
 import { join } from 'node:path'
-import { argv as processArgv, execPath } from 'node:process'
+import { execPath, argv as processArgv } from 'node:process'
 import { BRAND, envVar } from '../brand'
 import {
   installService,
-  serviceStatus,
-  uninstallService,
   SERVICE_LABEL,
-  type ServiceSpec
+  
+  serviceStatus,
+  uninstallService
 } from '../service'
+import type {ServiceSpec} from '../service';
 import * as ui from '../ui'
 import { flagValue, openStores, positionalArg } from './shared'
 

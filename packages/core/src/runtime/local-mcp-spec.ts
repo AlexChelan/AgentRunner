@@ -1,4 +1,4 @@
-import { z } from 'zod'
+import { z } from "zod";
 
 /**
  * A LOCAL MCP server the USER configured on this machine (`{binary} mcp add`), stored per paired
@@ -26,14 +26,14 @@ import { z } from 'zod'
  * server be handed straight to the runtime's argv builders with no mapping - and the compiler proves it
  * at that call site (`localMcpServers` in `terminal.ts`).
  */
-export type LocalMcpSpec = z.infer<typeof LocalMcpSpecSchema>
+export type LocalMcpSpec = z.infer<typeof LocalMcpSpecSchema>;
 
 /**
  * The charset a stdio server's environment KEY must match: a POSIX-shaped variable name. The keys are
  * merged into the environment of the CLI a `terminal` session spawns, so a malformed name (an empty
  * string, a `=`, a space) must never reach it.
  */
-export const ENV_NAME_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/
+export const ENV_NAME_PATTERN = /^[A-Z_]\w*$/i;
 
 /**
  * True when `name` is a well-formed environment variable name ({@link ENV_NAME_PATTERN}).
@@ -42,7 +42,7 @@ export const ENV_NAME_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/
  * @returns Whether the key is safe to merge into the spawned CLI's environment.
  */
 export function isSafeEnvName(name: string): boolean {
-  return ENV_NAME_PATTERN.test(name)
+	return ENV_NAME_PATTERN.test(name);
 }
 
 /**
@@ -52,18 +52,18 @@ export function isSafeEnvName(name: string): boolean {
  * the NAMES of the environment variables the server needs - their values are secrets and are stored
  * encrypted (see the {@link LocalMcpSpec} note).
  */
-export const LocalMcpSpecSchema = z.discriminatedUnion('type', [
-  z.object({
-    type: z.literal('http'),
-    url: z.url({ protocol: /^https?$/ })
-  }),
-  z.object({
-    type: z.literal('stdio'),
-    command: z.string().min(1),
-    args: z.array(z.string()).optional(),
-    envKeys: z.array(z.string().regex(ENV_NAME_PATTERN)).optional()
-  })
-])
+export const LocalMcpSpecSchema = z.discriminatedUnion("type", [
+	z.object({
+		type: z.literal("http"),
+		url: z.url({ protocol: /^https?$/ })
+	}),
+	z.object({
+		type: z.literal("stdio"),
+		command: z.string().min(1),
+		args: z.array(z.string()).optional(),
+		envKeys: z.array(z.string().regex(ENV_NAME_PATTERN)).optional()
+	})
+]);
 
 /**
  * True when a server can only run with credentials injected into its environment: a `stdio` spec that
@@ -81,7 +81,7 @@ export const LocalMcpSpecSchema = z.discriminatedUnion('type', [
  * @returns Whether the server needs environment values to run.
  */
 export function needsMcpEnv(spec: LocalMcpSpec): boolean {
-  return spec.type === 'stdio' && (spec.envKeys?.length ?? 0) > 0
+	return spec.type === "stdio" && (spec.envKeys?.length ?? 0) > 0;
 }
 
 /**
@@ -94,9 +94,9 @@ export function needsMcpEnv(spec: LocalMcpSpec): boolean {
  * @returns The display line.
  */
 export function describeLocalMcpSpec(name: string, spec: LocalMcpSpec): string {
-  if (spec.type === 'http') return `${name}: http ${spec.url}`
-  const command = [spec.command, ...(spec.args ?? [])].join(' ')
-  const envKeys = spec.envKeys ?? []
-  const env = envKeys.length > 0 ? ` (env: ${envKeys.join(', ')})` : ''
-  return `${name}: stdio ${command}${env}`
+	if (spec.type === "http") return `${name}: http ${spec.url}`;
+	const command = [spec.command, ...(spec.args ?? [])].join(" ");
+	const envKeys = spec.envKeys ?? [];
+	const env = envKeys.length > 0 ? ` (env: ${envKeys.join(", ")})` : "";
+	return `${name}: stdio ${command}${env}`;
 }

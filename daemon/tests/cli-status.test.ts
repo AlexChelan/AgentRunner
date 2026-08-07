@@ -2,15 +2,16 @@ import { describe, expect, it } from 'vitest'
 import { writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import {
-  run,
-  out,
-  tempAppData,
-  pairBackend,
-  createStateStore,
   BRAND,
+  createStateStore,
   daemonVersion,
-  serviceStatus
+  out,
+  pairBackend,
+  run,
+  serviceStatus,
+  tempAppData
 } from './cli-harness'
+import { reducedContainmentLines } from '../src/commands/backends'
 
 describe('cli routing - status + status --json', () => {
   it('routes "status" to a non-secret summary', async () => {
@@ -39,29 +40,6 @@ describe('cli routing - status + status --json', () => {
     expect(out.stdout).toContain('cannot read, write or search any file')
   })
 
-  it('"status" names a connected CLI the floor cannot be enforced for', async () => {
-    const solo = tempAppData('disclose-acp')
-    const state = createStateStore({ cwd: solo })
-    state.upsertPairedBackend('https://acp.example', {
-      backendUrl: 'https://acp.example',
-      deviceId: 'da',
-      userId: 'u1'
-    })
-    state.upsertConnection('https://acp.example', {
-      toolId: 'opencode',
-      source: 'reused',
-      authHealth: 'healthy'
-    })
-    await run(['status'])
-
-    // Named, with what was OBSERVED rather than what is theoretically possible, and with the CLIs that
-    // do hold the guarantee. A claim that quietly stops being true is worse than one never made, and
-    // "may be able to read files" reads as boilerplate where "read ~/.ssh in testing" does not.
-    expect(out.stdout).toContain('OpenCode: NOT CONFINED for app-dispatched work')
-    expect(out.stdout).toContain('~/.ssh')
-    expect(out.stdout).toContain('Claude Code and Codex are confined')
-  })
-
   it('"status" adds no reduced-containment line for a contained CLI', async () => {
     const solo = tempAppData('disclose-claude')
     const state = createStateStore({ cwd: solo })
@@ -70,6 +48,41 @@ describe('cli routing - status + status --json', () => {
 
     expect(out.stdout).not.toContain('REFUSED')
     expect(out.stdout).not.toContain('reduced containment')
+  })
+
+  // The Codex arm is the ONLY reduced-containment line left, and it is a safety disclosure: a dispatched
+  // Codex run is not OS-sandboxed on Windows. Driven directly rather than through `status`, because the
+  // arm is platform-dependent and a suite run only ever sees ONE platform - the negative assertion above
+  // can prove the line is absent HERE, which a broken or deleted arm would satisfy just as well.
+  it('discloses an unenforceable Codex floor, naming the cost, on a host with no OS sandbox', () => {
+    const [line, ...rest] = reducedContainmentLines(['codex'], 'win32')
+
+    expect(rest).toEqual([])
+    expect(line).toContain('Codex')
+    expect(line).toContain('reduced containment')
+    // The whole point of the line: WHY the floor does not hold here, and what it costs the user. A
+    // length check would pass on any string at all.
+    expect(line).toContain('needs an OS sandbox')
+    expect(line).toContain('not prevented from reaching your files')
+  })
+
+  it('stays silent on the platforms that DO enforce the Codex floor', () => {
+    expect(reducedContainmentLines(['codex'], 'darwin')).toEqual([])
+    expect(reducedContainmentLines(['codex'], 'linux')).toEqual([])
+  })
+
+  // A container IS the boundary: the Codex child drops to an unprivileged uid inside it and there is no
+  // host disk to reach, so the same host that reads as "reduced" natively has nothing reduced about it.
+  // Printing the warning anyway would tell a Docker user their files are exposed when they are not.
+  it('says nothing is reduced in container mode, on the very host that would otherwise warn', () => {
+    expect(reducedContainmentLines(['codex'], 'win32', true)).toEqual([])
+    // The same call without container mode still warns - the arm is gated, not deleted.
+    expect(reducedContainmentLines(['codex'], 'win32', false)).toHaveLength(1)
+  })
+
+  it('stays silent for a CLI whose floor holds on every platform', () => {
+    // Claude Code's floor is its own tool base, not an OS sandbox, so no host reduces it.
+    expect(reducedContainmentLines(['claude-code'], 'win32')).toEqual([])
   })
 
   it('"status --json" prints a machine-readable status (plain JSON, no ANSI) with the exact shape', async () => {
@@ -112,7 +125,7 @@ describe('cli routing - status + status --json', () => {
       }
     })
     // No ANSI escape sequences leak into the machine-readable output.
-    expect(out.stdout).not.toContain("\u001b")
+    expect(out.stdout).not.toContain("\u001B")
   })
 
   it('"status --json" reports this build\'s version, the app\'s probe for a terminal-capable daemon', async () => {
@@ -121,7 +134,7 @@ describe('cli routing - status + status --json', () => {
     // SAME release the command does, so its PRESENCE is the app's capability probe: a status document
     // without it is a daemon that must be updated first, and the app says exactly that. Dropping this
     // field would silently turn that check into "every daemon is too old".
-    const solo = tempAppData('statusjson-version')
+    tempAppData('statusjson-version')
     await run(['status', '--json'])
     const parsed = JSON.parse(out.stdout)
     expect(parsed.version).toBe(daemonVersion())

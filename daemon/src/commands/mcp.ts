@@ -1,16 +1,17 @@
-import { isSafeTerminalToolName } from '@opencompanion/core'
-import { scopeBackendUrl } from '@opencompanion/core/runtime/account-scope'
-import { findPairedScopes } from '@opencompanion/core/runtime/backend-url'
+import { isSafeTerminalToolName } from '@agentrunner/core'
+import { scopeBackendUrl } from '@agentrunner/core/runtime/account-scope'
+import { findPairedScopes } from '@agentrunner/core/runtime/backend-url'
 import { BRAND } from '../brand'
-import { isLocalScope, LOCAL_SCOPE } from '@opencompanion/core/runtime/local/scope'
+import { isLocalScope, LOCAL_SCOPE } from '@agentrunner/core/runtime/local/scope'
 import {
   describeLocalMcpSpec,
   isSafeEnvName,
+  
   LocalMcpSpecSchema,
-  needsMcpEnv,
-  type LocalMcpSpec
-} from '@opencompanion/core/runtime/local-mcp-spec'
-import { deleteMcpEnv, writeMcpEnv } from '@opencompanion/core/runtime/mcp-secrets'
+  needsMcpEnv
+} from '@agentrunner/core/runtime/local-mcp-spec'
+import type {LocalMcpSpec} from '@agentrunner/core/runtime/local-mcp-spec';
+import { deleteMcpEnv, writeMcpEnv } from '@agentrunner/core/runtime/mcp-secrets'
 import * as ui from '../ui'
 import { flagValue, flagValues, openStores, positionalArgs, resolveCommandScope } from './shared'
 

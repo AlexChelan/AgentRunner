@@ -1,0 +1,5 @@
+{
+  "type": "http",
+  "url": "http://127.0.0.1:7331/mcp",
+  "env": { "MCP_TOKEN": "tok_live_9f2" }
+}

@@ -1,9 +1,10 @@
-import { randomBytes } from 'node:crypto'
-import { linkSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
-import { join } from 'node:path'
+import type { Buffer } from "node:buffer";
+import { randomBytes } from "node:crypto";
+import { linkSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 
 /** The AES-256-GCM master key length in bytes. */
-const KEY_BYTES = 32
+const KEY_BYTES = 32;
 
 /**
  * Reads back an existing `master.key`, asserting it is exactly {@link KEY_BYTES} bytes. A shorter
@@ -16,11 +17,13 @@ const KEY_BYTES = 32
  * @throws When the file is not exactly 32 bytes.
  */
 function readMasterKey(keyFile: string): Buffer {
-  const existing = readFileSync(keyFile)
-  if (existing.length !== KEY_BYTES) {
-    throw new Error(`master key at ${keyFile} is ${existing.length} bytes, expected ${KEY_BYTES}; remove it and re-pair`)
-  }
-  return existing
+	const existing = readFileSync(keyFile);
+	if (existing.length !== KEY_BYTES) {
+		throw new Error(
+			`master key at ${keyFile} is ${existing.length} bytes, expected ${KEY_BYTES}; remove it and re-pair`
+		);
+	}
+	return existing;
 }
 
 /**
@@ -43,24 +46,24 @@ function readMasterKey(keyFile: string): Buffer {
  * @returns The 32-byte master key.
  */
 export function makeMasterKey(dir: string): Buffer {
-  mkdirSync(dir, { recursive: true, mode: 0o700 })
-  const keyFile = join(dir, 'master.key')
-  const key = randomBytes(KEY_BYTES)
-  const tmpFile = join(dir, `master.key.${randomBytes(6).toString('hex')}.tmp`)
-  try {
-    writeFileSync(tmpFile, key, { mode: 0o600, flag: 'wx' })
-    try {
-      linkSync(tmpFile, keyFile)
-      return key
-    } catch (err) {
-      // Another concurrent boot won the create: read back its key rather than overwriting it. Any
-      // non-EEXIST failure (a real I/O error) is not swallowed.
-      if (err instanceof Error && (err as NodeJS.ErrnoException).code === 'EEXIST') {
-        return readMasterKey(keyFile)
-      }
-      throw err
-    }
-  } finally {
-    rmSync(tmpFile, { force: true })
-  }
+	mkdirSync(dir, { recursive: true, mode: 0o700 });
+	const keyFile = join(dir, "master.key");
+	const key = randomBytes(KEY_BYTES);
+	const tmpFile = join(dir, `master.key.${randomBytes(6).toString("hex")}.tmp`);
+	try {
+		writeFileSync(tmpFile, key, { mode: 0o600, flag: "wx" });
+		try {
+			linkSync(tmpFile, keyFile);
+			return key;
+		} catch (err) {
+			// Another concurrent boot won the create: read back its key rather than overwriting it. Any
+			// non-EEXIST failure (a real I/O error) is not swallowed.
+			if (err instanceof Error && (err as NodeJS.ErrnoException).code === "EEXIST") {
+				return readMasterKey(keyFile);
+			}
+			throw err;
+		}
+	} finally {
+		rmSync(tmpFile, { force: true });
+	}
 }

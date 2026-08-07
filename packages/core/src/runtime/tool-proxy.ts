@@ -1,6 +1,7 @@
-import { jsonSchema, tool, type ToolSet } from '../index'
-import type { ToolCall, WebToolManifestEntry } from '@opencompanion/protocol'
-import { brand } from './brand'
+import { jsonSchema, tool } from "../index";
+import type { ToolSet } from "../index";
+import type { ToolCall, WebToolManifestEntry } from "@agentrunner/protocol";
+import { brand } from "./brand";
 
 /**
  * The `mcpServers` key a dispatched run's web-tool set is served under, and therefore the server
@@ -12,7 +13,7 @@ import { brand } from './brand'
  * @returns The loopback web-tools MCP server name.
  */
 export function webToolServerName(): string {
-  return brand().binary
+	return brand().binary;
 }
 
 /**
@@ -32,22 +33,22 @@ export function webToolServerName(): string {
  * @returns The proxying tool set.
  */
 export function manifestToToolSet(
-  manifest: WebToolManifestEntry[],
-  runId: string,
-  onToolCall: (call: Omit<ToolCall, 'callId'>) => Promise<unknown>
+	manifest: WebToolManifestEntry[],
+	runId: string,
+	onToolCall: (call: Omit<ToolCall, "callId">) => Promise<unknown>
 ): ToolSet {
-  const out: ToolSet = {}
-  for (const entry of manifest) {
-    out[entry.name] = tool({
-      ...(entry.description ? { description: entry.description } : {}),
-      inputSchema: jsonSchema(entry.inputSchema),
-      execute: async (args: unknown) =>
-        onToolCall({
-          runId,
-          name: entry.name,
-          args: (args ?? {}) as Record<string, unknown>
-        })
-    })
-  }
-  return out
+	const out: ToolSet = {};
+	for (const entry of manifest) {
+		out[entry.name] = tool({
+			...(entry.description ? { description: entry.description } : {}),
+			inputSchema: jsonSchema(entry.inputSchema),
+			execute: async (args: unknown) =>
+				onToolCall({
+					runId,
+					name: entry.name,
+					args: (args ?? {}) as Record<string, unknown>
+				})
+		});
+	}
+	return out;
 }

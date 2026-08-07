@@ -1,0 +1,10 @@
+{
+  "toolId": "codex",
+  "status": "connected",
+  "authHealth": "healthy",
+  "reason": "the browser flow completed",
+  "connections": [
+    { "toolId": "claude-code", "authHealth": "healthy" },
+    { "toolId": "codex", "authHealth": "needs-reauth" }
+  ]
+}

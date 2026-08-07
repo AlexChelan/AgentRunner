@@ -3,6 +3,7 @@ import { existsSync, mkdirSync, rmSync, writeFileSync } from 'node:fs'
 import { homedir, userInfo } from 'node:os'
 import { join } from 'node:path'
 import { BRAND } from './brand'
+import { isContained } from './container'
 
 /** The reverse-DNS service label / unit id used across platforms. */
 export const SERVICE_LABEL = BRAND.serviceLabel
@@ -19,7 +20,7 @@ const LEGACY_WINDOWS_TASK_NAME = BRAND.name
  *
  * `schtasks /Create /F /TN <name>` with a BARE name writes into the MACHINE-GLOBAL root of the Task
  * Scheduler Library and force-overwrites, so on a shared PC the second OS user to install the service
- * silently repointed the first user's logon task at their own binary and the first user's companion
+ * silently repointed the first user's logon task at their own binary and the first user's runner
  * stopped starting at login. A `\<Brand>\<user>` path puts each user's task in its own folder, matching
  * the per-user scoping macOS (`~/Library/LaunchAgents`) and Linux (`systemd --user`) already have.
  *
@@ -192,14 +193,24 @@ export function unitPath(platform: NodeJS.Platform, home: string): string {
  * (launchd on macOS, systemd `--user` on Linux, a logon Scheduled Task on Windows). Idempotent: an
  * existing unit is replaced and reloaded.
  *
+ * In CONTAINER MODE there is nothing to install: the container's restart policy already supervises the
+ * daemon, and a unit written inside the image would register a second supervisor for it (and vanish with
+ * the container anyway). Refusing here covers every caller - `service install` and `setup` alike.
+ *
  * @param spec - The service description (program, logs, env).
  * @param deps - Injected platform side effects (for testing).
  * @returns The path of the written unit and a human-readable status line.
+ * @throws When this daemon runs in a container.
  */
 export function installService(
   spec: ServiceSpec,
   deps: ServiceDeps = {}
 ): { path: string; message: string } {
+  if (isContained()) {
+    throw new Error(
+      `${BRAND.name} runs as a container here; the container's restart policy is the service. 'service install' is not available.`
+    )
+  }
   const d = resolveDeps(deps)
   if (d.platform === 'darwin') {
     const path = unitPath('darwin', d.home)
@@ -222,7 +233,7 @@ export function installService(
     const tr = spec.program.map((arg) => `"${arg}"`).join(' ')
     const task = windowsTaskName(d.username)
     d.run('schtasks', ['/Create', '/F', '/SC', 'ONLOGON', '/TN', task, '/TR', tr])
-    // A logon task alone would leave the companion offline until the NEXT logon, so start it now
+    // A logon task alone would leave the runner offline until the NEXT logon, so start it now
     // (matching launchd `bootstrap` / systemd `--now`, which both start the service immediately).
     d.run('schtasks', ['/Run', '/TN', task])
     return { path: `Scheduled Task ${task}`, message: 'installed and started logon Scheduled Task' }

@@ -1,7 +1,8 @@
 import { existsSync } from 'node:fs'
-import { createAuditLog, type AuditEntry } from '@opencompanion/core/runtime/audit-log'
+import {  createAuditLog } from '@agentrunner/core/runtime/audit-log'
+import type {AuditEntry} from '@agentrunner/core/runtime/audit-log';
 import { BRAND } from '../brand'
-import { appDataDir, auditDir } from '@opencompanion/core/runtime/paths'
+import { appDataDir, auditDir } from '@agentrunner/core/runtime/paths'
 import { flagValue } from './shared'
 
 /** The default number of newest audit entries `log` prints when `-n` is not given. */

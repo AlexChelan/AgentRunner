@@ -1,18 +1,18 @@
-// Builds the self-contained OpenCompanion daemon into `dist-standalone/opencompanion-<os>-<arch>/` - the payload
+// Builds the self-contained AgentRunner daemon into `dist-standalone/agentrunner-<os>-<arch>/` - the payload
 // an installer (.pkg/.msi/.deb) or a `curl | sh` script drops on a user's machine, and the folder a
-// Phase-3 `release.yml` tars into `opencompanion-<os>-<arch>.tar.gz`. There is no GUI app and no management
+// Phase-3 `release.yml` tars into `agentrunner-<os>-<arch>.tar.gz`. There is no GUI app and no management
 // UI: the daemon is headless, pairs + connects over its own CLI, and installs itself as an OS service
-// (`opencompanion service install`).
+// (`agentrunner service install`).
 //
 // The daemon ships as a single esbuild bundle (tsup.bundle.config.ts) inlining all third-party JS
 // except the two agentic SDKs, which ship as a small node_modules pruned of their ~210MB optional
 // platform binaries (`--omit=optional`); the user's OWN installed CLI is driven via binaryPath. A
-// vendored Node runs it, and a tiny launcher exposes `opencompanion <cmd>`. Layout produced:
+// vendored Node runs it, and a tiny launcher exposes `agentrunner <cmd>`. Layout produced:
 //
-//   dist-standalone/opencompanion-<os>-<arch>/node[.exe]              the vendored Node runtime
-//   dist-standalone/opencompanion-<os>-<arch>/daemon/cli.js + chunks  the ESM bundle
-//   dist-standalone/opencompanion-<os>-<arch>/daemon/node_modules/    SDK JS only (no heavy binaries)
-//   dist-standalone/opencompanion-<os>-<arch>/opencompanion[.cmd]          the launcher: `opencompanion serve | pair | connect | service ...`
+//   dist-standalone/agentrunner-<os>-<arch>/node[.exe]              the vendored Node runtime
+//   dist-standalone/agentrunner-<os>-<arch>/daemon/cli.js + chunks  the ESM bundle
+//   dist-standalone/agentrunner-<os>-<arch>/daemon/node_modules/    SDK JS only (no heavy binaries)
+//   dist-standalone/agentrunner-<os>-<arch>/agentrunner[.cmd]          the launcher: `agentrunner serve | pair | connect | service ...`
 //
 // Cross-platform: by default the CURRENT platform's Node (`process.execPath`) is vendored and the
 // artifact is named for `process.platform`/`process.arch`. For a CI cross-build, set the brand-prefixed
@@ -25,8 +25,8 @@ import {
   copyFileSync,
   existsSync,
   mkdirSync,
-  readFileSync,
   readdirSync,
+  readFileSync,
   rmSync,
   writeFileSync
 } from 'node:fs'
@@ -34,7 +34,7 @@ import { createRequire } from 'node:module'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
-const companionDir = dirname(dirname(fileURLToPath(import.meta.url)))
+const runnerDir = dirname(dirname(fileURLToPath(import.meta.url)))
 // Single source of the product identity. This .mjs runs outside the TS build (both in the monorepo
 // and in the exported public repo) so it cannot import src/brand.ts - it reads the same data file.
 const brand = JSON.parse(readFileSync(new URL('../brand.json', import.meta.url), 'utf8'))
@@ -44,7 +44,7 @@ const envVar = (suffix) => `${brand.envPrefix}_${suffix}`
 const targetOs = process.env[envVar('TARGET_OS')] ?? process.platform
 const targetArch = process.env[envVar('TARGET_ARCH')] ?? process.arch
 const artifactName = `${brand.binary}-${targetOs}-${targetArch}`
-const distDir = join(companionDir, 'dist-standalone', artifactName)
+const distDir = join(runnerDir, 'dist-standalone', artifactName)
 const daemonOut = join(distDir, 'daemon')
 const nodeOut = distDir
 
@@ -62,32 +62,32 @@ function run(cmd, args, cwd) {
 }
 
 /**
- * Reads the Claude Agent SDK version range from `@opencompanion/core` so the shipped SDK JS always
+ * Reads the Claude Agent SDK version range from `@agentrunner/core` so the shipped SDK JS always
  * matches what the bundle was compiled against. (Codex is driven via the spawned `codex app-server`,
  * not an SDK, so nothing external ships for it.) Resolved via the package id rather than a hard path
- * so the OpenCompanion export's scoped rewrite (`@opencompanion/core` -> `@opencompanion/core`) retargets it at
+ * so the AgentRunner export's scoped rewrite (`@agentrunner/core` -> `@agentrunner/core`) retargets it at
  * `packages/core` unchanged.
  *
  * @returns {{ claude: string }} The Claude Agent SDK version range.
  */
 function sdkVersions() {
   const require = createRequire(import.meta.url)
-  const corePkg = join(dirname(require.resolve('@opencompanion/core')), '..', 'package.json')
+  const corePkg = join(dirname(require.resolve('@agentrunner/core')), '..', 'package.json')
   const pkg = JSON.parse(readFileSync(corePkg, 'utf8'))
   const claude = pkg.dependencies?.['@anthropic-ai/claude-agent-sdk']
   if (!claude) {
-    throw new Error('[standalone] could not read the Claude Agent SDK version from @opencompanion/core')
+    throw new Error('[standalone] could not read the Claude Agent SDK version from @agentrunner/core')
   }
   return { claude }
 }
 
 // 1. Build the distribution bundle (no UI to build).
-run('pnpm', ['exec', 'tsup', '--config', 'tsup.bundle.config.ts'], companionDir)
+run('pnpm', ['exec', 'tsup', '--config', 'tsup.bundle.config.ts'], runnerDir)
 
 // 2. Reset the output and copy the bundle.
 rmSync(distDir, { recursive: true, force: true })
 mkdirSync(daemonOut, { recursive: true })
-const bundleDir = join(companionDir, 'dist-bundle')
+const bundleDir = join(runnerDir, 'dist-bundle')
 if (!existsSync(join(bundleDir, 'cli.js'))) {
   throw new Error(`[standalone] bundle missing at ${bundleDir} (did tsup run?)`)
 }
@@ -102,7 +102,7 @@ writeFileSync(
   join(daemonOut, 'package.json'),
   `${JSON.stringify(
     {
-      name: 'companion-daemon-dist',
+      name: 'runner-daemon-dist',
       private: true,
       type: 'module',
       dependencies: { '@anthropic-ai/claude-agent-sdk': claude }
@@ -119,7 +119,7 @@ const vendoredNode = isWin ? 'node.exe' : 'node'
 copyFileSync(process.env[envVar('VENDOR_NODE')] ?? process.execPath, join(nodeOut, vendoredNode))
 if (!isWin) chmodSync(join(nodeOut, vendoredNode), 0o755)
 
-// 5. The launcher: `opencompanion <cmd>` runs the vendored node against the bundle.
+// 5. The launcher: `agentrunner <cmd>` runs the vendored node against the bundle.
 if (isWin) {
   writeFileSync(
     join(distDir, `${brand.binary}.cmd`),

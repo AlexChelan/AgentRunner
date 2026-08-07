@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { run, out, tempAppData, pairBackend, createStateStore, BRAND } from './cli-harness'
+import { BRAND, createStateStore, out, pairBackend, run, tempAppData } from './cli-harness'
 
 /**
  * `origin` decides whether THIS DEVICE accepts a kind of work at all - a consent control over the
@@ -15,6 +15,22 @@ describe('cli routing - origin show / set', () => {
     expect(out.stdout).toContain('scheduled runs: allowed')
     expect(out.stdout).toContain('app-dispatched runs: allowed')
     expect(out.stdout).toContain('chat runs: always allowed')
+  })
+
+  // The note used to end "the real dispatch gate remains the backend-side per-device grant (default
+  // deny)". That gate was deleted - pairing IS the authorization now - so the sentence told a device
+  // owner a stronger control had their back while THIS deny was in fact one of only two they have. A
+  // stale promise about a security control is worse than no promise: it is the reason someone leaves
+  // the deny off.
+  it('"origin show" names the levers that exist and promises no backend gate', async () => {
+    tempAppData('originnote')
+    await run(['origin', 'show', '--local'])
+    expect(out.stdout).not.toMatch(/per-device grant/i)
+    expect(out.stdout).not.toMatch(/default[- ]deny/i)
+    // The two levers that are real: this deny, and unpairing the backend outright.
+    expect(out.stdout).toMatch(/unpair/i)
+    // The honest limit itself stays - it is what makes the deny's reach understandable.
+    expect(out.stdout).toContain('indistinguishable from chat')
   })
 
   it('"origin" with no subcommand shows the current stance', async () => {
@@ -69,8 +85,8 @@ describe('cli routing - origin show / set', () => {
   it('audits the change as a policy-change carrying the old and new stance', async () => {
     const solo = tempAppData('originaudit')
     await run(['origin', 'set', '--local', '--dispatch', 'deny'])
-    const { createAuditLog } = await import('@opencompanion/core/runtime/audit-log')
-    const { auditDir } = await import('@opencompanion/core/runtime/paths')
+    const { createAuditLog } = await import('@agentrunner/core/runtime/audit-log')
+    const { auditDir } = await import('@agentrunner/core/runtime/paths')
     const entry = createAuditLog({ dir: auditDir(solo) })
       .read({ backendUrl: 'local' })
       .find((e) => e.event === 'policy-change')

@@ -1,0 +1,30 @@
+# AgentRunner as a long-running container. Set the two variables (a `.env` beside this file, or your
+# shell) and run `docker compose up -d`; upgrade with `docker compose pull && docker compose up -d`.
+#
+#   AGENTRUNNER_BACKEND_URL=https://your-saas.example/api
+#   AGENTRUNNER_ENROLL=<one-time code from your app's "Add runner" dialog>
+#
+# The enrollment code is one-shot and pairs the container on first boot; a container that is already
+# paired ignores it (the pairing lives on the volume), so it is safe to leave the variable empty after.
+services:
+  agentrunner:
+    image: ghcr.io/alexchelan/agentrunner:latest
+    restart: unless-stopped
+    # The whole security posture: the daemon keeps only what it needs to drop its CLI children to the
+    # unprivileged `agent` user inside its own volume, and can never gain more than it starts with.
+    cap_drop:
+      - ALL
+    cap_add:
+      - SETUID
+      - SETGID
+      - CHOWN
+    security_opt:
+      - no-new-privileges:true
+    # The ONE mount. No host path and no Docker socket: the container is the machine boundary.
+    volumes:
+      - agentrunner-data:/data
+    environment:
+      - AGENTRUNNER_BACKEND_URL=${AGENTRUNNER_BACKEND_URL:-}
+      - AGENTRUNNER_ENROLL=${AGENTRUNNER_ENROLL:-}
+volumes:
+  agentrunner-data:

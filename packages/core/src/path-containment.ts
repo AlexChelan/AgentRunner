@@ -9,8 +9,8 @@
  * one entered through a link and the same one entered by its real name are ONE folder in the audit log,
  * not two that disagree.
  */
-import { realpathSync } from 'node:fs'
-import { resolve, sep } from 'node:path'
+import { realpathSync } from "node:fs";
+import { resolve, sep } from "node:path";
 
 /**
  * Resolves the deepest existing ancestor of a path through symlinks.
@@ -29,18 +29,18 @@ import { resolve, sep } from 'node:path'
  * @returns The path with its existing prefix canonicalized through symlinks.
  */
 export function realpathDeepest(path: string): string {
-  const absolutePath = resolve(path)
-  let current = absolutePath
-  const tail: string[] = []
-  for (;;) {
-    try {
-      const real = realpathSync(current)
-      return tail.length > 0 ? resolve(real, ...tail.reverse()) : real
-    } catch {
-      const parent = resolve(current, '..')
-      if (parent === current) return absolutePath
-      tail.push(current.slice(parent.endsWith(sep) ? parent.length : parent.length + 1))
-      current = parent
-    }
-  }
+	const absolutePath = resolve(path);
+	let current = absolutePath;
+	const tail: string[] = [];
+	for (;;) {
+		try {
+			const real = realpathSync(current);
+			return tail.length > 0 ? resolve(real, ...tail.reverse()) : real;
+		} catch {
+			const parent = resolve(current, "..");
+			if (parent === current) return absolutePath;
+			tail.push(current.slice(parent.endsWith(sep) ? parent.length : parent.length + 1));
+			current = parent;
+		}
+	}
 }

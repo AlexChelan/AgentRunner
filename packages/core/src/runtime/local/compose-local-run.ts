@@ -1,7 +1,8 @@
-import type { McpServerSpec, RunImage, RunStart } from '@opencompanion/protocol'
-import { needsMcpEnv, type LocalMcpSpec } from '../local-mcp-spec'
-import type { LocalAppConfig } from './app-config'
-import { composeLocalSystemPrompt } from './system-prompt'
+import type { McpServerSpec, RunImage, RunStart } from "@agentrunner/protocol";
+import { needsMcpEnv } from "../local-mcp-spec";
+import type { LocalMcpSpec } from "../local-mcp-spec";
+import type { LocalAppConfig } from "./app-config";
+import { composeLocalSystemPrompt } from "./system-prompt";
 
 /**
  * The daemon-local run composer: the on-device replacement for a paired backend's composition. It
@@ -15,39 +16,39 @@ import { composeLocalSystemPrompt } from './system-prompt'
  */
 
 /** The agent id every local run carries; with no scheduleId/origin, `deriveRunKind` reads it as `chat`. */
-const LOCAL_AGENT_ID = 'chat'
+const LOCAL_AGENT_ID = "chat";
 
 /** The user sentinel for a run with no paired backend or subscription owner. */
-const LOCAL_USER_ID = 'local'
+const LOCAL_USER_ID = "local";
 
 /** Options for {@link composeLocalRun}. */
 export interface ComposeLocalRunOpts {
-  /** The loaded on-device product config. */
-  config: LocalAppConfig
-  /** The user prompt / task input. */
-  prompt: string
-  /** The connection/tool id to drive (e.g. `claude-code`). */
-  cli: string
-  /** Optional pinned model id for this run. */
-  modelId?: string
-  /** Optional reasoning effort for this run; a discovered level may be any advertised string. */
-  effort?: string
-  /** Optional SDK session id to resume a multi-turn conversation. */
-  conversationId?: string
-  /** Images attached to a chat turn, carried to an image-capable CLI in-flight. */
-  images?: RunImage[]
-  /** The LOCAL-scope store's MCP servers, keyed by name. */
-  localMcpServers: Record<string, LocalMcpSpec>
+	/** The loaded on-device product config. */
+	config: LocalAppConfig;
+	/** The user prompt / task input. */
+	prompt: string;
+	/** The connection/tool id to drive (e.g. `claude-code`). */
+	cli: string;
+	/** Optional pinned model id for this run. */
+	modelId?: string;
+	/** Optional reasoning effort for this run; a discovered level may be any advertised string. */
+	effort?: string;
+	/** Optional SDK session id to resume a multi-turn conversation. */
+	conversationId?: string;
+	/** Images attached to a chat turn, carried to an image-capable CLI in-flight. */
+	images?: RunImage[];
+	/** The LOCAL-scope store's MCP servers, keyed by name. */
+	localMcpServers: Record<string, LocalMcpSpec>;
 }
 
 /** The on-device composition result. */
 export interface ComposedLocalRun {
-  /** The locally-constructed run descriptor. Type-reused for shape only; NEVER sent over any wire. */
-  start: RunStart
-  /** The MCP servers the local session sets onto `built.req.mcpServers`. */
-  mcpServers: Record<string, McpServerSpec>
-  /** Names of stdio servers refused in v1 because they need env values the executor path cannot inject. */
-  refusedServers: string[]
+	/** The locally-constructed run descriptor. Type-reused for shape only; NEVER sent over any wire. */
+	start: RunStart;
+	/** The MCP servers the local session sets onto `built.req.mcpServers`. */
+	mcpServers: Record<string, McpServerSpec>;
+	/** Names of stdio servers refused in v1 because they need env values the executor path cannot inject. */
+	refusedServers: string[];
 }
 
 /**
@@ -71,33 +72,33 @@ export interface ComposedLocalRun {
  * @returns The composed run, its MCP servers, and the refused server names ({@link ComposedLocalRun}).
  */
 export function composeLocalRun(opts: ComposeLocalRunOpts): ComposedLocalRun {
-  const { config, prompt, cli, modelId, effort, conversationId, images, localMcpServers } = opts
+	const { config, prompt, cli, modelId, effort, conversationId, images, localMcpServers } = opts;
 
-  const mcpServers: Record<string, McpServerSpec> = {}
-  const refusedServers: string[] = []
-  for (const [name, spec] of Object.entries(localMcpServers)) {
-    if (needsMcpEnv(spec)) {
-      refusedServers.push(name)
-    } else {
-      mcpServers[name] = spec
-    }
-  }
+	const mcpServers: Record<string, McpServerSpec> = {};
+	const refusedServers: string[] = [];
+	for (const [name, spec] of Object.entries(localMcpServers)) {
+		if (needsMcpEnv(spec)) {
+			refusedServers.push(name);
+		} else {
+			mcpServers[name] = spec;
+		}
+	}
 
-  const start: RunStart = {
-    type: 'run.start',
-    runId: crypto.randomUUID(),
-    agentId: LOCAL_AGENT_ID,
-    productId: config.productId,
-    userId: LOCAL_USER_ID,
-    connectionId: cli,
-    input: prompt,
-    ...(images && images.length > 0 ? { inputImages: images } : {}),
-    webToolManifest: [],
-    systemPrompt: composeLocalSystemPrompt(config),
-    modelId,
-    effort,
-    conversationId
-  }
+	const start: RunStart = {
+		type: "run.start",
+		runId: crypto.randomUUID(),
+		agentId: LOCAL_AGENT_ID,
+		productId: config.productId,
+		userId: LOCAL_USER_ID,
+		connectionId: cli,
+		input: prompt,
+		...(images && images.length > 0 ? { inputImages: images } : {}),
+		webToolManifest: [],
+		systemPrompt: composeLocalSystemPrompt(config),
+		modelId,
+		effort,
+		conversationId
+	};
 
-  return { start, mcpServers, refusedServers }
+	return { start, mcpServers, refusedServers };
 }

@@ -7,11 +7,11 @@
  * the parentheses of `Bash(*)`) can carry a rule, so only this charset is ever joined into the flag.
  *
  * It lives in this pure leaf package because BOTH ends of that pipe must agree on one regex: the
- * terminal-args builders that write the flag (`@opencompanion/core`), and the capability registry that
+ * terminal-args builders that write the flag (`@agentrunner/core`), and the capability registry that
  * DECLARES the names (`@repo/ai`), where a buyer's app names its tools. A second copy could be widened
  * on one side and quietly re-open the hole on the other.
  */
-export const TERMINAL_TOOL_NAME_PATTERN = /^[A-Za-z0-9_-]{1,128}$/
+export const TERMINAL_TOOL_NAME_PATTERN = /^[\w-]{1,128}$/;
 
 /**
  * True when `name` is a plain identifier that cannot carry a CLI permission rule
@@ -21,5 +21,5 @@ export const TERMINAL_TOOL_NAME_PATTERN = /^[A-Za-z0-9_-]{1,128}$/
  * @returns Whether the name is safe to join into a permission flag.
  */
 export function isSafeTerminalToolName(name: string): boolean {
-  return TERMINAL_TOOL_NAME_PATTERN.test(name)
+	return TERMINAL_TOOL_NAME_PATTERN.test(name);
 }

@@ -1,7 +1,7 @@
-# Publishes an OpenCompanion release when a v* tag is pushed. Each OS leg builds the self-contained
+# Publishes an AgentRunner release when a v* tag is pushed. Each OS leg builds the self-contained
 # standalone daemon (a vendored Node runtime plus the bundled daemon) with
-# `pnpm --filter opencompanion standalone`, signs the macOS binaries when Apple Developer ID secrets
-# are present, and tars the payload into opencompanion-<os>-<arch>.tar.gz. The publish leg gathers every
+# `pnpm --filter agentrunner standalone`, signs the macOS binaries when Apple Developer ID secrets
+# are present, and tars the payload into agentrunner-<os>-<arch>.tar.gz. The publish leg gathers every
 # tarball, writes SHA256SUMS and a bare VERSION marker (the tag without its leading v, which the
 # updater's cheap remote check reads), attaches a build-provenance attestation to every artifact, and
 # uploads the tarballs, SHA256SUMS, VERSION, and the install scripts to the GitHub release. install.sh
@@ -25,22 +25,22 @@ jobs:
     strategy:
       fail-fast: false
       # One leg per shipped target. Each runner vendors its own native Node and the standalone
-      # script names the folder opencompanion-<process.platform>-<process.arch>, which is exactly the
+      # script names the folder agentrunner-<process.platform>-<process.arch>, which is exactly the
       # name install.sh / install.ps1 fetch, so the runner choice fixes the artifact name.
       matrix:
         include:
           - os: ubuntu-latest
-            artifact: opencompanion-linux-x64
+            artifact: agentrunner-linux-x64
           - os: ubuntu-24.04-arm
-            artifact: opencompanion-linux-arm64
+            artifact: agentrunner-linux-arm64
           - os: macos-15-intel
-            artifact: opencompanion-darwin-x64
+            artifact: agentrunner-darwin-x64
           - os: macos-14
-            artifact: opencompanion-darwin-arm64
+            artifact: agentrunner-darwin-arm64
           - os: windows-latest
-            artifact: opencompanion-win32-x64
+            artifact: agentrunner-win32-x64
           - os: windows-11-arm
-            artifact: opencompanion-win32-arm64
+            artifact: agentrunner-win32-arm64
     steps:
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
       - uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271 # v6.0.9
@@ -51,7 +51,7 @@ jobs:
       - run: pnpm install --frozen-lockfile
 
       - name: Build the standalone daemon
-        run: pnpm --filter opencompanion standalone
+        run: pnpm --filter agentrunner standalone
 
       # macOS binaries are code-signed with a Developer ID Application certificate when the signing
       # secrets are present, so Gatekeeper accepts the vendored Node runtime. Forks and any CI
@@ -73,9 +73,9 @@ jobs:
             echo "No macOS signing secrets set; shipping an unsigned tarball for ${ARTIFACT}."
             exit 0
           fi
-          KEYCHAIN="$RUNNER_TEMP/opencompanion-sign.keychain-db"
+          KEYCHAIN="$RUNNER_TEMP/agentrunner-sign.keychain-db"
           KEYCHAIN_PASSWORD="$(openssl rand -hex 16)"
-          P12="$RUNNER_TEMP/opencompanion-cert.p12"
+          P12="$RUNNER_TEMP/agentrunner-cert.p12"
           security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
           security set-keychain-settings -lut 3600 "$KEYCHAIN"
           security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
@@ -84,7 +84,7 @@ jobs:
           security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
           security list-keychains -d user -s "$KEYCHAIN" login.keychain-db
           rm -f "$P12"
-          ENTITLEMENTS="$RUNNER_TEMP/opencompanion-entitlements.plist"
+          ENTITLEMENTS="$RUNNER_TEMP/agentrunner-entitlements.plist"
           printf '%s\n' \
             '<?xml version="1.0" encoding="UTF-8"?>' \
             '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">' \
@@ -155,8 +155,8 @@ jobs:
           DIR="daemon/dist-standalone/${ARTIFACT}"
           test -d "$DIR" || { echo "standalone folder $DIR was not produced" >&2; exit 1; }
           # Tar the folder CONTENTS (the trailing dot), not the folder, so the launcher sits at the
-          # archive root: install.sh / install.ps1 extract into the install dir and expect ./opencompanion
-          # (or ./opencompanion.cmd) there.
+          # archive root: install.sh / install.ps1 extract into the install dir and expect ./agentrunner
+          # (or ./agentrunner.cmd) there.
           tar -czf "${ARTIFACT}.tar.gz" -C "$DIR" .
           ls -l "${ARTIFACT}.tar.gz"
 
@@ -213,6 +213,92 @@ jobs:
           # releases/latest/download/install.sh URL always resolves to this build's copy.
           cp install.sh install.ps1 dist/
           gh release create "$TAG" \
-            --title "OpenCompanion $TAG" \
+            --title "AgentRunner $TAG" \
             --generate-notes \
             dist/*.tar.gz dist/SHA256SUMS dist/VERSION dist/install.sh dist/install.ps1
+
+  # The container image, published to GHCR (free for a public repo) on the same v* tag push. It runs
+  # BESIDE publish rather than gating it, so a registry hiccup never withholds the tarball release - a
+  # failed smoke test still fails this workflow loudly.
+  #
+  # The image carries the very bundle the release tarballs ship: the Dockerfile COPYs a pre-built
+  # standalone payload, so this job downloads the two linux legs' artifacts and unpacks them back into
+  # daemon/dist-standalone/ instead of rebuilding (no second toolchain, and no way for the image to drift
+  # from what a buyer downloads). Nothing is pushed until scripts/image-smoke.sh passes against a real,
+  # locally-loaded amd64 image: buildx keeps its layer cache between the two builds, so the multi-arch
+  # rebuild only pays for the emulated arm64 half.
+  docker:
+    name: Publish the container image
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: write # push to ghcr.io
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: "agentrunner-linux-*"
+          path: dist
+          merge-multiple: true
+
+      - name: Unpack the linux payloads into the build context
+        run: |
+          set -euo pipefail
+          # The tarballs hold the folder CONTENTS (see "Package the tarball"), so each is extracted back
+          # into the per-target folder name the Dockerfile's payload stage selects by TARGETARCH.
+          for arch in x64 arm64; do
+            name="agentrunner-linux-${arch}"
+            test -f "dist/${name}.tar.gz" || { echo "missing dist/${name}.tar.gz" >&2; exit 1; }
+            mkdir -p "daemon/dist-standalone/${name}"
+            tar -xzf "dist/${name}.tar.gz" -C "daemon/dist-standalone/${name}"
+            test -x "daemon/dist-standalone/${name}/agentrunner" \
+              || { echo "no executable launcher in ${name}" >&2; exit 1; }
+          done
+
+      - name: Resolve the image reference
+        id: ref
+        run: |
+          set -euo pipefail
+          # A registry path must be lowercase; a brand's repository name need not be.
+          printf 'image=%s\n' "$(printf '%s' 'ghcr.io/alexchelan/agentrunner' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
+          # The same version the publish leg writes into the VERSION marker: the tag without its leading v.
+          printf 'version=%s\n' "${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4.2.0
+      - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # amd64 only, loaded into the local daemon so the smoke test drives the REAL image. `load` cannot
+      # take a multi-platform result, and the smoke test runs on an amd64 runner anyway.
+      - name: Build the amd64 image for the smoke test
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          platforms: linux/amd64
+          load: true
+          push: false
+          provenance: false
+          tags: ${{ steps.ref.outputs.image }}:smoke
+
+      - name: Smoke-test the image
+        env:
+          IMAGE: ${{ steps.ref.outputs.image }}:smoke
+        # Invoked through bash rather than as an executable, so a checkout that lost the exec bit cannot
+        # fail a release for a reason that has nothing to do with the image.
+        run: bash scripts/image-smoke.sh
+
+      - name: Build and push the multi-arch image
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ${{ steps.ref.outputs.image }}:${{ steps.ref.outputs.version }}
+            ${{ steps.ref.outputs.image }}:latest

@@ -1,25 +1,29 @@
 import { hostname } from 'node:os'
-import { isTerminalCliId, TERMINAL_CLI_IDS, type TerminalCliId } from '@opencompanion/core'
+import { isTerminalCliId, TERMINAL_CLI_IDS  } from '@agentrunner/core'
+import type {TerminalCliId} from '@agentrunner/core';
 import { BRAND } from '../brand'
-import { loadLocalAppConfig, type LocalAppConfig } from '@opencompanion/core/runtime/local/app-config'
-import { scopeBackendUrl } from '@opencompanion/core/runtime/account-scope'
-import { LOCAL_SCOPE, scopeFlag } from '@opencompanion/core/runtime/local/scope'
-import { collectMcpEnv } from '@opencompanion/core/runtime/mcp-secrets'
-import { readBearer } from '@opencompanion/core/runtime/pair'
-import type { StateStore } from '@opencompanion/core/runtime/storage/state-store'
-import { runLocalTerminalSession, runTerminalSession } from '@opencompanion/core/runtime/terminal'
-import { messageOf } from '@opencompanion/core/runtime/error-message'
+import { isContained } from '../container'
+import { loadLocalAppConfig  } from '@agentrunner/core/runtime/local/app-config'
+import type {LocalAppConfig} from '@agentrunner/core/runtime/local/app-config';
+import { scopeBackendUrl } from '@agentrunner/core/runtime/account-scope'
+import { dispatchableConnections, hostDispatchProfile } from '@agentrunner/core/runtime/dispatchable-clis'
+import { LOCAL_SCOPE, scopeFlag } from '@agentrunner/core/runtime/local/scope'
+import { collectMcpEnv } from '@agentrunner/core/runtime/mcp-secrets'
+import { readBearer } from '@agentrunner/core/runtime/pair'
+import type { StateStore } from '@agentrunner/core/runtime/storage/state-store'
+import { runLocalTerminalSession, runTerminalSession } from '@agentrunner/core/runtime/terminal'
+import { messageOf } from '@agentrunner/core/runtime/error-message'
 import * as ui from '../ui'
 import { daemonVersion } from '../version'
 import { flagValue, openAuditLog, openStores, positionalArg, resolveCommandScope } from './shared'
 
 /**
  * The product a session is attributed to when the user names none. It matches the backend's OWN
- * fallback (`config.companion.clientId ?? "companion"`), so a default terminal session and a default
+ * fallback (`config.runner.clientId ?? "runner"`), so a default terminal session and a default
  * dispatched run share one confined work folder instead of splitting the workspace in two. LOCAL
  * sessions never fall back to it: their product is named by the on-device app config.
  */
-const DEFAULT_PRODUCT_ID = 'companion'
+const DEFAULT_PRODUCT_ID = 'runner'
 
 /**
  * Resolves which CLI the session drives: an explicit `--cli` (validated against the terminal-capable
@@ -137,7 +141,7 @@ async function cmdLocalTerminal(argv: string[], stores: ReturnType<typeof openSt
  * The PAIRED form opens the user's own coding CLI as an interactive session wired to their product: the
  * product's tools on the CLI's MCP surface, the user's OWN local MCP servers (`mcp add`) beside them, the
  * backend's composed instructions as its system prompt, and the product's confined work folder as its cwd.
- * `<productId>` names the workspace the session runs in (defaulting to the backend's own `companion`
+ * `<productId>` names the workspace the session runs in (defaulting to the backend's own `runner`
  * product); `--url` picks the backend when several are paired and `--user` picks the account when one
  * backend carries two SaaS logins; `--cli` picks the CLI when several are
  * connected; `--model` pins the model; `--cwd` runs the session in any folder the user names - the
@@ -195,9 +199,15 @@ export async function cmdTerminal(argv: string[]): Promise<void> {
     mcpEnv: collectMcpEnv(secrets, scope, localMcpServers),
     write: ui.line,
     ...(requestedCwd ? { requestedCwd } : {}),
-    connections: state
-      .listConnections(scope)
-      .map((conn) => ({ toolId: conn.toolId, authHealth: conn.authHealth })),
+    // This POSTs `/connect`, which UPSERTS the durable device record - so an unfiltered snapshot here
+    // would re-advertise a CLI the daemon withholds and reopen an offer every dispatched run refuses.
+    // Same profile as the daemon's own reporting path, so one session can never contradict the other.
+    connections: dispatchableConnections(
+      state
+        .listConnections(scope)
+        .map((conn) => ({ toolId: conn.toolId, authHealth: conn.authHealth })),
+      hostDispatchProfile(isContained())
+    ),
     ...(machineName ? { hostname: machineName } : {}),
     ...(modelId ? { modelId } : {})
   })

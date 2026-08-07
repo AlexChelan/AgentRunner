@@ -4,18 +4,18 @@ import { join } from 'node:path'
 import { afterEach, beforeEach, vi } from 'vitest'
 import { envVar } from '../src/brand'
 import type { ServiceSpec } from '../src/service'
-import { createStateStore } from '@opencompanion/core/runtime/storage/state-store'
-import type { PairedBackend, StateStore } from '@opencompanion/core/runtime/storage/state-store'
+import { createStateStore } from '@agentrunner/core/runtime/storage/state-store'
+import type { PairedBackend, StateStore } from '@agentrunner/core/runtime/storage/state-store'
 
 /**
- * Shared harness for the `companion` CLI command suites. Every `cli-*.test.ts` file imports it: it owns
+ * Shared harness for the `runner` CLI command suites. Every `cli-*.test.ts` file imports it: it owns
  * the module mocks, the `appDataDir()` override, the captured stdout/stderr/exit, the `run()` driver, and
  * the per-test reset hooks (registered here, applied per file thanks to vitest's per-file isolation). The
  * `vi.mock` calls run in source order before the daemon CLI is imported, so the mocks are in place for it.
  */
 
 /** The default app-data root shared across a file's tests (individual tests point at their own via {@link tempAppData}). */
-export const APP_DATA = mkdtempSync(join(tmpdir(), 'companion-cli-'))
+export const APP_DATA = mkdtempSync(join(tmpdir(), 'runner-cli-'))
 // The app-data dir the mocked `appDataDir()` returns. Defaults to the shared APP_DATA; a test that needs a
 // clean single-paired-backend state points it at its own fresh dir via `tempAppData`/`setAppData`.
 let appDataOverride = APP_DATA
@@ -37,9 +37,10 @@ export const out: { exitCode: number | undefined; stdout: string; stderr: string
 
 export const runPair = vi.fn(async () => ({ ok: true }))
 export const runPairWithToken = vi.fn(async () => ({ ok: true }))
+export const runEnroll = vi.fn(async () => ({ ok: true }))
 export const runUnpair = vi.fn(() => ({ ok: true }))
 export const runConnect = vi.fn(async () => [])
-export const buildCompanionRegistry = vi.fn(() => ({}))
+export const buildRunnerRegistry = vi.fn(() => ({}))
 export const clackSelect = vi.fn(async () => 'skip' as string)
 export const clackMultiselect = vi.fn(async (): Promise<string[]> => [])
 export const connectTool = vi.fn(async () => ({ kind: 'reused', toolId: 'claude-code', authHealth: 'healthy' }))
@@ -67,13 +68,17 @@ export const childSpawn = vi.fn((_bin: string, _args: string[], _opts: unknown) 
   on: () => undefined
 }))
 
-vi.mock('@opencompanion/core/runtime/paths', async (importOriginal) => {
-  const actual = await importOriginal<typeof import('@opencompanion/core/runtime/paths')>()
+vi.mock('@agentrunner/core/runtime/paths', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@agentrunner/core/runtime/paths')>()
   return { ...actual, appDataDir: () => appDataOverride }
 })
-vi.mock('@opencompanion/core/runtime/pair', async (importOriginal) => {
-  const actual = await importOriginal<typeof import('@opencompanion/core/runtime/pair')>()
+vi.mock('@agentrunner/core/runtime/pair', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@agentrunner/core/runtime/pair')>()
   return { ...actual, runPair, runPairWithToken, runUnpair }
+})
+vi.mock('@agentrunner/core/runtime/enroll', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@agentrunner/core/runtime/enroll')>()
+  return { ...actual, runEnroll }
 })
 // Fake the clack UI so commands never touch a real TTY: message helpers echo to stdout (so the
 // text assertions still see the content), and `select` is scripted per test.
@@ -91,12 +96,12 @@ vi.mock('@clack/prompts', () => {
     isCancel: () => false
   }
 })
-vi.mock('@opencompanion/core/runtime/connect', async (importOriginal) => {
-  const actual = await importOriginal<typeof import('@opencompanion/core/runtime/connect')>()
+vi.mock('@agentrunner/core/runtime/connect', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@agentrunner/core/runtime/connect')>()
   return {
     ...actual,
     runConnect,
-    buildCompanionRegistry,
+    buildRunnerRegistry,
     connectTool
   }
 })
@@ -112,8 +117,8 @@ vi.mock('../src/service', async (importOriginal) => {
 // The `terminal` command drives the user's real CLI: fake ONLY the two runtime seams that touch the
 // machine (binary resolution + the loopback MCP listener) and the spawn itself, so the argv the daemon
 // would hand the CLI - the assertion target - is still built by the real code path.
-vi.mock('@opencompanion/core', async (importOriginal) => {
-  const actual = await importOriginal<typeof import('@opencompanion/core')>()
+vi.mock('@agentrunner/core', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@agentrunner/core')>()
   return { ...actual, resolveToolBinary, serveToolsOverHttp }
 })
 vi.mock('node:child_process', async (importOriginal) => {
@@ -140,7 +145,7 @@ beforeEach(() => {
   vi.clearAllMocks()
   // A stable release base so the `update`/`update --check` publish-first guard (empty installBase) is
   // neutralized: the two update tests exercise the check/flip logic regardless of the brand's publish
-  // state, which is empty pre-publish for a buyer and set for the monorepo's OpenCompanion.
+  // state, which is empty pre-publish for a buyer and set for the monorepo's AgentRunner.
   process.env[envVar('RELEASE_BASE')] = 'https://releases.example/latest/download'
   // Default stdin to non-TTY so `serve` never blocks on the interactive connect prompt; the TTY
   // path is exercised explicitly by its own test.
@@ -167,14 +172,14 @@ afterEach(() => {
 })
 
 /**
- * Creates a fresh temp app-data root (named `companion-cli-<label>-…`) and points the mocked `appDataDir()`
+ * Creates a fresh temp app-data root (named `runner-cli-<label>-…`) and points the mocked `appDataDir()`
  * at it for the rest of the test, returning the root. Collapses the ubiquitous `mkdtempSync` +
  * `appDataOverride =` arrange pair.
  *
  * @param label - A short slug woven into the temp dir name to keep it recognizable in a leaked-dir listing.
  */
 export function tempAppData(label: string): string {
-  const dir = mkdtempSync(join(tmpdir(), `companion-cli-${label}-`))
+  const dir = mkdtempSync(join(tmpdir(), `runner-cli-${label}-`))
   setAppData(dir)
   return dir
 }
@@ -205,10 +210,10 @@ export function pairBackend(
  * @returns The state store the backend was paired in.
  */
 export async function pairWithBearer(appDataRoot: string, backendUrl: string): Promise<StateStore> {
-  const { createFileSecretStore } = await import('@opencompanion/core/runtime/storage/secret-store')
-  const { makeMasterKey } = await import('@opencompanion/core/runtime/master-key')
-  const { secretsDir } = await import('@opencompanion/core/runtime/paths')
-  const { bearerKey } = await import('@opencompanion/core/runtime/pair')
+  const { createFileSecretStore } = await import('@agentrunner/core/runtime/storage/secret-store')
+  const { makeMasterKey } = await import('@agentrunner/core/runtime/master-key')
+  const { secretsDir } = await import('@agentrunner/core/runtime/paths')
+  const { bearerKey } = await import('@agentrunner/core/runtime/pair')
   const state = createStateStore({ cwd: appDataRoot })
   state.upsertPairedBackend(backendUrl, { backendUrl, deviceId: 'dt', userId: 'u1' })
   const dir = secretsDir(appDataRoot)
@@ -218,7 +223,7 @@ export async function pairWithBearer(appDataRoot: string, backendUrl: string): P
 
 /** A real project folder on disk (canonical, so expectations match what the daemon resolves). */
 export function projectDir(name: string): string {
-  return realpathSync(mkdtempSync(join(tmpdir(), `companion-project-${name}-`)))
+  return realpathSync(mkdtempSync(join(tmpdir(), `runner-project-${name}-`)))
 }
 
 /**
@@ -230,10 +235,10 @@ export async function readMcpSecret(
   backendUrl: string,
   serverName: string
 ): Promise<Record<string, string> | null> {
-  const { createFileSecretStore } = await import('@opencompanion/core/runtime/storage/secret-store')
-  const { makeMasterKey } = await import('@opencompanion/core/runtime/master-key')
-  const { secretsDir } = await import('@opencompanion/core/runtime/paths')
-  const { mcpEnvKey } = await import('@opencompanion/core/runtime/mcp-secrets')
+  const { createFileSecretStore } = await import('@agentrunner/core/runtime/storage/secret-store')
+  const { makeMasterKey } = await import('@agentrunner/core/runtime/master-key')
+  const { secretsDir } = await import('@agentrunner/core/runtime/paths')
+  const { mcpEnvKey } = await import('@agentrunner/core/runtime/mcp-secrets')
   const dir = secretsDir(appDataRoot)
   const raw = createFileSecretStore({ dir, masterKey: makeMasterKey(dir) }).get(mcpEnvKey(backendUrl, serverName))
   return raw === null ? null : (JSON.parse(raw) as Record<string, string>)
@@ -243,7 +248,7 @@ export async function readMcpSecret(
 // re-exporting local bindings via `export { … }` resolves to `undefined` for importers when this module
 // carries a top-level await (the `await import('../src/cli')` above).
 export { BRAND, envVar } from '../src/brand'
-export { createStateStore } from '@opencompanion/core/runtime/storage/state-store'
-export { daemonVersion } from '../src/version'
-export type { PairedBackend, StateStore } from '@opencompanion/core/runtime/storage/state-store'
 export type { ServiceSpec } from '../src/service'
+export { daemonVersion } from '../src/version'
+export { createStateStore } from '@agentrunner/core/runtime/storage/state-store'
+export type { PairedBackend, StateStore } from '@agentrunner/core/runtime/storage/state-store'

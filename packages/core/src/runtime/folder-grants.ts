@@ -1,6 +1,6 @@
-import { statSync } from 'node:fs'
-import { resolve } from 'node:path'
-import { realpathDeepest } from '../index'
+import { statSync } from "node:fs";
+import { resolve } from "node:path";
+import { realpathDeepest } from "../index";
 
 /**
  * Where a `terminal --cwd <path>` actually runs.
@@ -34,13 +34,13 @@ import { realpathDeepest } from '../index'
  * @throws When the path does not exist or is not a directory (the message is user-facing).
  */
 export function resolveExistingFolder(input: string): string {
-  const absolute = resolve(input)
-  let isDirectory: boolean
-  try {
-    isDirectory = statSync(absolute).isDirectory()
-  } catch {
-    throw new Error(`no such folder: ${absolute}`)
-  }
-  if (!isDirectory) throw new Error(`not a folder: ${absolute}`)
-  return realpathDeepest(absolute)
+	const absolute = resolve(input);
+	let isDirectory: boolean;
+	try {
+		isDirectory = statSync(absolute).isDirectory();
+	} catch {
+		throw new Error(`no such folder: ${absolute}`);
+	}
+	if (!isDirectory) throw new Error(`not a folder: ${absolute}`);
+	return realpathDeepest(absolute);
 }

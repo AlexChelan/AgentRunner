@@ -1,6 +1,6 @@
 import type { JSONValue, LanguageModel } from "ai";
 
-import type { ReasoningEffort } from "@opencompanion/core-types";
+import type { ReasoningEffort } from "@agentrunner/core-types";
 
 /** Provider ids the transport supports. Kept set-equal to @repo/config AI_PROVIDERS by packages/ai/tests/providers.test.ts. */
 export type ProviderId =
@@ -165,10 +165,38 @@ export interface ProviderSpec {
 
 /** The shipped provider catalog. Adding a provider is a new row here. */
 export const PROVIDER_CATALOG: readonly ProviderSpec[] = [
-	{ id: "anthropic", displayName: "Anthropic", transport: "anthropic", apiKeyEnv: "ANTHROPIC_API_KEY", reasoning: "anthropic", searchWire: "anthropic" },
-	{ id: "openai", displayName: "OpenAI", transport: "openai", apiKeyEnv: "OPENAI_API_KEY", reasoning: "openai", searchWire: "openai" },
-	{ id: "google", displayName: "Google Gemini", transport: "google", apiKeyEnv: "GOOGLE_GENERATIVE_AI_API_KEY", reasoning: "google", searchWire: "google" },
-	{ id: "openrouter", displayName: "OpenRouter", transport: "openrouter", apiKeyEnv: "OPENROUTER_API_KEY", reasoning: "openrouter", searchWire: "openrouter" },
+	{
+		id: "anthropic",
+		displayName: "Anthropic",
+		transport: "anthropic",
+		apiKeyEnv: "ANTHROPIC_API_KEY",
+		reasoning: "anthropic",
+		searchWire: "anthropic"
+	},
+	{
+		id: "openai",
+		displayName: "OpenAI",
+		transport: "openai",
+		apiKeyEnv: "OPENAI_API_KEY",
+		reasoning: "openai",
+		searchWire: "openai"
+	},
+	{
+		id: "google",
+		displayName: "Google Gemini",
+		transport: "google",
+		apiKeyEnv: "GOOGLE_GENERATIVE_AI_API_KEY",
+		reasoning: "google",
+		searchWire: "google"
+	},
+	{
+		id: "openrouter",
+		displayName: "OpenRouter",
+		transport: "openrouter",
+		apiKeyEnv: "OPENROUTER_API_KEY",
+		reasoning: "openrouter",
+		searchWire: "openrouter"
+	},
 	{
 		id: "xai",
 		displayName: "xAI (Grok)",
@@ -368,7 +396,8 @@ export async function buildLanguageModel(
 		// The Anthropic SDK appends only `/messages`, so the base must already carry `/v1`.
 		if (baseURL) baseURL = ensureAnthropicV1(baseURL);
 		const { createAnthropic } = await import("@ai-sdk/anthropic");
-		const bearer = opts.accessToken ?? (looksLikeAnthropicMessages(baseURL) ? opts.apiKey : undefined);
+		const bearer =
+			opts.accessToken ?? (looksLikeAnthropicMessages(baseURL) ? opts.apiKey : undefined);
 		if (bearer) {
 			return createAnthropic({
 				authToken: bearer,
@@ -386,7 +415,9 @@ export async function buildLanguageModel(
 	}
 
 	const bearerHeaders =
-		opts.accessToken !== undefined ? { ...headers, Authorization: `Bearer ${opts.accessToken}` } : headers;
+		opts.accessToken !== undefined
+			? { ...headers, Authorization: `Bearer ${opts.accessToken}` }
+			: headers;
 	const apiKey = opts.accessToken !== undefined ? undefined : opts.apiKey;
 	const hasHeaders = Object.keys(bearerHeaders).length > 0;
 

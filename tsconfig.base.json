@@ -1,6 +1,6 @@
 {
 	"$schema": "https://json.schemastore.org/tsconfig",
-	"display": "OpenCompanion Base",
+	"display": "AgentRunner Base",
 	"compilerOptions": {
 		"composite": true,
 		"declaration": true,

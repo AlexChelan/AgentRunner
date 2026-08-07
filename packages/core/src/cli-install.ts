@@ -1,27 +1,30 @@
-import { createHash } from 'node:crypto'
+import { createHash } from "node:crypto";
 import {
-  chmodSync,
-  closeSync,
-  constants as fsConstants,
-  lstatSync,
-  mkdirSync,
-  mkdtempSync,
-  openSync,
-  readFileSync,
-  readdirSync,
-  realpathSync,
-  renameSync,
-  rmSync,
-  unlinkSync,
-  writeFileSync,
-  writeSync
-} from 'node:fs'
-import { tmpdir } from 'node:os'
-import { basename, dirname, join, relative, resolve, sep } from 'node:path'
-import spawn from 'cross-spawn'
-import type { RunTool } from './adapters/types'
-import { resolveToolBinary } from './binaries'
-import { runTool } from './exec'
+	chmodSync,
+	closeSync,
+	existsSync,
+	constants as fsConstants,
+	lstatSync,
+	mkdirSync,
+	mkdtempSync,
+	openSync,
+	readdirSync,
+	readFileSync,
+	realpathSync,
+	renameSync,
+	rmSync,
+	unlinkSync,
+	writeFileSync,
+	writeSync
+} from "node:fs";
+import { tmpdir } from "node:os";
+import { basename, dirname, join, relative, resolve, sep } from "node:path";
+import spawn from "cross-spawn";
+import type { RunTool } from "./adapters/types";
+import { AGENT_TRAVERSE_MODE, shareWithAgent } from "./agent-share";
+import type { AgentIdentity, AgentShareSeams, ShareDir } from "./agent-share";
+import { resolveToolBinary } from "./binaries";
+import { runTool } from "./exec";
 
 /**
  * Managed coding-CLI installs: the host downloads a coding CLI's STANDALONE binary into a
@@ -30,7 +33,7 @@ import { runTool } from './exec'
  * `baseDir` rather than read from any framework, and the GitHub User-Agent is injected.
  *
  * Each CLI is fetched as a single self-contained executable - Claude Code as a raw,
- * SHA256-verified binary, Codex and OpenCode as the one target binary extracted from a
+ * SHA256-verified binary and Codex as the one target binary extracted from a
  * release archive whose bytes are SHA256-verified against the GitHub-published asset
  * `digest` BEFORE anything is placed - and written DIRECTLY to
  * `<baseDir>/clis/<toolId>/<binary>`. That managed dir is appended to the
@@ -41,68 +44,36 @@ import { runTool } from './exec'
 
 /** Per-CLI install metadata: the executable it provides and its vendor login subcommand. */
 export interface CliInstallSpec {
-  /** The executable name written into the managed dir (`.exe` is added on Windows). */
-  binary: string
-  /**
-   * The CLI's own login subcommand, run in the in-app terminal so the user signs in
-   * without leaving the app. Verified against each CLI's `--help`: Codex `login` starts
-   * an interactive browser sign-in; Claude Code's `auth login` ("Sign in to your
-   * Anthropic account"); OpenCode's `auth login` (configure a provider). The terminal
-   * spawns the resolved binary with these args; the renderer never supplies the command.
-   */
-  loginArgs: string[]
+	/** The executable name written into the managed dir (`.exe` is added on Windows). */
+	binary: string;
+	/**
+	 * The CLI's own login subcommand, run in the in-app terminal so the user signs in
+	 * without leaving the app. Verified against each CLI's `--help`: Codex `login` starts
+	 * an interactive browser sign-in; Claude Code's `auth login` ("Sign in to your
+	 * Anthropic account"). The terminal
+	 * spawns the resolved binary with these args; the renderer never supplies the command.
+	 */
+	loginArgs: string[];
 }
 
 /**
  * Install metadata for every managed coding CLI, keyed by adapter id. Only these tool
  * ids may be installed; an unknown id is rejected by {@link installCli}. The download
  * source for each id is fixed in code (per-CLI functions below), never supplied by the
- * caller, so an install can only ever fetch one of these three known binaries.
+ * caller, so an install can only ever fetch one of these two known binaries.
+ *
+ * This now covers EVERY connectable id. The system-install-only tier (`SYSTEM_CLI_SPECS`,
+ * `systemInstallGuidance`) existed solely for Hermes and went with it on 2026-08-02 - a tier with
+ * no members is a branch every reader has to rule out and no input can reach.
  */
 export const CLI_INSTALL_SPECS: Record<string, CliInstallSpec> = {
-  'claude-code': { binary: 'claude', loginArgs: ['auth', 'login'] },
-  codex: { binary: 'codex', loginArgs: ['login'] },
-  opencode: { binary: 'opencode', loginArgs: ['auth', 'login'] }
-}
+	"claude-code": { binary: "claude", loginArgs: ["auth", "login"] },
+	codex: { binary: "codex", loginArgs: ["login"] }
+};
 
 /** True when `toolId` has managed-install metadata (a CLI the host can install). */
 export function isInstallableCli(toolId: string): toolId is keyof typeof CLI_INSTALL_SPECS {
-  return Object.prototype.hasOwnProperty.call(CLI_INSTALL_SPECS, toolId)
-}
-
-/** One installer field a system-install-only CLI needs (not a managed download source). */
-export interface SystemCliSpec {
-  /** The binary name resolved on PATH (never installed by the host). */
-  binary: string
-  /** The CLI's own interactive login/setup args (spawned with inherited stdio). */
-  loginArgs: string[]
-  /** The vendor install one-liner shown to a user whose machine lacks the binary. */
-  installGuidance: string
-}
-
-/**
- * CLIs the host can CONNECT and LOG IN but never MANAGE-INSTALL: the tool ships its own
- * installer and moves fast, so the host detects it on PATH and, when missing, prints the
- * vendor guidance rather than downloading anything. Distinct from {@link CLI_INSTALL_SPECS}
- * (a managed download source); a `SYSTEM_CLI_SPECS` id is never installable.
- */
-export const SYSTEM_CLI_SPECS: Record<string, SystemCliSpec> = {
-  hermes: {
-    binary: 'hermes',
-    loginArgs: ['acp', '--setup'],
-    installGuidance: 'Install Hermes Agent: curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash'
-  }
-}
-
-/**
- * The vendor install guidance for a system-install-only CLI, or `undefined` for a managed
- * (or unknown) tool id.
- *
- * @param toolId - The adapter id.
- * @returns The vendor install one-liner, or `undefined`.
- */
-export function systemInstallGuidance(toolId: string): string | undefined {
-  return SYSTEM_CLI_SPECS[toolId]?.installGuidance
+	return Object.hasOwn(CLI_INSTALL_SPECS, toolId);
 }
 
 /**
@@ -113,14 +84,14 @@ export function systemInstallGuidance(toolId: string): string | undefined {
  * @throws When `toolId` is not a managed CLI.
  */
 export function requireInstallSpec(toolId: string): CliInstallSpec {
-  const spec = CLI_INSTALL_SPECS[toolId]
-  if (!spec) throw new Error(`"${toolId}" is not an installable CLI`)
-  return spec
+	const spec = CLI_INSTALL_SPECS[toolId];
+	if (!spec) throw new Error(`"${toolId}" is not an installable CLI`);
+	return spec;
 }
 
 /** The on-disk executable name for a spec (adds `.exe` on Windows). */
 function binaryFileName(spec: CliInstallSpec, platform: NodeJS.Platform): string {
-  return platform === 'win32' ? `${spec.binary}.exe` : spec.binary
+	return platform === "win32" ? `${spec.binary}.exe` : spec.binary;
 }
 
 /**
@@ -132,7 +103,12 @@ function binaryFileName(spec: CliInstallSpec, platform: NodeJS.Platform): string
  * @returns The tool's managed install directory.
  */
 function managedDir(baseDir: string, toolId: string): string {
-  return join(baseDir, 'clis', toolId)
+	return join(managedRoot(baseDir), toolId);
+}
+
+/** The parent every tool's managed dir sits directly under (`<baseDir>/clis`). */
+function managedRoot(baseDir: string): string {
+	return join(baseDir, "clis");
 }
 
 /**
@@ -146,7 +122,7 @@ function managedDir(baseDir: string, toolId: string): string {
  * @returns One managed dir per installable CLI.
  */
 export function managedCliBinDirs(baseDir: string): string[] {
-  return Object.keys(CLI_INSTALL_SPECS).map((toolId) => managedDir(baseDir, toolId))
+	return Object.keys(CLI_INSTALL_SPECS).map((toolId) => managedDir(baseDir, toolId));
 }
 
 /**
@@ -161,52 +137,52 @@ export function managedCliBinDirs(baseDir: string): string[] {
  * @returns The expected managed binary path, or `undefined` when not installable.
  */
 export function managedBinaryPath(
-  baseDir: string,
-  toolId: string,
-  platform: NodeJS.Platform = process.platform
+	baseDir: string,
+	toolId: string,
+	platform: NodeJS.Platform = process.platform
 ): string | undefined {
-  const spec = CLI_INSTALL_SPECS[toolId]
-  if (!spec) return undefined
-  return join(managedDir(baseDir, toolId), binaryFileName(spec, platform))
+	const spec = CLI_INSTALL_SPECS[toolId];
+	if (!spec) return undefined;
+	return join(managedDir(baseDir, toolId), binaryFileName(spec, platform));
 }
 
 /** Throws "Install cancelled" when the signal has fired (checked at each await boundary). */
 function throwIfAborted(signal: AbortSignal): void {
-  if (signal.aborted) throw new Error('Install cancelled')
+	if (signal.aborted) throw new Error("Install cancelled");
 }
 
 /** The `platform-arch` key used to select a download asset (e.g. `darwin-arm64`). */
 function platformArch(platform: NodeJS.Platform, arch: string): string {
-  return `${platform}-${arch}`
+	return `${platform}-${arch}`;
 }
 
 /** Rejects an unsupported platform/arch with a clear, actionable message. */
 function unsupported(toolId: string, key: string): Error {
-  return new Error(`${toolId} has no managed binary for this platform (${key})`)
+	return new Error(`${toolId} has no managed binary for this platform (${key})`);
 }
 
 // --- Claude Code: raw binary + SHA256 -------------------------------------------------
 
 /** Google Cloud Storage bucket that hosts the Claude Code release binaries. */
 const CLAUDE_BUCKET =
-  'https://storage.googleapis.com/claude-code-dist-86c565f3-f756-42ad-8dfa-d59b1c096819/claude-code-releases'
+	"https://storage.googleapis.com/claude-code-dist-86c565f3-f756-42ad-8dfa-d59b1c096819/claude-code-releases";
 
 /** Maps `platform-arch` to Claude Code's release platform string, or `null` if unsupported. */
 function claudePlatform(platform: NodeJS.Platform, arch: string): string | null {
-  const key = platformArch(platform, arch)
-  const map: Record<string, string> = {
-    'darwin-arm64': 'darwin-arm64',
-    'darwin-x64': 'darwin-x64',
-    'linux-x64': 'linux-x64',
-    'linux-arm64': 'linux-arm64',
-    'win32-x64': 'win32-x64'
-  }
-  return map[key] ?? null
+	const key = platformArch(platform, arch);
+	const map: Record<string, string> = {
+		"darwin-arm64": "darwin-arm64",
+		"darwin-x64": "darwin-x64",
+		"linux-x64": "linux-x64",
+		"linux-arm64": "linux-arm64",
+		"win32-x64": "win32-x64"
+	};
+	return map[key] ?? null;
 }
 
 /** The Claude Code manifest shape (only the per-platform checksum is read). */
 interface ClaudeManifest {
-  platforms?: Record<string, { checksum?: string } | undefined>
+	platforms?: Record<string, { checksum?: string } | undefined>;
 }
 
 /**
@@ -214,64 +190,64 @@ interface ClaudeManifest {
  * checksum from the version manifest is verified BEFORE the bytes are ever written.
  */
 async function downloadClaude(
-  fetchFn: FetchFn,
-  platform: NodeJS.Platform,
-  arch: string,
-  version: string | undefined,
-  signal: AbortSignal,
-  onProgress: (line: string) => void
+	fetchFn: FetchFn,
+	platform: NodeJS.Platform,
+	arch: string,
+	version: string | undefined,
+	signal: AbortSignal,
+	onProgress: (line: string) => void
 ): Promise<Uint8Array> {
-  const plat = claudePlatform(platform, arch)
-  if (!plat) throw unsupported('Claude Code', platformArch(platform, arch))
+	const plat = claudePlatform(platform, arch);
+	if (!plat) throw unsupported("Claude Code", platformArch(platform, arch));
 
-  throwIfAborted(signal)
-  onProgress('Resolving version...')
-  const resolved = version ?? (await fetchText(fetchFn, `${CLAUDE_BUCKET}/latest`, signal)).trim()
+	throwIfAborted(signal);
+	onProgress("Resolving version...");
+	const resolved = version ?? (await fetchText(fetchFn, `${CLAUDE_BUCKET}/latest`, signal)).trim();
 
-  throwIfAborted(signal)
-  const manifest = await fetchJson(fetchFn, `${CLAUDE_BUCKET}/${resolved}/manifest.json`, signal)
-  assertObject<ClaudeManifest>(
-    manifest,
-    `Unexpected Claude Code manifest for version ${resolved} (expected an object)`
-  )
-  const expected = manifest.platforms?.[plat]?.checksum
-  if (!expected) throw new Error(`No Claude Code checksum for ${plat} in version ${resolved}`)
+	throwIfAborted(signal);
+	const manifest = await fetchJson(fetchFn, `${CLAUDE_BUCKET}/${resolved}/manifest.json`, signal);
+	assertObject<ClaudeManifest>(
+		manifest,
+		`Unexpected Claude Code manifest for version ${resolved} (expected an object)`
+	);
+	const expected = manifest.platforms?.[plat]?.checksum;
+	if (!expected) throw new Error(`No Claude Code checksum for ${plat} in version ${resolved}`);
 
-  throwIfAborted(signal)
-  onProgress('Downloading...')
-  const binaryName = platform === 'win32' ? 'claude.exe' : 'claude'
-  const bytes = await fetchBytes(
-    fetchFn,
-    `${CLAUDE_BUCKET}/${resolved}/${plat}/${binaryName}`,
-    signal
-  )
+	throwIfAborted(signal);
+	onProgress("Downloading...");
+	const binaryName = platform === "win32" ? "claude.exe" : "claude";
+	const bytes = await fetchBytes(
+		fetchFn,
+		`${CLAUDE_BUCKET}/${resolved}/${plat}/${binaryName}`,
+		signal
+	);
 
-  throwIfAborted(signal)
-  onProgress('Verifying checksum...')
-  const got = createHash('sha256').update(bytes).digest('hex')
-  if (got.toLowerCase() !== expected.toLowerCase()) {
-    throw new Error(`Checksum mismatch: expected ${expected}, got ${got}`)
-  }
-  return bytes
+	throwIfAborted(signal);
+	onProgress("Verifying checksum...");
+	const got = createHash("sha256").update(bytes).digest("hex");
+	if (got.toLowerCase() !== expected.toLowerCase()) {
+		throw new Error(`Checksum mismatch: expected ${expected}, got ${got}`);
+	}
+	return bytes;
 }
 
 // --- Codex: GitHub release archive, extract the matched-triple binary -----------------
 
 /** Codex GitHub releases API endpoint. */
-const CODEX_RELEASES = 'https://api.github.com/repos/openai/codex/releases'
+const CODEX_RELEASES = "https://api.github.com/repos/openai/codex/releases";
 
 /** Maps `platform-arch` to Codex's Rust target triple, or `null` if unsupported. */
 function codexTriple(platform: NodeJS.Platform, arch: string): string | null {
-  const key = platformArch(platform, arch)
-  const map: Record<string, string> = {
-    'darwin-arm64': 'aarch64-apple-darwin',
-    'darwin-x64': 'x86_64-apple-darwin',
-    'linux-x64': 'x86_64-unknown-linux-musl',
-    'linux-arm64': 'aarch64-unknown-linux-musl',
-    'win32-x64': 'x86_64-pc-windows-msvc',
-    'win32-arm64': 'aarch64-pc-windows-msvc'
-  }
-  return map[key] ?? null
+	const key = platformArch(platform, arch);
+	const map: Record<string, string> = {
+		"darwin-arm64": "aarch64-apple-darwin",
+		"darwin-x64": "x86_64-apple-darwin",
+		"linux-x64": "x86_64-unknown-linux-musl",
+		"linux-arm64": "aarch64-unknown-linux-musl",
+		"win32-x64": "x86_64-pc-windows-msvc",
+		"win32-arm64": "aarch64-pc-windows-msvc"
+	};
+	return map[key] ?? null;
 }
 
 /**
@@ -280,16 +256,16 @@ function codexTriple(platform: NodeJS.Platform, arch: string): string | null {
  * ships a `.tar.gz`.
  */
 function codexAssetCandidates(triple: string): string[] {
-  if (triple.endsWith('-windows-msvc')) return [`codex-${triple}.exe.zip`]
-  if (triple.endsWith('-unknown-linux-musl')) {
-    const gnu = triple.replace('-unknown-linux-musl', '-unknown-linux-gnu')
-    return [`codex-${triple}.tar.gz`, `codex-${gnu}.tar.gz`]
-  }
-  return [`codex-${triple}.tar.gz`]
+	if (triple.endsWith("-windows-msvc")) return [`codex-${triple}.exe.zip`];
+	if (triple.endsWith("-unknown-linux-musl")) {
+		const gnu = triple.replace("-unknown-linux-musl", "-unknown-linux-gnu");
+		return [`codex-${triple}.tar.gz`, `codex-${gnu}.tar.gz`];
+	}
+	return [`codex-${triple}.tar.gz`];
 }
 
 /** Helper binaries Codex ships alongside the CLI, never the one to install. */
-const CODEX_HELPER_BASENAMES = ['codex-command-runner', 'codex-windows-sandbox-setup']
+const CODEX_HELPER_BASENAMES = ["codex-command-runner", "codex-windows-sandbox-setup"];
 
 /**
  * A single GitHub release asset (only the fields we read). `digest` is the
@@ -297,14 +273,14 @@ const CODEX_HELPER_BASENAMES = ['codex-command-runner', 'codex-windows-sandbox-s
  * the downloaded bytes are ever placed on disk.
  */
 interface GithubAsset {
-  name?: string
-  browser_download_url?: string
-  digest?: string
+	name?: string;
+	browser_download_url?: string;
+	digest?: string;
 }
 
 /** A single GitHub release (only the fields we read). */
 interface GithubRelease {
-  assets?: GithubAsset[]
+	assets?: GithubAsset[];
 }
 
 /**
@@ -312,7 +288,7 @@ interface GithubRelease {
  * value), throwing a clear error on a missing digest or a mismatch BEFORE the bytes
  * are ever extracted or placed. The comparison is case-insensitive and tolerates a
  * present-or-absent `sha256:` prefix. Shared by the GitHub-sourced CLIs (Codex,
- * OpenCode) so the hash-and-compare logic lives in one place.
+ * so the hash-and-compare logic lives in one place.
  *
  * @param bytes - The downloaded archive bytes to verify.
  * @param expectedDigest - The asset's published `sha256:<hex>` digest, or `undefined`.
@@ -320,18 +296,18 @@ interface GithubRelease {
  * @throws When no digest was published, or when the computed hash does not match.
  */
 function verifyArchiveDigest(
-  bytes: Uint8Array,
-  expectedDigest: string | undefined,
-  label: string
+	bytes: Uint8Array,
+	expectedDigest: string | undefined,
+	label: string
 ): void {
-  if (!expectedDigest) {
-    throw new Error(`No integrity digest published for ${label}; refusing to install.`)
-  }
-  const expected = expectedDigest.replace(/^sha256:/i, '').toLowerCase()
-  const got = createHash('sha256').update(bytes).digest('hex').toLowerCase()
-  if (got !== expected) {
-    throw new Error(`Checksum mismatch for ${label}: expected ${expected}, got ${got}`)
-  }
+	if (!expectedDigest) {
+		throw new Error(`No integrity digest published for ${label}; refusing to install.`);
+	}
+	const expected = expectedDigest.replace(/^sha256:/i, "").toLowerCase();
+	const got = createHash("sha256").update(bytes).digest("hex").toLowerCase();
+	if (got !== expected) {
+		throw new Error(`Checksum mismatch for ${label}: expected ${expected}, got ${got}`);
+	}
 }
 
 /**
@@ -341,7 +317,7 @@ function verifyArchiveDigest(
  * `GH_TOKEN`/`GITHUB_TOKEN` from being exfiltrated to a `http://` URL or a non-GitHub
  * host injected via a compromised or spoofed release.
  */
-const GITHUB_AUTH_HOSTS: readonly string[] = ['github.com', 'githubusercontent.com']
+const GITHUB_AUTH_HOSTS: readonly string[] = ["github.com", "githubusercontent.com"];
 
 /**
  * True when `url` is an HTTPS URL whose host is a GitHub-owned host (exact match or a
@@ -349,15 +325,15 @@ const GITHUB_AUTH_HOSTS: readonly string[] = ['github.com', 'githubusercontent.c
  * or any other host returns false, so a token is never attached to it.
  */
 export function isGithubAuthUrl(url: string): boolean {
-  let parsed: URL
-  try {
-    parsed = new URL(url)
-  } catch {
-    return false
-  }
-  if (parsed.protocol !== 'https:') return false
-  const host = parsed.hostname.toLowerCase()
-  return GITHUB_AUTH_HOSTS.some((allowed) => host === allowed || host.endsWith(`.${allowed}`))
+	let parsed: URL;
+	try {
+		parsed = new URL(url);
+	} catch {
+		return false;
+	}
+	if (parsed.protocol !== "https:") return false;
+	const host = parsed.hostname.toLowerCase();
+	return GITHUB_AUTH_HOSTS.some((allowed) => host === allowed || host.endsWith(`.${allowed}`));
 }
 
 /**
@@ -370,9 +346,9 @@ export function isGithubAuthUrl(url: string): boolean {
  * @returns The Authorization header, or `{}` when no token applies to this URL.
  */
 function githubAuthHeaders(url: string): Record<string, string> {
-  if (!isGithubAuthUrl(url)) return {}
-  const token = process.env.GH_TOKEN ?? process.env.GITHUB_TOKEN
-  return token ? { Authorization: `Bearer ${token}` } : {}
+	if (!isGithubAuthUrl(url)) return {};
+	const token = process.env.GH_TOKEN ?? process.env.GITHUB_TOKEN;
+	return token ? { Authorization: `Bearer ${token}` } : {};
 }
 
 /**
@@ -382,143 +358,69 @@ function githubAuthHeaders(url: string): Record<string, string> {
  * releases are all prereleases, so the latest release with a matching asset is used.
  */
 async function downloadCodex(
-  fetchFn: FetchFn,
-  extract: ExtractArchive,
-  platform: NodeJS.Platform,
-  arch: string,
-  signal: AbortSignal,
-  onProgress: (line: string) => void
+	fetchFn: FetchFn,
+	extract: ExtractArchive,
+	platform: NodeJS.Platform,
+	arch: string,
+	signal: AbortSignal,
+	onProgress: (line: string) => void
 ): Promise<Uint8Array> {
-  const triple = codexTriple(platform, arch)
-  if (!triple) throw unsupported('Codex', platformArch(platform, arch))
-  const candidates = codexAssetCandidates(triple)
+	const triple = codexTriple(platform, arch);
+	if (!triple) throw unsupported("Codex", platformArch(platform, arch));
+	const candidates = codexAssetCandidates(triple);
 
-  throwIfAborted(signal)
-  onProgress('Resolving version...')
-  const releasesUrl = `${CODEX_RELEASES}?per_page=10`
-  const headers = {
-    Accept: 'application/vnd.github+json',
-    'X-GitHub-Api-Version': '2022-11-28',
-    ...githubAuthHeaders(releasesUrl)
-  }
-  const releases = await fetchJson(fetchFn, releasesUrl, signal, headers)
-  assertArray<GithubRelease>(releases, 'Unexpected Codex releases response (expected an array)')
+	throwIfAborted(signal);
+	onProgress("Resolving version...");
+	const releasesUrl = `${CODEX_RELEASES}?per_page=10`;
+	const headers = {
+		Accept: "application/vnd.github+json",
+		"X-GitHub-Api-Version": "2022-11-28",
+		...githubAuthHeaders(releasesUrl)
+	};
+	const releases = await fetchJson(fetchFn, releasesUrl, signal, headers);
+	assertArray<GithubRelease>(releases, "Unexpected Codex releases response (expected an array)");
 
-  let asset: GithubAsset | undefined
-  for (const release of releases) {
-    for (const name of candidates) {
-      asset = (release.assets ?? []).find((a) => a.name === name)
-      if (asset) break
-    }
-    if (asset) break
-  }
-  if (!asset?.browser_download_url || !asset.name) {
-    throw new Error(`No Codex release asset for ${triple}`)
-  }
+	let asset: GithubAsset | undefined;
+	for (const release of releases) {
+		for (const name of candidates) {
+			asset = (release.assets ?? []).find((a) => a.name === name);
+			if (asset) break;
+		}
+		if (asset) break;
+	}
+	if (!asset?.browser_download_url || !asset.name) {
+		throw new Error(`No Codex release asset for ${triple}`);
+	}
 
-  throwIfAborted(signal)
-  onProgress('Downloading...')
-  const archive = await fetchBytes(
-    fetchFn,
-    asset.browser_download_url,
-    signal,
-    githubAuthHeaders(asset.browser_download_url)
-  )
+	throwIfAborted(signal);
+	onProgress("Downloading...");
+	const archive = await fetchBytes(
+		fetchFn,
+		asset.browser_download_url,
+		signal,
+		githubAuthHeaders(asset.browser_download_url)
+	);
 
-  throwIfAborted(signal)
-  onProgress('Verifying checksum...')
-  verifyArchiveDigest(archive, asset.digest, asset.name)
+	throwIfAborted(signal);
+	onProgress("Verifying checksum...");
+	verifyArchiveDigest(archive, asset.digest, asset.name);
 
-  throwIfAborted(signal)
-  onProgress('Extracting...')
-  // The inner binary's basename matches the chosen asset minus its archive suffix (so a
-  // gnu-equivalent fallback asset yields `codex-<gnu-triple>`, not the primary triple).
-  const want = asset.name.replace(/\.tar\.gz$/, '').replace(/\.zip$/, '')
-  return extractEntry(
-    extract,
-    archive,
-    asset.name,
-    (entry) => {
-      const base = basename(entry)
-      if (CODEX_HELPER_BASENAMES.includes(base)) return false
-      return base === want
-    },
-    signal
-  )
-}
-
-// --- OpenCode: GitHub release archive, extract `opencode` -----------------------------
-
-/** OpenCode GitHub repo (releases come from its release downloads). */
-const OPENCODE_REPO = 'anomalyco/opencode'
-
-/** Maps `platform-arch` to OpenCode's release asset name, or `null` if unsupported. */
-function opencodeAsset(platform: NodeJS.Platform, arch: string): string | null {
-  const key = platformArch(platform, arch)
-  const map: Record<string, string> = {
-    'darwin-arm64': 'opencode-darwin-arm64.zip',
-    'darwin-x64': 'opencode-darwin-x64.zip',
-    'linux-arm64': 'opencode-linux-arm64.tar.gz',
-    'linux-x64': 'opencode-linux-x64.tar.gz',
-    'win32-x64': 'opencode-windows-x64.zip'
-  }
-  return map[key] ?? null
-}
-
-/**
- * Downloads the OpenCode release via the GitHub releases API (so the matched asset's
- * published `digest` is available), SHA256-verifies the archive against that digest
- * BEFORE placing anything, extracts the single `opencode` binary, and returns its
- * bytes. The default install resolves `releases/latest`; an explicit `version` pins a
- * specific tag. GitHub requires a non-empty User-Agent, so the injected `userAgent` is
- * sent on every OpenCode request.
- */
-async function downloadOpencode(
-  fetchFn: FetchFn,
-  extract: ExtractArchive,
-  userAgent: string,
-  platform: NodeJS.Platform,
-  arch: string,
-  version: string | undefined,
-  signal: AbortSignal,
-  onProgress: (line: string) => void
-): Promise<Uint8Array> {
-  const assetName = opencodeAsset(platform, arch)
-  if (!assetName) throw unsupported('OpenCode', platformArch(platform, arch))
-
-  throwIfAborted(signal)
-  onProgress('Resolving version...')
-  const releaseUrl = version
-    ? `https://api.github.com/repos/${OPENCODE_REPO}/releases/tags/v${version}`
-    : `https://api.github.com/repos/${OPENCODE_REPO}/releases/latest`
-  const headers = {
-    Accept: 'application/vnd.github+json',
-    'X-GitHub-Api-Version': '2022-11-28',
-    'User-Agent': userAgent,
-    ...githubAuthHeaders(releaseUrl)
-  }
-  const release = await fetchJson(fetchFn, releaseUrl, signal, headers)
-  assertObject<GithubRelease>(release, 'Unexpected OpenCode release response (expected an object)')
-  const asset = (release.assets ?? []).find((a) => a.name === assetName)
-  if (!asset?.browser_download_url) {
-    throw new Error(`No OpenCode release asset named ${assetName}`)
-  }
-
-  throwIfAborted(signal)
-  onProgress('Downloading...')
-  const archive = await fetchBytes(fetchFn, asset.browser_download_url, signal, {
-    'User-Agent': userAgent,
-    ...githubAuthHeaders(asset.browser_download_url)
-  })
-
-  throwIfAborted(signal)
-  onProgress('Verifying checksum...')
-  verifyArchiveDigest(archive, asset.digest, assetName)
-
-  throwIfAborted(signal)
-  onProgress('Extracting...')
-  const want = platform === 'win32' ? 'opencode.exe' : 'opencode'
-  return extractEntry(extract, archive, assetName, (entry) => basename(entry) === want, signal)
+	throwIfAborted(signal);
+	onProgress("Extracting...");
+	// The inner binary's basename matches the chosen asset minus its archive suffix (so a
+	// gnu-equivalent fallback asset yields `codex-<gnu-triple>`, not the primary triple).
+	const want = asset.name.replace(/\.tar\.gz$/, "").replace(/\.zip$/, "");
+	return extractEntry(
+		extract,
+		archive,
+		asset.name,
+		(entry) => {
+			const base = basename(entry);
+			if (CODEX_HELPER_BASENAMES.includes(base)) return false;
+			return base === want;
+		},
+		signal
+	);
 }
 
 // --- Fetch helpers --------------------------------------------------------------------
@@ -534,7 +436,7 @@ async function downloadOpencode(
  * @param label - The clear error thrown when the value is not an object.
  */
 function assertObject<T extends object>(value: unknown, label: string): asserts value is T {
-  if (typeof value !== 'object' || value === null) throw new Error(label)
+	if (typeof value !== "object" || value === null) throw new Error(label);
 }
 
 /**
@@ -546,7 +448,7 @@ function assertObject<T extends object>(value: unknown, label: string): asserts 
  * @param label - The clear error thrown when the value is not an array.
  */
 function assertArray<T>(value: unknown, label: string): asserts value is T[] {
-  if (!Array.isArray(value)) throw new Error(label)
+	if (!Array.isArray(value)) throw new Error(label);
 }
 
 /**
@@ -555,34 +457,55 @@ function assertArray<T>(value: unknown, label: string): asserts value is T[] {
  * it, a cancel during a large download leaves the request running to completion.
  */
 export type FetchFn = (
-  url: string,
-  init?: { headers?: Record<string, string>; signal?: AbortSignal }
-) => Promise<Response>
+	url: string,
+	init?: { headers?: Record<string, string>; signal?: AbortSignal }
+) => Promise<Response>;
+
+/**
+ * Wraps a {@link FetchFn} so EVERY request it makes carries a `User-Agent`.
+ *
+ * GitHub answers 403 to API requests that send none, so the header is not decoration - a release
+ * lookup without it fails the install outright. It is applied by wrapping rather than by threading
+ * the value through `downloadClaude`/`downloadCodex`/`fetchOk`/`fetchText`/`fetchJson`, because a
+ * parameter has to be remembered at six call sites and forgetting one is exactly how the header
+ * came to be computed, passed into `downloadBinary`, and then dropped without ever reaching a
+ * request. Wrapping makes that class of miss unrepresentable.
+ *
+ * A caller's own headers win, so `downloadCodex`'s `Accept: application/vnd.github+json` survives.
+ *
+ * @param fetchFn - The underlying fetch implementation.
+ * @param userAgent - The User-Agent to send on every request.
+ * @returns A `FetchFn` that always sends the header.
+ */
+function withUserAgent(fetchFn: FetchFn, userAgent: string): FetchFn {
+	return (url, init) =>
+		fetchFn(url, { ...init, headers: { "User-Agent": userAgent, ...init?.headers } });
+}
 
 /** Builds the fetch init from optional headers + the install signal, omitting empty keys. */
 function fetchInit(
-  signal: AbortSignal,
-  headers?: Record<string, string>
+	signal: AbortSignal,
+	headers?: Record<string, string>
 ): { headers?: Record<string, string>; signal: AbortSignal } {
-  return headers ? { headers, signal } : { signal }
+	return headers ? { headers, signal } : { signal };
 }
 
 /** Fetches a URL (threading the abort signal), throwing a clear error on a non-OK response. */
 async function fetchOk(
-  fetchFn: FetchFn,
-  url: string,
-  signal: AbortSignal,
-  headers?: Record<string, string>
+	fetchFn: FetchFn,
+	url: string,
+	signal: AbortSignal,
+	headers?: Record<string, string>
 ): Promise<Response> {
-  const res = await fetchFn(url, fetchInit(signal, headers))
-  if (!res.ok) throw new Error(`Download failed (${res.status}) for ${url}`)
-  return res
+	const res = await fetchFn(url, fetchInit(signal, headers));
+	if (!res.ok) throw new Error(`Download failed (${res.status}) for ${url}`);
+	return res;
 }
 
 /** Fetches a URL as trimmed text. */
 async function fetchText(fetchFn: FetchFn, url: string, signal: AbortSignal): Promise<string> {
-  const res = await fetchOk(fetchFn, url, signal)
-  return res.text()
+	const res = await fetchOk(fetchFn, url, signal);
+	return res.text();
 }
 
 /**
@@ -592,24 +515,24 @@ async function fetchText(fetchFn: FetchFn, url: string, signal: AbortSignal): Pr
  * error rather than propagating an unsound type.
  */
 async function fetchJson(
-  fetchFn: FetchFn,
-  url: string,
-  signal: AbortSignal,
-  headers?: Record<string, string>
+	fetchFn: FetchFn,
+	url: string,
+	signal: AbortSignal,
+	headers?: Record<string, string>
 ): Promise<unknown> {
-  const res = await fetchOk(fetchFn, url, signal, headers)
-  return res.json()
+	const res = await fetchOk(fetchFn, url, signal, headers);
+	return res.json();
 }
 
 /** Fetches a URL as raw bytes. */
 async function fetchBytes(
-  fetchFn: FetchFn,
-  url: string,
-  signal: AbortSignal,
-  headers?: Record<string, string>
+	fetchFn: FetchFn,
+	url: string,
+	signal: AbortSignal,
+	headers?: Record<string, string>
 ): Promise<Uint8Array> {
-  const res = await fetchOk(fetchFn, url, signal, headers)
-  return new Uint8Array(await res.arrayBuffer())
+	const res = await fetchOk(fetchFn, url, signal, headers);
+	return new Uint8Array(await res.arrayBuffer());
 }
 
 // --- Archive extraction (no npm dependency, via the system `tar`) ---------------------
@@ -626,11 +549,11 @@ async function fetchBytes(
  * @param signal - Aborts the extraction (kills the child) when fired.
  */
 export type ExtractArchive = (
-  bytes: Uint8Array,
-  assetName: string,
-  destDir: string,
-  signal: AbortSignal
-) => Promise<void>
+	bytes: Uint8Array,
+	assetName: string,
+	destDir: string,
+	signal: AbortSignal
+) => Promise<void>;
 
 /**
  * Spawns the system `tar` to extract an archive file into a directory. The child is
@@ -638,52 +561,53 @@ export type ExtractArchive = (
  * rejects with "Install cancelled" so the install promise never hangs.
  */
 function spawnTarExtract(archivePath: string, destDir: string, signal: AbortSignal): Promise<void> {
-  return new Promise((resolve, reject) => {
-    if (signal.aborted) {
-      reject(new Error('Install cancelled'))
-      return
-    }
-    const child = spawn('tar', ['-xf', archivePath, '-C', destDir], {
-      windowsHide: true,
-      stdio: ['ignore', 'ignore', 'pipe']
-    })
-    const onAbort = (): void => {
-      child.kill()
-    }
-    signal.addEventListener('abort', onAbort, { once: true })
-    let stderr = ''
-    child.stderr?.setEncoding('utf8')
-    child.stderr?.on('data', (chunk: string) => {
-      stderr += chunk
-    })
-    child.on('error', (error) => {
-      signal.removeEventListener('abort', onAbort)
-      reject(new Error(`Could not start tar: ${error.message}`))
-    })
-    child.on('close', (code) => {
-      signal.removeEventListener('abort', onAbort)
-      if (signal.aborted) reject(new Error('Install cancelled'))
-      else if (code === 0) resolve()
-      else reject(new Error(`tar exited with code ${code ?? 1}${stderr ? `: ${stderr.trim()}` : ''}`))
-    })
-  })
+	return new Promise((resolve, reject) => {
+		if (signal.aborted) {
+			reject(new Error("Install cancelled"));
+			return;
+		}
+		const child = spawn("tar", ["-xf", archivePath, "-C", destDir], {
+			windowsHide: true,
+			stdio: ["ignore", "ignore", "pipe"]
+		});
+		const onAbort = (): void => {
+			child.kill();
+		};
+		signal.addEventListener("abort", onAbort, { once: true });
+		let stderr = "";
+		child.stderr?.setEncoding("utf8");
+		child.stderr?.on("data", (chunk: string) => {
+			stderr += chunk;
+		});
+		child.on("error", (error) => {
+			signal.removeEventListener("abort", onAbort);
+			reject(new Error(`Could not start tar: ${error.message}`));
+		});
+		child.on("close", (code) => {
+			signal.removeEventListener("abort", onAbort);
+			if (signal.aborted) reject(new Error("Install cancelled"));
+			else if (code === 0) resolve();
+			else
+				reject(new Error(`tar exited with code ${code ?? 1}${stderr ? `: ${stderr.trim()}` : ""}`));
+		});
+	});
 }
 
 /** The default {@link ExtractArchive}: write to a temp file, spawn `tar`, clean up. */
 const defaultExtractArchive: ExtractArchive = async (bytes, assetName, destDir, signal) => {
-  const suffix = assetName.endsWith('.zip') ? '.zip' : '.tar.gz'
-  const archivePath = join(destDir, `archive${suffix}`)
-  writeFileSync(archivePath, bytes)
-  try {
-    await spawnTarExtract(archivePath, destDir, signal)
-  } finally {
-    try {
-      unlinkSync(archivePath)
-    } catch {
-      // Best-effort cleanup; the whole temp dir is removed by the caller anyway.
-    }
-  }
-}
+	const suffix = assetName.endsWith(".zip") ? ".zip" : ".tar.gz";
+	const archivePath = join(destDir, `archive${suffix}`);
+	writeFileSync(archivePath, bytes);
+	try {
+		await spawnTarExtract(archivePath, destDir, signal);
+	} finally {
+		try {
+			unlinkSync(archivePath);
+		} catch {
+			// Best-effort cleanup; the whole temp dir is removed by the caller anyway.
+		}
+	}
+};
 
 /**
  * Recursively lists every regular-file path under `dir`. Uses `lstatSync` (not `statSync`)
@@ -692,15 +616,15 @@ const defaultExtractArchive: ExtractArchive = async (bytes, assetName, destDir, 
  * link) - the matched binary is re-checked against the extraction root by `assertWithin`.
  */
 function walkFiles(dir: string): string[] {
-  const out: string[] = []
-  for (const entry of readdirSync(dir)) {
-    const full = join(dir, entry)
-    const stat = lstatSync(full)
-    if (stat.isSymbolicLink()) continue
-    if (stat.isDirectory()) out.push(...walkFiles(full))
-    else if (stat.isFile()) out.push(full)
-  }
-  return out
+	const out: string[] = [];
+	for (const entry of readdirSync(dir)) {
+		const full = join(dir, entry);
+		const stat = lstatSync(full);
+		if (stat.isSymbolicLink()) continue;
+		if (stat.isDirectory()) out.push(...walkFiles(full));
+		else if (stat.isFile()) out.push(full);
+	}
+	return out;
 }
 
 /**
@@ -710,12 +634,12 @@ function walkFiles(dir: string): string[] {
  * `../` or a symlink), making traversal-safety explicit rather than relying on tar.
  */
 function assertWithin(root: string, target: string): void {
-  const realRoot = realpathSync(root)
-  const realTarget = realpathSync(target)
-  const prefix = realRoot.endsWith(sep) ? realRoot : realRoot + sep
-  if (realTarget !== realRoot && !realTarget.startsWith(prefix)) {
-    throw new Error('Refusing to read an extracted file outside the extraction directory')
-  }
+	const realRoot = realpathSync(root);
+	const realTarget = realpathSync(target);
+	const prefix = realRoot.endsWith(sep) ? realRoot : realRoot + sep;
+	if (realTarget !== realRoot && !realTarget.startsWith(prefix)) {
+		throw new Error("Refusing to read an extracted file outside the extraction directory");
+	}
 }
 
 /**
@@ -725,22 +649,22 @@ function assertWithin(root: string, target: string): void {
  * a path-traversal entry can never read outside it. The temp dir is always removed.
  */
 async function extractEntry(
-  extract: ExtractArchive,
-  bytes: Uint8Array,
-  assetName: string,
-  match: (entryPath: string) => boolean,
-  signal: AbortSignal
+	extract: ExtractArchive,
+	bytes: Uint8Array,
+	assetName: string,
+	match: (entryPath: string) => boolean,
+	signal: AbortSignal
 ): Promise<Uint8Array> {
-  const dir = mkdtempSync(join(tmpdir(), 'cli-extract-'))
-  try {
-    await extract(bytes, assetName, dir, signal)
-    const target = walkFiles(dir).find((file) => match(file))
-    if (!target) throw new Error(`Archive ${assetName} did not contain the expected binary`)
-    assertWithin(dir, target)
-    return new Uint8Array(readFileSync(resolve(target)))
-  } finally {
-    rmSync(dir, { recursive: true, force: true })
-  }
+	const dir = mkdtempSync(join(tmpdir(), "cli-extract-"));
+	try {
+		await extract(bytes, assetName, dir, signal);
+		const target = walkFiles(dir).find((file) => match(file));
+		if (!target) throw new Error(`Archive ${assetName} did not contain the expected binary`);
+		assertWithin(dir, target);
+		return new Uint8Array(readFileSync(resolve(target)));
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
 }
 
 // --- Atomic write + verify ------------------------------------------------------------
@@ -757,23 +681,23 @@ async function extractEntry(
  * @throws When any component below `baseDir` is a symlink.
  */
 function assertNoSymlinkComponents(baseDir: string, dir: string): void {
-  const rel = relative(baseDir, dir)
-  if (rel === '' || rel.startsWith('..')) return
-  let current = baseDir
-  for (const part of rel.split(sep)) {
-    if (part === '') continue
-    current = join(current, part)
-    let stat: ReturnType<typeof lstatSync>
-    try {
-      stat = lstatSync(current)
-    } catch {
-      // The component does not exist yet (mkdirSync will create it); nothing to reject.
-      continue
-    }
-    if (stat.isSymbolicLink()) {
-      throw new Error(`Refusing to install through a symlinked path component: ${current}`)
-    }
-  }
+	const rel = relative(baseDir, dir);
+	if (rel === "" || rel.startsWith("..")) return;
+	let current = baseDir;
+	for (const part of rel.split(sep)) {
+		if (part === "") continue;
+		current = join(current, part);
+		let stat: ReturnType<typeof lstatSync>;
+		try {
+			stat = lstatSync(current);
+		} catch {
+			// The component does not exist yet (mkdirSync will create it); nothing to reject.
+			continue;
+		}
+		if (stat.isSymbolicLink()) {
+			throw new Error(`Refusing to install through a symlinked path component: ${current}`);
+		}
+	}
 }
 
 /**
@@ -782,7 +706,7 @@ function assertNoSymlinkComponents(baseDir: string, dir: string): void {
  * between place and exec is caught (a TOCTOU guard).
  */
 function sha256Hex(bytes: Uint8Array): string {
-  return createHash('sha256').update(bytes).digest('hex').toLowerCase()
+	return createHash("sha256").update(bytes).digest("hex").toLowerCase();
 }
 
 /**
@@ -792,17 +716,17 @@ function sha256Hex(bytes: Uint8Array): string {
  * so a retry is not blocked by the exclusive create.
  */
 function writeExclusive(path: string, bytes: Uint8Array): void {
-  try {
-    unlinkSync(path)
-  } catch {
-    // No stale temp to remove.
-  }
-  const fd = openSync(path, fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_WRONLY, 0o600)
-  try {
-    writeSync(fd, bytes)
-  } finally {
-    closeSync(fd)
-  }
+	try {
+		unlinkSync(path);
+	} catch {
+		// No stale temp to remove.
+	}
+	const fd = openSync(path, fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_WRONLY, 0o600);
+	try {
+		writeSync(fd, bytes);
+	} finally {
+		closeSync(fd);
+	}
 }
 
 /**
@@ -817,50 +741,50 @@ function writeExclusive(path: string, bytes: Uint8Array): void {
  * @returns The lowercase SHA256 hex of the bytes written (re-checked before the exec).
  */
 async function placeBinary(
-  bytes: Uint8Array,
-  binaryPath: string,
-  platform: NodeJS.Platform,
-  signal: AbortSignal
+	bytes: Uint8Array,
+	binaryPath: string,
+	platform: NodeJS.Platform,
+	signal: AbortSignal
 ): Promise<string> {
-  const tmp = `${binaryPath}.tmp`
-  writeExclusive(tmp, bytes)
-  if (platform === 'win32') {
-    const old = `${binaryPath}.old`
-    try {
-      renameSync(binaryPath, old)
-    } catch {
-      // No existing target to move aside.
-    }
-    renameSync(tmp, binaryPath)
-    try {
-      unlinkSync(old)
-    } catch {
-      // Best-effort; a locked previous binary is left as `.old`.
-    }
-  } else {
-    renameSync(tmp, binaryPath)
-    chmodSync(binaryPath, 0o755)
-    if (platform === 'darwin') {
-      await new Promise<void>((resolve) => {
-        const child = spawn('xattr', ['-d', 'com.apple.quarantine', binaryPath], {
-          windowsHide: true,
-          stdio: 'ignore'
-        })
-        const onAbort = (): void => {
-          child.kill()
-        }
-        signal.addEventListener('abort', onAbort, { once: true })
-        const finish = (): void => {
-          signal.removeEventListener('abort', onAbort)
-          resolve()
-        }
-        // The xattr may be absent (non-zero exit) - that is fine, so never reject.
-        child.on('error', finish)
-        child.on('close', finish)
-      })
-    }
-  }
-  return sha256Hex(bytes)
+	const tmp = `${binaryPath}.tmp`;
+	writeExclusive(tmp, bytes);
+	if (platform === "win32") {
+		const old = `${binaryPath}.old`;
+		try {
+			renameSync(binaryPath, old);
+		} catch {
+			// No existing target to move aside.
+		}
+		renameSync(tmp, binaryPath);
+		try {
+			unlinkSync(old);
+		} catch {
+			// Best-effort; a locked previous binary is left as `.old`.
+		}
+	} else {
+		renameSync(tmp, binaryPath);
+		chmodSync(binaryPath, 0o755);
+		if (platform === "darwin") {
+			await new Promise<void>((resolve) => {
+				const child = spawn("xattr", ["-d", "com.apple.quarantine", binaryPath], {
+					windowsHide: true,
+					stdio: "ignore"
+				});
+				const onAbort = (): void => {
+					child.kill();
+				};
+				signal.addEventListener("abort", onAbort, { once: true });
+				const finish = (): void => {
+					signal.removeEventListener("abort", onAbort);
+					resolve();
+				};
+				// The xattr may be absent (non-zero exit) - that is fine, so never reject.
+				child.on("error", finish);
+				child.on("close", finish);
+			});
+		}
+	}
+	return sha256Hex(bytes);
 }
 
 /**
@@ -874,63 +798,84 @@ async function placeBinary(
  * @throws When the on-disk bytes no longer hash to `expectedSha`.
  */
 export function assertPlacedUnchanged(binaryPath: string, expectedSha: string): void {
-  const onDisk = sha256Hex(new Uint8Array(readFileSync(binaryPath)))
-  if (onDisk !== expectedSha) {
-    throw new Error('Installed binary changed on disk before verification; refusing to run it.')
-  }
+	const onDisk = sha256Hex(new Uint8Array(readFileSync(binaryPath)));
+	if (onDisk !== expectedSha) {
+		throw new Error("Installed binary changed on disk before verification; refusing to run it.");
+	}
 }
 
 /** Injectable dependencies for {@link installCli} (real implementations by default). */
 export interface InstallDeps {
-  /** The fetch used for every download (defaults to the global `fetch`). */
-  fetchFn?: FetchFn
-  /** Extracts an archive into a directory (defaults to spawning the system `tar`). */
-  extractArchive?: ExtractArchive
-  /** Runs `<binary> --version` to verify the install (defaults to {@link runTool}). */
-  runToolFn?: RunTool
-  /**
-   * The User-Agent sent to GitHub for OpenCode requests. GitHub requires a non-empty
-   * User-Agent; the host injects its own branding (never an internal codename). Defaults
-   * to a neutral `agent-runtime`.
-   */
-  userAgent?: string
-  /** The OS platform (defaults to `process.platform`). */
-  platform?: NodeJS.Platform
-  /** The CPU architecture (defaults to `process.arch`). */
-  arch?: string
+	/** The fetch used for every download (defaults to the global `fetch`). */
+	fetchFn?: FetchFn;
+	/** Extracts an archive into a directory (defaults to spawning the system `tar`). */
+	extractArchive?: ExtractArchive;
+	/** Runs `<binary> --version` to verify the install (defaults to {@link runTool}). */
+	runToolFn?: RunTool;
+	/**
+	 * The User-Agent sent to GitHub for release-asset requests. GitHub requires a non-empty
+	 * User-Agent; the host injects its own branding (never an internal codename). Defaults
+	 * to a neutral `agent-runtime`.
+	 */
+	userAgent?: string;
+	/** The OS platform (defaults to `process.platform`). */
+	platform?: NodeJS.Platform;
+	/** The CPU architecture (defaults to `process.arch`). */
+	arch?: string;
+	/**
+	 * The unprivileged identity the CLI RUN children run as, set ONLY on a contained host (the runner in
+	 * its own container). There the daemon installs as root while a dispatched run drops to this
+	 * identity, and the managed tree is created owner-only (`0700`), so that child cannot even TRAVERSE
+	 * to the binary, let alone exec it. (A login child is NOT one of them - it stays the daemon, so the
+	 * credential it writes is one the daemon can read back.) Unset off a contained host,
+	 * where the daemon already runs as the user the CLI does. Only the `gid` is consumed - see
+	 * {@link shareManagedClisWithAgent} for why the tree is group-shared rather than handed over.
+	 */
+	agent?: AgentIdentity;
+	/**
+	 * The share seam (defaults to the real no-follow {@link shareDirNoFollow}), injectable so a test can
+	 * assert the group share without being root. Only consulted when {@link InstallDeps.agent} is set.
+	 */
+	share?: ShareDir;
 }
 
 /** Dispatches to the per-CLI downloader for a tool id, returning the verified binary bytes. */
 function downloadBinary(
-  toolId: string,
-  deps: Required<Pick<InstallDeps, 'fetchFn' | 'extractArchive' | 'userAgent' | 'platform' | 'arch'>>,
-  version: string | undefined,
-  signal: AbortSignal,
-  onProgress: (line: string) => void
+	toolId: string,
+	deps: Required<
+		Pick<InstallDeps, "fetchFn" | "extractArchive" | "userAgent" | "platform" | "arch">
+	>,
+	version: string | undefined,
+	signal: AbortSignal,
+	onProgress: (line: string) => void
 ): Promise<Uint8Array> {
-  const { fetchFn, extractArchive, userAgent, platform, arch } = deps
-  if (toolId === 'claude-code') {
-    return downloadClaude(fetchFn, platform, arch, version, signal, onProgress)
-  }
-  if (toolId === 'codex') {
-    return downloadCodex(fetchFn, extractArchive, platform, arch, signal, onProgress)
-  }
-  if (toolId === 'opencode') {
-    return downloadOpencode(fetchFn, extractArchive, userAgent, platform, arch, version, signal, onProgress)
-  }
-  throw new Error(`"${toolId}" is not an installable CLI`)
+	const { fetchFn, extractArchive, userAgent, platform, arch } = deps;
+	// Bind the User-Agent once here so both downloaders - and every helper they reach through
+	// (`fetchOk`, `fetchText`, `fetchJson`) - send it without having to know about it.
+	const fetchWithUa = withUserAgent(fetchFn, userAgent);
+	if (toolId === "claude-code") {
+		return downloadClaude(fetchWithUa, platform, arch, version, signal, onProgress);
+	}
+	if (toolId === "codex") {
+		return downloadCodex(fetchWithUa, extractArchive, platform, arch, signal, onProgress);
+	}
+	throw new Error(`"${toolId}" is not an installable CLI`);
 }
 
 /**
  * Installs a coding CLI into the host's OWN data folder (`baseDir`) by DOWNLOADING its
  * standalone binary (no npm, no Node) - Claude Code as a raw SHA256-verified binary,
- * Codex/OpenCode as the one target binary extracted from a release archive - and writing it
+ * Codex as the one target binary extracted from a release archive - and writing it
  * atomically to `<baseDir>/clis/<toolId>/<binary>`. Installs the LATEST version by default;
  * an optional `version` pins a specific one (the caller never supplies the download source -
  * it is fixed per tool id). Streams meaningful progress phases via `onProgress`, honors the
  * abort signal at every await (rejecting "Install cancelled"), and verifies the install by
  * running `<binary> --version`. Rejects with a clear message on an unknown tool id, an
  * unsupported platform, a failed download/checksum/extraction, or a cancel.
+ *
+ * `deps.agent` (contained hosts only) group-shares the verified install with the unprivileged identity
+ * the CLI children run as; without it the `0700` tree is not even traversable by them, so the binary
+ * cannot be exec'd. See {@link shareManagedClisWithAgent}.
  *
  * @param baseDir - The host data folder the managed CLIs are installed under (injected; no Electron).
  * @param toolId - The adapter id of the CLI to install (must be a managed CLI).
@@ -941,35 +886,37 @@ function downloadBinary(
  * @returns Resolves once the binary is downloaded, written, and verified.
  */
 export function installCli(
-  baseDir: string,
-  toolId: string,
-  onProgress: (line: string) => void,
-  signal: AbortSignal,
-  version?: string,
-  deps: InstallDeps = {}
+	baseDir: string,
+	toolId: string,
+	onProgress: (line: string) => void,
+	signal: AbortSignal,
+	version?: string,
+	deps: InstallDeps = {}
 ): Promise<void> {
-  // Serialize per managed binary: two concurrent installs of the same CLI would race on the shared
-  // `<binaryPath>.tmp` (writeExclusive unlinks the "stale" tmp that is actually the other
-  // install's live one, corrupting both). A queued install WAITS for the prior one, then runs
-  // (idempotent re-verify), keeping its own progress sink and abort signal semantics.
-  const key = `${baseDir}\0${toolId}`
-  const prev = installQueue.get(key) ?? Promise.resolve()
-  // The QUEUE POSITION the next install chains on: it always awaits the prior install's REAL
-  // completion (serialization holds even if this install is cancelled while queued), then runs unless
-  // aborted meanwhile - a cancelled queued install never touches the shared .tmp.
-  const settled = prev.catch(() => undefined).then(async () => {
-    if (signal.aborted) return
-    await runInstallCli(baseDir, toolId, onProgress, signal, version, deps)
-  })
-  const stored = settled.catch(() => undefined)
-  installQueue.set(key, stored)
-  void stored.then(() => {
-    if (installQueue.get(key) === stored) installQueue.delete(key)
-  })
-  // The CALLER sees cancellation promptly: reject as soon as the signal fires rather than sitting
-  // behind a multi-minute prior install. Serialization is preserved by `settled` above, which the
-  // next install waits on regardless of this early rejection.
-  return abortableInstall(settled, signal)
+	// Serialize per managed binary: two concurrent installs of the same CLI would race on the shared
+	// `<binaryPath>.tmp` (writeExclusive unlinks the "stale" tmp that is actually the other
+	// install's live one, corrupting both). A queued install WAITS for the prior one, then runs
+	// (idempotent re-verify), keeping its own progress sink and abort signal semantics.
+	const key = `${baseDir}\0${toolId}`;
+	const prev = installQueue.get(key) ?? Promise.resolve();
+	// The QUEUE POSITION the next install chains on: it always awaits the prior install's REAL
+	// completion (serialization holds even if this install is cancelled while queued), then runs unless
+	// aborted meanwhile - a cancelled queued install never touches the shared .tmp.
+	const settled = prev
+		.catch(() => undefined)
+		.then(async () => {
+			if (signal.aborted) return;
+			await runInstallCli(baseDir, toolId, onProgress, signal, version, deps);
+		});
+	const stored = settled.catch(() => undefined);
+	installQueue.set(key, stored);
+	void stored.then(() => {
+		if (installQueue.get(key) === stored) installQueue.delete(key);
+	});
+	// The CALLER sees cancellation promptly: reject as soon as the signal fires rather than sitting
+	// behind a multi-minute prior install. Serialization is preserved by `settled` above, which the
+	// next install waits on regardless of this early rejection.
+	return abortableInstall(settled, signal);
 }
 
 /**
@@ -981,108 +928,147 @@ export function installCli(
  * @returns A promise that settles with `settled` or rejects promptly on abort.
  */
 function abortableInstall(settled: Promise<void>, signal: AbortSignal): Promise<void> {
-  if (signal.aborted) return Promise.reject(new Error('Install cancelled'))
-  return new Promise<void>((resolve, reject) => {
-    const onAbort = (): void => reject(new Error('Install cancelled'))
-    signal.addEventListener('abort', onAbort, { once: true })
-    settled.then(
-      () => {
-        signal.removeEventListener('abort', onAbort)
-        resolve()
-      },
-      (err: unknown) => {
-        signal.removeEventListener('abort', onAbort)
-        reject(err instanceof Error ? err : new Error(String(err)))
-      }
-    )
-  })
+	if (signal.aborted) return Promise.reject(new Error("Install cancelled"));
+	return new Promise<void>((resolve, reject) => {
+		const onAbort = (): void => reject(new Error("Install cancelled"));
+		signal.addEventListener("abort", onAbort, { once: true });
+		settled.then(
+			() => {
+				signal.removeEventListener("abort", onAbort);
+				resolve();
+			},
+			(err: unknown) => {
+				signal.removeEventListener("abort", onAbort);
+				reject(err instanceof Error ? err : new Error(String(err)));
+			}
+		);
+	});
 }
 
 /** In-flight/queued installs keyed by managed binary (see {@link installCli}'s serialization note). */
-const installQueue = new Map<string, Promise<void>>()
+const installQueue = new Map<string, Promise<void>>();
+
+/**
+ * Makes the managed CLI tree reachable by `agent`, the unprivileged identity the CLI children actually
+ * run as, WITHOUT giving up the daemon's own control of it (see {@link shareWithAgent}).
+ *
+ * On a contained host the daemon installs as root while every CLI child (a web login, a dispatched
+ * run) drops to an unprivileged uid. The managed tree is created owner-only (`0700`), so that child
+ * gets EACCES on exec before the CLI starts - and in a container the managed dir is the ONLY place
+ * the binary exists (nothing is on PATH), so this breaks every contained run.
+ *
+ * EVERY component from `baseDir` down is shared, not just the leaf: `mkdirSync(..., { mode: 0o700 })`
+ * creates `baseDir` and its `clis/` too, and traversal needs `+x` on all of them, so a leaf-only
+ * share still fails one directory higher. The binaries are left exactly as placed (`0755`) and the
+ * group gets no WRITE, so a prompt-injected run cannot swap the binary it is about to exec.
+ *
+ * IDEMPOTENT AND WHOLE-TREE, because install time is not the only moment that needs it. A tree
+ * installed before this existed (an upgraded image on an existing `/data` volume), or installed by a
+ * path that had no agent identity to hand it (`connect` run through `docker exec`), is never
+ * re-installed - both install sites early-return once the CLI is detected - so it would be EACCES
+ * forever with no recovery but deleting the tree. The daemon therefore also calls this at BOOT, which
+ * heals every such tree. Every existing tool dir is shared, not just one, for the same reason.
+ *
+ * @param baseDir - The managed-CLI base directory (the root of the tree the daemon installs into).
+ * @param agent - The identity the CLI children run as; only its `gid` is used.
+ * @param seams - Injectable share implementation (the real no-follow one by default).
+ */
+export function shareManagedClisWithAgent(
+	baseDir: string,
+	agent: AgentIdentity,
+	seams: AgentShareSeams = {}
+): void {
+	const toolDirs = Object.keys(CLI_INSTALL_SPECS)
+		.map((toolId) => managedDir(baseDir, toolId))
+		.filter((dir) => existsSync(dir));
+	shareWithAgent([baseDir, managedRoot(baseDir), ...toolDirs], agent, AGENT_TRAVERSE_MODE, seams);
+}
 
 async function runInstallCli(
-  baseDir: string,
-  toolId: string,
-  onProgress: (line: string) => void,
-  signal: AbortSignal,
-  version?: string,
-  deps: InstallDeps = {}
+	baseDir: string,
+	toolId: string,
+	onProgress: (line: string) => void,
+	signal: AbortSignal,
+	version?: string,
+	deps: InstallDeps = {}
 ): Promise<void> {
-  const spec = requireInstallSpec(toolId)
-  const platform = deps.platform ?? process.platform
-  const arch = deps.arch ?? process.arch
-  const fetchFn: FetchFn = deps.fetchFn ?? ((url, init) => globalThis.fetch(url, init))
-  const extractArchive = deps.extractArchive ?? defaultExtractArchive
-  const runToolFn = deps.runToolFn ?? runTool
-  const userAgent = deps.userAgent ?? 'agent-runtime'
+	const spec = requireInstallSpec(toolId);
+	const platform = deps.platform ?? process.platform;
+	const arch = deps.arch ?? process.arch;
+	const fetchFn: FetchFn = deps.fetchFn ?? ((url, init) => globalThis.fetch(url, init));
+	const extractArchive = deps.extractArchive ?? defaultExtractArchive;
+	const runToolFn = deps.runToolFn ?? runTool;
+	const userAgent = deps.userAgent ?? "agent-runtime";
 
-  throwIfAborted(signal)
-  const dir = managedDir(baseDir, toolId)
-  // Reject a symlinked path component BEFORE creating anything, so a pre-planted symlink
-  // cannot redirect the install root. `recursive` with an explicit 0o700 keeps the managed
-  // tree private (owner-only), so another local user cannot pre-create or swap its contents.
-  assertNoSymlinkComponents(baseDir, dirname(dir))
-  mkdirSync(dir, { recursive: true, mode: 0o700 })
-  // mkdirSync's `mode` applies only to dirs it CREATES; a pre-existing `clis/<id>` from a prior
-  // install keeps its old (possibly looser) permissions, so re-assert owner-only here. Windows has
-  // no POSIX modes (chmod is a near no-op there), so only tighten on non-Windows.
-  if (platform !== 'win32') chmodSync(dir, 0o700)
-  assertNoSymlinkComponents(baseDir, dir)
-  const binaryPath = join(dir, binaryFileName(spec, platform))
+	throwIfAborted(signal);
+	const dir = managedDir(baseDir, toolId);
+	// Reject a symlinked path component BEFORE creating anything, so a pre-planted symlink
+	// cannot redirect the install root. `recursive` with an explicit 0o700 keeps the managed
+	// tree private (owner-only), so another local user cannot pre-create or swap its contents.
+	assertNoSymlinkComponents(baseDir, dirname(dir));
+	mkdirSync(dir, { recursive: true, mode: 0o700 });
+	// mkdirSync's `mode` applies only to dirs it CREATES; a pre-existing `clis/<id>` from a prior
+	// install keeps its old (possibly looser) permissions, so re-assert owner-only here. Windows has
+	// no POSIX modes (chmod is a near no-op there), so only tighten on non-Windows.
+	if (platform !== "win32") chmodSync(dir, 0o700);
+	assertNoSymlinkComponents(baseDir, dir);
+	const binaryPath = join(dir, binaryFileName(spec, platform));
 
-  const bytes = await downloadBinary(
-    toolId,
-    { fetchFn, extractArchive, userAgent, platform, arch },
-    version,
-    signal,
-    onProgress
-  )
+	const bytes = await downloadBinary(
+		toolId,
+		{ fetchFn, extractArchive, userAgent, platform, arch },
+		version,
+		signal,
+		onProgress
+	);
 
-  throwIfAborted(signal)
-  const placedSha = await placeBinary(bytes, binaryPath, platform, signal)
+	throwIfAborted(signal);
+	const placedSha = await placeBinary(bytes, binaryPath, platform, signal);
 
-  throwIfAborted(signal)
-  onProgress('Verifying install...')
-  // Re-hash the placed binary immediately before running it, so a file swapped in the
-  // window between place and exec is caught rather than executed (TOCTOU guard).
-  assertPlacedUnchanged(binaryPath, placedSha)
-  const { code } = await runToolFn(binaryPath, ['--version'])
-  if (code !== 0) {
-    throw new Error(`Installed ${spec.binary} but it failed to run (--version exited ${code})`)
-  }
+	throwIfAborted(signal);
+	onProgress("Verifying install...");
+	// Re-hash the placed binary immediately before running it, so a file swapped in the
+	// window between place and exec is caught rather than executed (TOCTOU guard).
+	assertPlacedUnchanged(binaryPath, placedSha);
+	const { code } = await runToolFn(binaryPath, ["--version"]);
+	if (code !== 0) {
+		throw new Error(`Installed ${spec.binary} but it failed to run (--version exited ${code})`);
+	}
+
+	// LAST, and only once the binary is verified: a failed install shares nothing.
+	if (deps.agent) {
+		shareManagedClisWithAgent(baseDir, deps.agent, deps.share ? { share: deps.share } : {});
+	}
 }
 
 /** The resolved login command (executable path + args) for a managed CLI. */
 export interface CliLoginCommand {
-  /** Absolute path to the CLI executable to spawn (managed install or system binary). */
-  command: string
-  /** The CLI's login subcommand args (from the install spec, never caller input). */
-  args: string[]
+	/** Absolute path to the CLI executable to spawn (managed install or system binary). */
+	command: string;
+	/** The CLI's login subcommand args (from the install spec, never caller input). */
+	args: string[];
 }
 
 /**
  * Resolves the fixed login command for a coding CLI: the CLI's own login subcommand plus
  * the executable to run it. The spec comes from {@link CLI_INSTALL_SPECS} (a managed CLI)
- * or, failing that, {@link SYSTEM_CLI_SPECS} (a system-install-only CLI the host connects
- * but never installs). The executable is the managed binary under `baseDir` when it exists
- * on disk (an "install for me" CLI), else the resolved system binary on PATH. The args come
- * ONLY from the spec, never from the caller, so the terminal can never be asked to run an
- * arbitrary command. Returns `null` when `toolId` matches neither registry or no binary
- * resolves (not installed anywhere).
+ * The executable is the managed binary under `baseDir` when it exists on disk (an "install for me"
+ * CLI), else the resolved system binary on PATH. The args come ONLY from the spec, never from the
+ * caller, so the terminal can never be asked to run an arbitrary command. Returns `null` when
+ * `toolId` is not a managed CLI or no binary resolves (not installed anywhere).
  *
  * @param baseDir - The host data folder the managed CLIs live under (injected; no Electron).
  * @param toolId - The adapter id of the CLI to log in to.
  * @returns The login command, or `null` when the tool is unknown or has no binary.
  */
 export function cliLoginCommand(baseDir: string, toolId: string): CliLoginCommand | null {
-  const spec = CLI_INSTALL_SPECS[toolId] ?? SYSTEM_CLI_SPECS[toolId]
-  if (!spec) return null
-  // Prefer the managed binary when it is present on disk (a prior "install for me"); a
-  // bare path string is not enough, so resolve through `resolveToolBinary`, which also
-  // finds a system install on PATH. Searching the managed dir LAST keeps a system install
-  // winning, exactly like the adapters' own binary resolution.
-  const binary = resolveToolBinary(spec.binary, { managedDirs: managedCliBinDirs(baseDir) })
-  if (!binary) return null
-  return { command: binary, args: spec.loginArgs }
+	const spec = CLI_INSTALL_SPECS[toolId];
+	if (!spec) return null;
+	// Prefer the managed binary when it is present on disk (a prior "install for me"); a
+	// bare path string is not enough, so resolve through `resolveToolBinary`, which also
+	// finds a system install on PATH. Searching the managed dir LAST keeps a system install
+	// winning, exactly like the adapters' own binary resolution.
+	const binary = resolveToolBinary(spec.binary, { managedDirs: managedCliBinDirs(baseDir) });
+	if (!binary) return null;
+	return { command: binary, args: spec.loginArgs };
 }

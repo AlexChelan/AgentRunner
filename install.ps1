@@ -1,37 +1,40 @@
-# OpenCompanion installer for Windows. One command, no npm:
+# AgentRunner installer for Windows. One command, no npm:
 #
-#   $env:OPENCOMPANION_BACKEND_URL='https://your-saas.example/api'; irm https://github.com/AlexChelan/OpenCompanion/releases/latest/download/install.ps1 | iex
+#   $env:AGENTRUNNER_BACKEND_URL='https://your-saas.example/api'; irm https://github.com/AlexChelan/AgentRunner/releases/latest/download/install.ps1 | iex
 #
-# It downloads the self-contained OpenCompanion daemon for your architecture, verifies it against the
-# release SHA256SUMS, installs it under %LOCALAPPDATA%\opencompanion, adds it to your PATH, then runs
-# `opencompanion setup` (pair + connect your CLIs + install the always-on Scheduled Task). Re-run any
-# time to upgrade in place; uninstall with `opencompanion uninstall`.
+# It downloads the self-contained AgentRunner daemon for your architecture, verifies it against the
+# release SHA256SUMS, installs it under %LOCALAPPDATA%\agentrunner, adds it to your PATH, then runs
+# `agentrunner setup` (pair + connect your CLIs + install the always-on Scheduled Task). Re-run any
+# time to upgrade in place; uninstall with `agentrunner uninstall`.
 #
-# Set OPENCOMPANION_APP_SCOPED=1 (or pass -AppScoped) to install the binary only and SKIP setup - the
+# Set AGENTRUNNER_APP_SCOPED=1 (or pass -AppScoped) to install the binary only and SKIP setup - the
 # product app then drives pairing and starts the daemon itself, so no always-on task is installed.
 #
-# Nothing is baked in. No backend URL is embedded: set OPENCOMPANION_BACKEND_URL (or pass -Url when you
-# run a saved copy of this script) to pair with your SaaS at setup time. Point OPENCOMPANION_RELEASE_BASE
+# Nothing is baked in. No backend URL is embedded: set AGENTRUNNER_BACKEND_URL (or pass -Url when you
+# run a saved copy of this script) to pair with your SaaS at setup time. Point AGENTRUNNER_RELEASE_BASE
 # at a mirror to fetch the daemon elsewhere.
-param([string]$Url = $env:OPENCOMPANION_BACKEND_URL, [switch]$AppScoped)
+#
+# Set AGENTRUNNER_ENROLL (or pass -Enroll) to pair with a one-time enrollment code from your app
+# instead of the interactive device flow - the whole install then needs no further input.
+param([string]$Url = $env:AGENTRUNNER_BACKEND_URL, [string]$Enroll = $env:AGENTRUNNER_ENROLL, [switch]$AppScoped)
 $ErrorActionPreference = 'Stop'
-# App-scoped is driven by the -AppScoped switch or OPENCOMPANION_APP_SCOPED=1 (the `irm | iex` one-liner
+# App-scoped is driven by the -AppScoped switch or AGENTRUNNER_APP_SCOPED=1 (the `irm | iex` one-liner
 # cannot pass a switch, so the env var is its channel). The env var is compared to '1' explicitly: a
 # [bool] cast would make ANY non-empty value truthy, so '0' would wrongly mean app-scoped.
-$appScopedMode = $AppScoped.IsPresent -or ($env:OPENCOMPANION_APP_SCOPED -eq '1')
+$appScopedMode = $AppScoped.IsPresent -or ($env:AGENTRUNNER_APP_SCOPED -eq '1')
 
-$ReleaseBase = if ($env:OPENCOMPANION_RELEASE_BASE) { $env:OPENCOMPANION_RELEASE_BASE } else { 'https://github.com/AlexChelan/OpenCompanion/releases/latest/download' }
-$InstallDir  = if ($env:OPENCOMPANION_HOME)         { $env:OPENCOMPANION_HOME }         else { Join-Path $env:LOCALAPPDATA 'opencompanion' }
+$ReleaseBase = if ($env:AGENTRUNNER_RELEASE_BASE) { $env:AGENTRUNNER_RELEASE_BASE } else { 'https://github.com/AlexChelan/AgentRunner/releases/latest/download' }
+$InstallDir  = if ($env:AGENTRUNNER_HOME)         { $env:AGENTRUNNER_HOME }         else { Join-Path $env:LOCALAPPDATA 'agentrunner' }
 
 function Fail($msg) { Write-Host "error: $msg" -ForegroundColor Red; exit 1 }
 
 # PROCESSOR_ARCHITECTURE reports the shell's arch (x86 under a 32-bit PowerShell); on ARM64 Windows in that case the real OS arch is in PROCESSOR_ARCHITEW6432.
 $arch = if ($env:PROCESSOR_ARCHITECTURE -eq 'ARM64' -or $env:PROCESSOR_ARCHITEW6432 -eq 'ARM64') { 'arm64' } else { 'x64' }
-$artifact = "opencompanion-win32-$arch.tar.gz"
+$artifact = "agentrunner-win32-$arch.tar.gz"
 $base = $ReleaseBase.TrimEnd('/')
 
-Write-Host "Installing OpenCompanion (win32/$arch)" -ForegroundColor White
-$tmp = New-Item -ItemType Directory -Path (Join-Path $env:TEMP ("opencompanion-" + [guid]::NewGuid()))
+Write-Host "Installing AgentRunner (win32/$arch)" -ForegroundColor White
+$tmp = New-Item -ItemType Directory -Path (Join-Path $env:TEMP ("agentrunner-" + [guid]::NewGuid()))
 try {
   $tar = Join-Path $tmp $artifact
   $tarUrl = "$base/$artifact"
@@ -61,25 +64,25 @@ try {
   Write-Host "Checksum verified." -ForegroundColor Green
 
   # Extract into a staging dir so we can read the payload's own version before committing it to a
-  # versioned slot. The archive holds the per-version launcher at .\opencompanion.cmd.
+  # versioned slot. The archive holds the per-version launcher at .\agentrunner.cmd.
   $payload = New-Item -ItemType Directory -Path (Join-Path $tmp 'payload')
   tar -xzf $tar -C $payload   # bsdtar ships with Windows 10 and later
-  $payloadExe = Join-Path $payload 'opencompanion.cmd'
-  if (-not (Test-Path $payloadExe)) { Fail "The downloaded archive did not contain the opencompanion launcher." }
+  $payloadExe = Join-Path $payload 'agentrunner.cmd'
+  if (-not (Test-Path $payloadExe)) { Fail "The downloaded archive did not contain the agentrunner launcher." }
 
   # The version names the install slot and the `current` pointer. Parse it from the payload's own
-  # `--version` (format: `opencompanion <semver>`) - the second whitespace-separated token.
+  # `--version` (format: `agentrunner <semver>`) - the second whitespace-separated token.
   $version = (((& $payloadExe --version) | Out-String).Trim() -split '\s+')[1]
-  if (-not $version) { Fail "Could not determine the downloaded version (opencompanion --version returned nothing)." }
+  if (-not $version) { Fail "Could not determine the downloaded version (agentrunner --version returned nothing)." }
 
-  Write-Host "Installing OpenCompanion $version to $InstallDir"
+  Write-Host "Installing AgentRunner $version to $InstallDir"
 
-  # Legacy flat install (pre-versioned layout): the old installer dropped node.exe/daemon/opencompanion.cmd
+  # Legacy flat install (pre-versioned layout): the old installer dropped node.exe/daemon/agentrunner.cmd
   # straight into $InstallDir. Detect it by a missing versions\ dir plus a present node.exe, and remove
   # ONLY those known payload entries - never the whole dir, which may hold the user's config.
   if ((-not (Test-Path (Join-Path $InstallDir 'versions'))) -and (Test-Path (Join-Path $InstallDir 'node.exe'))) {
     Write-Host "Migrating a pre-versioned install to the versioned layout."
-    foreach ($entry in 'node.exe', 'daemon', 'opencompanion', 'opencompanion.cmd') {
+    foreach ($entry in 'node.exe', 'daemon', 'agentrunner', 'agentrunner.cmd') {
       Remove-Item -Recurse -Force (Join-Path $InstallDir $entry) -ErrorAction SilentlyContinue
     }
   }
@@ -94,13 +97,13 @@ try {
   # per-version launcher, exporting its own path so the boot task re-invokes it (not a versioned path)
   # and so a later update that flips `current` is picked up without re-registering the task. Written as
   # ASCII (no BOM) so `set /p` reads a clean value.
-  $exe = Join-Path $InstallDir 'opencompanion.cmd'
+  $exe = Join-Path $InstallDir 'agentrunner.cmd'
   $launcherBody = @'
 @echo off
 setlocal
 set /p CUR=<"%~dp0current"
-set "OPENCOMPANION_ROOT_LAUNCHER=%~dp0opencompanion.cmd"
-"%~dp0versions\%CUR%\opencompanion.cmd" %*
+set "AGENTRUNNER_ROOT_LAUNCHER=%~dp0agentrunner.cmd"
+"%~dp0versions\%CUR%\agentrunner.cmd" %*
 endlocal & exit /b %ERRORLEVEL%
 '@
   # cmd.exe batch parsing needs CRLF; this here-string is stored LF-only in the exported script, so
@@ -118,16 +121,21 @@ endlocal & exit /b %ERRORLEVEL%
   $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
   if ($userPath -notlike "*$InstallDir*") {
     [Environment]::SetEnvironmentVariable('Path', "$userPath;$InstallDir", 'User')
-    Write-Host "Added $InstallDir to your PATH (restart the terminal to use 'opencompanion' directly)."
+    Write-Host "Added $InstallDir to your PATH (restart the terminal to use 'agentrunner' directly)."
   }
 
   if ($appScopedMode) {
     # App-scoped: the product app supervises the daemon, so install the binary only and let the app drive
     # pairing + an app-scoped setup + a plain `serve`. Never install the always-on task from here.
-    Write-Host "Installed. The app will pair and start OpenCompanion for you." -ForegroundColor Green
+    Write-Host "Installed. The app will pair and start AgentRunner for you." -ForegroundColor Green
   } else {
     Write-Host "Installed. Running setup..." -ForegroundColor Green
-    if ($Url) { & $exe setup --url $Url } else { & $exe setup }
+    # Built as an argument array (splatted) so the optional backend URL and the optional one-time
+    # enrollment code compose, instead of needing a branch per combination.
+    $setupArgs = @('setup')
+    if ($Url) { $setupArgs += @('--url', $Url) }
+    if ($Enroll) { $setupArgs += @('--enroll', $Enroll) }
+    & $exe @setupArgs
   }
 } finally {
   Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue

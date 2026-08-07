@@ -1,34 +1,40 @@
 #!/usr/bin/env bash
-# OpenCompanion installer for macOS and Linux. One command, no npm:
+# AgentRunner installer for macOS and Linux. One command, no npm:
 #
-#   curl -fsSL https://github.com/AlexChelan/OpenCompanion/releases/latest/download/install.sh | sh -s -- --url https://your-saas.example/api
+#   curl -fsSL https://github.com/AlexChelan/AgentRunner/releases/latest/download/install.sh | sh -s -- --url https://your-saas.example/api
 #
-# It downloads the self-contained OpenCompanion daemon (a vendored Node runtime + the bundled daemon)
+# It downloads the self-contained AgentRunner daemon (a vendored Node runtime + the bundled daemon)
 # for your OS and architecture, verifies it against the release SHA256SUMS, installs it under
-# ~/.opencompanion, links the `opencompanion` launcher onto your PATH, then runs `opencompanion setup` (pair +
+# ~/.agentrunner, links the `agentrunner` launcher onto your PATH, then runs `agentrunner setup` (pair +
 # connect your CLIs + install the always-on service). Re-run any time to upgrade in place;
-# uninstall with `opencompanion uninstall`.
+# uninstall with `agentrunner uninstall`.
 #
-# Pass --app-scoped (or set OPENCOMPANION_APP_SCOPED=1) to install the binary only and SKIP setup - the
+# Pass --app-scoped (or set AGENTRUNNER_APP_SCOPED=1) to install the binary only and SKIP setup - the
 # product app then drives pairing and starts the daemon itself, so no always-on service is installed.
 #
 # Nothing is baked in. The daemon is fetched from the GitHub release by default; point
-# OPENCOMPANION_RELEASE_BASE at a mirror to fetch it elsewhere. No backend URL is embedded: pass
-# `--url <backend>` (or set OPENCOMPANION_BACKEND_URL) to pair with your SaaS at setup time.
+# AGENTRUNNER_RELEASE_BASE at a mirror to fetch it elsewhere. No backend URL is embedded: pass
+# `--url <backend>` (or set AGENTRUNNER_BACKEND_URL) to pair with your SaaS at setup time.
+#
+# Pass --enroll <code> (or set AGENTRUNNER_ENROLL) to pair with a one-time enrollment code from your
+# app instead of the interactive device flow - the whole install then needs no further input.
 set -eu
 
-RELEASE_BASE="${OPENCOMPANION_RELEASE_BASE:-https://github.com/AlexChelan/OpenCompanion/releases/latest/download}"
-INSTALL_DIR="${OPENCOMPANION_HOME:-$HOME/.opencompanion}"
-BIN_DIR="${OPENCOMPANION_BIN_DIR:-$HOME/.local/bin}"
-BACKEND_URL="${OPENCOMPANION_BACKEND_URL:-}"
-# App-scoped is driven by the --app-scoped flag below or OPENCOMPANION_APP_SCOPED=1. The env is compared to
+RELEASE_BASE="${AGENTRUNNER_RELEASE_BASE:-https://github.com/AlexChelan/AgentRunner/releases/latest/download}"
+INSTALL_DIR="${AGENTRUNNER_HOME:-$HOME/.agentrunner}"
+BIN_DIR="${AGENTRUNNER_BIN_DIR:-$HOME/.local/bin}"
+BACKEND_URL="${AGENTRUNNER_BACKEND_URL:-}"
+ENROLL="${AGENTRUNNER_ENROLL:-}"
+# App-scoped is driven by the --app-scoped flag below or AGENTRUNNER_APP_SCOPED=1. The env is compared to
 # `1` exactly (never `-n`, which any non-empty value satisfies, so `0` would wrongly mean app-scoped).
-APP_SCOPED="${OPENCOMPANION_APP_SCOPED:-}"
+APP_SCOPED="${AGENTRUNNER_APP_SCOPED:-}"
 
 while [ $# -gt 0 ]; do
   case "$1" in
     --url) BACKEND_URL="${2:-}"; shift 2 ;;
     --url=*) BACKEND_URL="${1#--url=}"; shift ;;
+    --enroll) ENROLL="${2:-}"; shift 2 ;;
+    --enroll=*) ENROLL="${1#--enroll=}"; shift ;;
     --app-scoped) APP_SCOPED=1; shift ;;
     *) shift ;;
   esac
@@ -54,12 +60,12 @@ case "${arch}" in
   arm64|aarch64) arch="arm64" ;;
   *) fail "Unsupported architecture: ${arch}." ;;
 esac
-artifact="opencompanion-${os}-${arch}.tar.gz"
+artifact="agentrunner-${os}-${arch}.tar.gz"
 
 download() {
   if command -v curl >/dev/null 2>&1; then curl -fsSL "$1" -o "$2"
   elif command -v wget >/dev/null 2>&1; then wget -qO "$2" "$1"
-  else fail "Need curl or wget to download OpenCompanion."; fi
+  else fail "Need curl or wget to download AgentRunner."; fi
 }
 
 sha256_of() {
@@ -68,7 +74,7 @@ sha256_of() {
   else fail "Need sha256sum or shasum to verify the download."; fi
 }
 
-printf "${BOLD}Installing OpenCompanion${NC} (${os}/${arch})\n"
+printf "${BOLD}Installing AgentRunner${NC} (${os}/${arch})\n"
 tmp="$(mktemp -d)"; trap 'rm -rf "${tmp}"' EXIT
 base="${RELEASE_BASE%/}"
 
@@ -85,26 +91,26 @@ actual="$(sha256_of "${tmp}/${artifact}")"
 ok "Checksum verified."
 
 # Extract into a staging dir so we can read the payload's own version before committing it to a
-# versioned slot. The archive holds the per-version launcher at ./opencompanion.
+# versioned slot. The archive holds the per-version launcher at ./agentrunner.
 payload="${tmp}/payload"
 mkdir -p "${payload}"
 tar -xzf "${tmp}/${artifact}" -C "${payload}"
-[ -f "${payload}/opencompanion" ] || fail "The downloaded archive did not contain the opencompanion launcher."
-chmod +x "${payload}/opencompanion"
+[ -f "${payload}/agentrunner" ] || fail "The downloaded archive did not contain the agentrunner launcher."
+chmod +x "${payload}/agentrunner"
 
 # The version names the install slot and the `current` pointer. Parse it from the payload's own
-# `--version` (format: `opencompanion <semver>`) - the second whitespace-separated token.
-version="$("${payload}/opencompanion" --version | awk '{ print $2; exit }')"
-[ -n "${version}" ] || fail "Could not determine the downloaded version (opencompanion --version returned nothing)."
+# `--version` (format: `agentrunner <semver>`) - the second whitespace-separated token.
+version="$("${payload}/agentrunner" --version | awk '{ print $2; exit }')"
+[ -n "${version}" ] || fail "Could not determine the downloaded version (agentrunner --version returned nothing)."
 
-info "Installing OpenCompanion ${version} to ${INSTALL_DIR}"
+info "Installing AgentRunner ${version} to ${INSTALL_DIR}"
 
-# Legacy flat install (pre-versioned layout): the old installer dropped node/daemon/opencompanion
+# Legacy flat install (pre-versioned layout): the old installer dropped node/daemon/agentrunner
 # straight into ${INSTALL_DIR}. Detect it by a missing versions/ dir plus a present node entry, and
 # remove ONLY those known payload entries - never the whole dir, which may hold the user's config.
 if [ ! -d "${INSTALL_DIR}/versions" ] && [ -e "${INSTALL_DIR}/node" ]; then
   info "Migrating a pre-versioned install to the versioned layout."
-  rm -rf "${INSTALL_DIR}/node" "${INSTALL_DIR}/daemon" "${INSTALL_DIR}/opencompanion" "${INSTALL_DIR}/opencompanion.cmd"
+  rm -rf "${INSTALL_DIR}/node" "${INSTALL_DIR}/daemon" "${INSTALL_DIR}/agentrunner" "${INSTALL_DIR}/agentrunner.cmd"
 fi
 
 # Commit the payload into versions/<version> (replacing that slot when reinstalling the same version).
@@ -116,9 +122,9 @@ mv "${payload}" "${dest}"
 # The stable root launcher resolves the active version from `current` and execs that version's
 # per-version launcher, exporting its own path so the boot service re-invokes it (not a versioned
 # path) and so a later update that flips `current` is picked up without touching the OS unit.
-cat > "${INSTALL_DIR}/opencompanion" <<'LAUNCHER'
+cat > "${INSTALL_DIR}/agentrunner" <<'LAUNCHER'
 #!/bin/sh
-# OpenCompanion stable launcher: resolves the active version from `current` and execs it.
+# AgentRunner stable launcher: resolves the active version from `current` and execs it.
 # Follow `$0` through symlinks first (the PATH entry is a symlink into the install dir), so `dir` is
 # the real install dir and not wherever the symlink lives. POSIX readlink loop - no `readlink -f`,
 # which macOS lacks.
@@ -132,29 +138,31 @@ while [ -L "${self}" ]; do
 done
 dir="$(CDPATH= cd -- "$(dirname -- "${self}")" && pwd)"
 current="$(cat "${dir}/current" 2>/dev/null || true)"
-[ -n "${current}" ] || { echo "opencompanion: no installed version (missing ${dir}/current)" >&2; exit 1; }
-OPENCOMPANION_ROOT_LAUNCHER="${dir}/opencompanion" exec "${dir}/versions/${current}/opencompanion" "$@"
+[ -n "${current}" ] || { echo "agentrunner: no installed version (missing ${dir}/current)" >&2; exit 1; }
+AGENTRUNNER_ROOT_LAUNCHER="${dir}/agentrunner" exec "${dir}/versions/${current}/agentrunner" "$@"
 LAUNCHER
-chmod +x "${INSTALL_DIR}/opencompanion"
+chmod +x "${INSTALL_DIR}/agentrunner"
 
 # Flip the pointer atomically (write a temp, then rename) so a reader never sees a half-written version.
 printf '%s\n' "${version}" > "${INSTALL_DIR}/current.tmp"
 mv "${INSTALL_DIR}/current.tmp" "${INSTALL_DIR}/current"
 
 mkdir -p "${BIN_DIR}"
-ln -sf "${INSTALL_DIR}/opencompanion" "${BIN_DIR}/opencompanion"
+ln -sf "${INSTALL_DIR}/agentrunner" "${BIN_DIR}/agentrunner"
 case ":${PATH}:" in
   *":${BIN_DIR}:"*) ;;
-  *) info "Add ${BIN_DIR} to your PATH to run 'opencompanion' directly." ;;
+  *) info "Add ${BIN_DIR} to your PATH to run 'agentrunner' directly." ;;
 esac
 
 if [ "${APP_SCOPED}" = "1" ]; then
   # App-scoped: the product app supervises the daemon, so install the binary only and let the app drive
   # pairing + an app-scoped setup + a plain `serve`. Never install the always-on service from here.
-  ok "Installed. The app will pair and start OpenCompanion for you."
+  ok "Installed. The app will pair and start AgentRunner for you."
 else
   ok "Installed. Running setup..."
   if [ -n "${BACKEND_URL}" ]; then set -- setup --url "${BACKEND_URL}"; else set -- setup; fi
+  # A one-time enrollment code pairs without a prompt; without one, setup keeps its interactive flow.
+  if [ -n "${ENROLL}" ]; then set -- "$@" --enroll "${ENROLL}"; fi
   # Piped installs (curl | sh) leave stdin on the exhausted script pipe; re-attach the real terminal
   # so setup's prompts and the CLIs' interactive logins still work. Headless (no controlling tty),
   # setup degrades gracefully: it pairs, reports the detected CLIs, and installs the service without
@@ -162,8 +170,8 @@ else
   # and pass the permission tests yet fail to open with ENXIO. The `if` keeps `set -e` from aborting
   # on that expected headless failure; only a working /dev/tty takes the redirected path.
   if { : < /dev/tty; } 2>/dev/null; then
-    "${INSTALL_DIR}/opencompanion" "$@" < /dev/tty
+    "${INSTALL_DIR}/agentrunner" "$@" < /dev/tty
   else
-    "${INSTALL_DIR}/opencompanion" "$@"
+    "${INSTALL_DIR}/agentrunner" "$@"
   fi
 fi

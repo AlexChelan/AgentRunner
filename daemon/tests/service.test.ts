@@ -1,7 +1,7 @@
 import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
-import { argv as processArgv, execPath } from 'node:process'
+import { execPath, argv as processArgv } from 'node:process'
 import { describe, expect, it } from 'vitest'
 import { BRAND, envVar } from '../src/brand'
 import { buildServiceSpec } from '../src/commands/service'
@@ -12,12 +12,13 @@ import {
   isServiceUnitPresent,
   restartService,
   SERVICE_LABEL,
+  
   serviceStatus,
   uninstallService,
   unitPath,
-  windowsTaskName,
-  type ServiceSpec
+  windowsTaskName
 } from '../src/service'
+import type {ServiceSpec} from '../src/service';
 
 /** The per-user task name every Windows case below asserts against ({@link fakeDeps} pins the username). */
 const WIN_TASK = windowsTaskName('u')
@@ -28,7 +29,7 @@ const WIN_TASK = windowsTaskName('u')
  * nowhere, which is why presence is read from the exit status instead.
  */
 const SCHTASKS_QUERY_OUTPUT = [
-  'Folder: \\OpenCompanion',
+  'Folder: \\AgentRunner',
   'TaskName                                 Next Run Time          Status',
   '======================================== ====================== ===============',
   'u                                        N/A                    Ready',
@@ -130,7 +131,7 @@ describe('service unit builders - a multi-element program on both OSes', () => {
     expect(plist).toContain('<string>serve</string>')
   })
 
-  it('Linux: the systemd unit ExecStart carries the whole argv', () => {
+  it('linux: the systemd unit ExecStart carries the whole argv', () => {
     const unit = buildSystemdUnit(nodeSpec)
     expect(unit).toContain('ExecStart=/opt/node /app/cli.js serve')
   })
@@ -186,7 +187,7 @@ describe('installService', () => {
     ])
   })
 
-  it('Linux: writes the systemd unit then daemon-reload + enable --now', () => {
+  it('linux: writes the systemd unit then daemon-reload + enable --now', () => {
     const f = fakeDeps('linux')
     installService(spec, f.deps)
     expect(f.writes[0]?.content).toContain('Restart=always')
@@ -196,14 +197,30 @@ describe('installService', () => {
     ])
   })
 
-  it('Windows: registers a logon Scheduled Task and starts it immediately', () => {
+  // A container's restart policy IS the service. Writing a systemd unit inside the image would register
+  // a second supervisor for a daemon the container already restarts, so the install refuses instead - and
+  // says which one is in charge, since the user asked for an always-on daemon and already has one.
+  it('refuses in container mode and names the restart policy as the service', () => {
+    process.env[envVar('CONTAINED')] = '1'
+    const f = fakeDeps('linux')
+    try {
+      expect(() => installService(spec, f.deps)).toThrow(/container/i)
+      // Refused BEFORE any side effect: no unit written, no systemctl run.
+      expect(f.writes).toEqual([])
+      expect(f.runs).toEqual([])
+    } finally {
+      delete process.env[envVar('CONTAINED')]
+    }
+  })
+
+  it('windows: registers a logon Scheduled Task and starts it immediately', () => {
     const f = fakeDeps('win32')
     const { message } = installService(spec, f.deps)
     expect(message).toContain('Scheduled Task')
     expect(f.runs[0]?.cmd).toBe('schtasks')
     expect(f.runs[0]?.args).toContain('/Create')
     expect(f.runs[0]?.args).toContain(WIN_TASK)
-    // Without an immediate /Run the companion would stay offline until the next logon.
+    // Without an immediate /Run the runner would stay offline until the next logon.
     expect(f.runs[1]?.cmd).toBe('schtasks')
     expect(f.runs[1]?.args).toContain('/Run')
     expect(f.runs[1]?.args).toContain(WIN_TASK)
@@ -240,7 +257,7 @@ describe('uninstallService', () => {
     expect(f.removes).toEqual([unitPath('darwin', '/home/u')])
   })
 
-  it('Windows: deletes the per-user task AND the legacy bare one an upgraded install left behind', () => {
+  it('windows: deletes the per-user task AND the legacy bare one an upgraded install left behind', () => {
     // An install predating the per-user folder registered a bare machine-global task. Deleting only
     // the qualified name would strand it, leaving the user with two logon tasks and no way to remove one.
     const f = fakeDeps('win32')
@@ -253,7 +270,7 @@ describe('uninstallService', () => {
 })
 
 describe('serviceStatus', () => {
-  it('Linux: reports the systemctl is-active state', () => {
+  it('linux: reports the systemctl is-active state', () => {
     const f = fakeDeps('linux')
     f.deps.run = () => 'active'
     expect(serviceStatus(f.deps).message).toBe('systemd: active')
@@ -262,7 +279,7 @@ describe('serviceStatus', () => {
 
 describe('isServiceUnitPresent (cheap probe, no launchctl/systemctl spawn)', () => {
   it('macOS: reads the plist file existence and never shells out', () => {
-    const home = mkdtempSync(join(tmpdir(), 'companion-svc-present-mac-'))
+    const home = mkdtempSync(join(tmpdir(), 'runner-svc-present-mac-'))
     const runs: string[] = []
     const run = (cmd: string): string => {
       runs.push(cmd)
@@ -277,8 +294,8 @@ describe('isServiceUnitPresent (cheap probe, no launchctl/systemctl spawn)', () 
     expect(runs).toEqual([])
   })
 
-  it('Linux: reads the systemd unit existence and never shells out', () => {
-    const home = mkdtempSync(join(tmpdir(), 'companion-svc-present-linux-'))
+  it('linux: reads the systemd unit existence and never shells out', () => {
+    const home = mkdtempSync(join(tmpdir(), 'runner-svc-present-linux-'))
     const runs: string[] = []
     const run = (cmd: string): string => {
       runs.push(cmd)
@@ -292,7 +309,7 @@ describe('isServiceUnitPresent (cheap probe, no launchctl/systemctl spawn)', () 
     expect(runs).toEqual([])
   })
 
-  it('Windows: queries the Scheduled Task (which registers no unit file)', () => {
+  it('windows: queries the Scheduled Task (which registers no unit file)', () => {
     const deps = { platform: 'win32', home: '/home/u', username: 'u' } as const
     // The query is BY NAME, so presence is its EXIT STATUS: a missing task exits non-zero, which the
     // tolerant `run` reports as empty output.
@@ -307,7 +324,7 @@ describe('isServiceUnitPresent (cheap probe, no launchctl/systemctl spawn)', () 
     expect(isServiceUnitPresent({ ...deps, run: () => SCHTASKS_QUERY_OUTPUT })).toBe(true)
   })
 
-  it('Windows: reports the same verdict through serviceStatus, with a matching message', () => {
+  it('windows: reports the same verdict through serviceStatus, with a matching message', () => {
     const deps = { platform: 'win32', home: '/home/u', username: 'u' } as const
     // A "not installed" verdict paired with a "task present" message was the tell that the two halves
     // of this answer were derived from different things.
@@ -332,13 +349,13 @@ describe('restartService', () => {
     expect(message.length).toBeGreaterThan(0)
   })
 
-  it('Linux: restarts the systemd user unit', () => {
+  it('linux: restarts the systemd user unit', () => {
     const f = fakeDeps('linux')
     restartService(f.deps)
     expect(f.runs).toEqual([{ cmd: 'systemctl', args: ['--user', 'restart', `${BRAND.binary}.service`] }])
   })
 
-  it('Windows: ends then re-runs the logon Scheduled Task', () => {
+  it('windows: ends then re-runs the logon Scheduled Task', () => {
     const f = fakeDeps('win32')
     restartService(f.deps)
     expect(f.runs[0]?.cmd).toBe('schtasks')

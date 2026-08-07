@@ -1,0 +1,12 @@
+{
+  "type": "tool.result",
+  "runId": "3d9a7c1e-2b4f-4a6d-9c8e-1f2a3b4c5d6e",
+  "callId": "call_7Yt2QxR9",
+  "ok": true,
+  "result": {
+    "rows": [
+      { "id": "kb-101", "title": "Pricing tiers", "score": 0.94 }
+    ]
+  },
+  "error": "knowledge index temporarily unavailable"
+}

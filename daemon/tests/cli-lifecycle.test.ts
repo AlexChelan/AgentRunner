@@ -1,14 +1,14 @@
 import { describe, expect, it } from 'vitest'
 import {
-  run,
-  out,
   APP_DATA,
-  tempAppData,
   createStateStore,
+  installService,
+  out,
+  run,
+  runConnect,
   runPair,
   runUnpair,
-  runConnect,
-  installService,
+  tempAppData,
   uninstallService
 } from './cli-harness'
 

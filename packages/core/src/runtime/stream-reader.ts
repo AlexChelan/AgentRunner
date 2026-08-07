@@ -10,12 +10,12 @@
 
 /** One decoded SSE frame. A comment frame (`: keepalive`) carries neither name nor data. */
 export interface StreamFrame {
-  /** The event name, when the frame named one. */
-  event?: string
-  /** The frame's `data:` payload, joined by newline when the frame carried several lines. */
-  data?: string
-  /** The comment text, for a `:`-prefixed frame. */
-  comment?: string
+	/** The event name, when the frame named one. */
+	event?: string;
+	/** The frame's `data:` payload, joined by newline when the frame carried several lines. */
+	data?: string;
+	/** The comment text, for a `:`-prefixed frame. */
+	comment?: string;
 }
 
 /**
@@ -27,7 +27,7 @@ export interface StreamFrame {
  * 32 MiB is comfortably clear of that while still bounding the growth, so the cap can only ever be hit
  * by a body that is not a frame at all.
  */
-export const MAX_BUFFERED_FRAME_CHARS = 32 * 1024 * 1024
+export const MAX_BUFFERED_FRAME_CHARS = 32 * 1024 * 1024;
 
 /**
  * Incrementally decodes SSE frames out of a byte/text stream.
@@ -42,46 +42,52 @@ export const MAX_BUFFERED_FRAME_CHARS = 32 * 1024 * 1024
  * would otherwise grow it for the life of the socket until the process is killed for memory.
  */
 export class SseFrameDecoder {
-  /** The bytes received since the last complete frame. */
-  private buffer = ''
+	/** The bytes received since the last complete frame. */
+	private buffer = "";
 
-  /**
-   * Feeds one chunk in and returns every frame it completed.
-   *
-   * A frame ends at a BLANK LINE, so the buffer is split on that and the trailing partial is kept.
-   * BOTH framings are read, because the grammar allows either and the daemon reads this from a backend
-   * it does not control: a proxy or a runtime that writes CRLF ends its frames with `\r\n\r\n`, which
-   * contains no `\n\n` at all. Looking only for the latter completed no frame on such a body EVER - the
-   * device read as perfectly connected while every run, cancel and instruction pushed to it was
-   * swallowed, until the tail hit the cap below and the loop threw, whereupon it reconnected into the
-   * same state.
-   *
-   * A tail past {@link MAX_BUFFERED_FRAME_CHARS} THROWS rather than being truncated. Truncating would
-   * hand the caller a frame whose payload is not what was sent - a run.start missing its closing brace
-   * parses as malformed and is skipped, which looks exactly like a backend that never sent it - so the
-   * failure is made loud: the read loop ends, the buffer is released, and the reconnect backoff brings
-   * the device back on a fresh socket.
-   *
-   * @param chunk - The text just read from the stream.
-   * @returns The frames completed by this chunk, in order (empty while a frame is still arriving).
-   * @throws When a single frame exceeds {@link MAX_BUFFERED_FRAME_CHARS} without terminating.
-   */
-  push(chunk: string): StreamFrame[] {
-    this.buffer += chunk
-    const frames: StreamFrame[] = []
-    for (let boundary = frameBoundary(this.buffer); boundary; boundary = frameBoundary(this.buffer)) {
-      const block = this.buffer.slice(0, boundary.index)
-      this.buffer = this.buffer.slice(boundary.index + boundary.length)
-      const frame = decodeFrame(block)
-      if (frame) frames.push(frame)
-    }
-    if (this.buffer.length > MAX_BUFFERED_FRAME_CHARS) {
-      const overflow = this.buffer.length
-      this.buffer = ''
-      throw new Error(`unterminated SSE frame exceeded ${MAX_BUFFERED_FRAME_CHARS} characters (${overflow})`)
-    }
-    return frames
-  }
+	/**
+	 * Feeds one chunk in and returns every frame it completed.
+	 *
+	 * A frame ends at a BLANK LINE, so the buffer is split on that and the trailing partial is kept.
+	 * BOTH framings are read, because the grammar allows either and the daemon reads this from a backend
+	 * it does not control: a proxy or a runtime that writes CRLF ends its frames with `\r\n\r\n`, which
+	 * contains no `\n\n` at all. Looking only for the latter completed no frame on such a body EVER - the
+	 * device read as perfectly connected while every run, cancel and instruction pushed to it was
+	 * swallowed, until the tail hit the cap below and the loop threw, whereupon it reconnected into the
+	 * same state.
+	 *
+	 * A tail past {@link MAX_BUFFERED_FRAME_CHARS} THROWS rather than being truncated. Truncating would
+	 * hand the caller a frame whose payload is not what was sent - a run.start missing its closing brace
+	 * parses as malformed and is skipped, which looks exactly like a backend that never sent it - so the
+	 * failure is made loud: the read loop ends, the buffer is released, and the reconnect backoff brings
+	 * the device back on a fresh socket.
+	 *
+	 * @param chunk - The text just read from the stream.
+	 * @returns The frames completed by this chunk, in order (empty while a frame is still arriving).
+	 * @throws When a single frame exceeds {@link MAX_BUFFERED_FRAME_CHARS} without terminating.
+	 */
+	push(chunk: string): StreamFrame[] {
+		this.buffer += chunk;
+		const frames: StreamFrame[] = [];
+		for (
+			let boundary = frameBoundary(this.buffer);
+			boundary;
+			boundary = frameBoundary(this.buffer)
+		) {
+			const block = this.buffer.slice(0, boundary.index);
+			this.buffer = this.buffer.slice(boundary.index + boundary.length);
+			const frame = decodeFrame(block);
+			if (frame) frames.push(frame);
+		}
+		if (this.buffer.length > MAX_BUFFERED_FRAME_CHARS) {
+			const overflow = this.buffer.length;
+			this.buffer = "";
+			throw new Error(
+				`unterminated SSE frame exceeded ${MAX_BUFFERED_FRAME_CHARS} characters (${overflow})`
+			);
+		}
+		return frames;
+	}
 }
 
 /**
@@ -97,11 +103,11 @@ export class SseFrameDecoder {
  * @returns Where the terminator starts and how many characters it occupies, or `null` if none is in yet.
  */
 function frameBoundary(buffer: string): { index: number; length: number } | null {
-  const lf = buffer.indexOf('\n\n')
-  const crlf = buffer.indexOf('\r\n\r\n')
-  if (crlf !== -1 && (lf === -1 || crlf < lf)) return { index: crlf, length: 4 }
-  if (lf !== -1) return { index: lf, length: 2 }
-  return null
+	const lf = buffer.indexOf("\n\n");
+	const crlf = buffer.indexOf("\r\n\r\n");
+	if (crlf !== -1 && (lf === -1 || crlf < lf)) return { index: crlf, length: 4 };
+	if (lf !== -1) return { index: lf, length: 2 };
+	return null;
 }
 
 /**
@@ -121,39 +127,39 @@ function frameBoundary(buffer: string): { index: number; length: number } | null
  * @returns The decoded frame, or `null` when the block carried nothing usable.
  */
 function decodeFrame(block: string): StreamFrame | null {
-  const frame: StreamFrame = {}
-  const dataLines: string[] = []
-  let sawField = false
-  for (const rawLine of block.split('\n')) {
-    const line = rawLine.endsWith('\r') ? rawLine.slice(0, -1) : rawLine
-    if (line.length === 0) continue
-    if (line.startsWith(':')) {
-      frame.comment = line.slice(1).trimStart()
-      sawField = true
-      continue
-    }
-    const colon = line.indexOf(':')
-    if (colon === -1) continue
-    const field = line.slice(0, colon)
-    const value = line.slice(colon + 1).replace(/^ /, '')
-    if (field === 'event') {
-      frame.event = value
-      sawField = true
-    } else if (field === 'data') {
-      dataLines.push(value)
-      sawField = true
-    } else if (field === 'id' || field === 'retry') {
-      sawField = true
-    }
-  }
-  if (dataLines.length > 0) frame.data = dataLines.join('\n')
-  return sawField ? frame : null
+	const frame: StreamFrame = {};
+	const dataLines: string[] = [];
+	let sawField = false;
+	for (const rawLine of block.split("\n")) {
+		const line = rawLine.endsWith("\r") ? rawLine.slice(0, -1) : rawLine;
+		if (line.length === 0) continue;
+		if (line.startsWith(":")) {
+			frame.comment = line.slice(1).trimStart();
+			sawField = true;
+			continue;
+		}
+		const colon = line.indexOf(":");
+		if (colon === -1) continue;
+		const field = line.slice(0, colon);
+		const value = line.slice(colon + 1).replace(/^ /, "");
+		if (field === "event") {
+			frame.event = value;
+			sawField = true;
+		} else if (field === "data") {
+			dataLines.push(value);
+			sawField = true;
+		} else if (field === "id" || field === "retry") {
+			sawField = true;
+		}
+	}
+	if (dataLines.length > 0) frame.data = dataLines.join("\n");
+	return sawField ? frame : null;
 }
 
 /** The reconnect delay floor, so a backend that refuses instantly is not hammered. */
-const RECONNECT_BASE_MS = 1_000
+const RECONNECT_BASE_MS = 1_000;
 /** The reconnect delay ceiling, so a long outage still leaves a device reconnecting every half minute. */
-const RECONNECT_MAX_MS = 30_000
+const RECONNECT_MAX_MS = 30_000;
 
 /**
  * The delay before reconnect attempt `attempt` (1-based), exponential and JITTERED.
@@ -181,6 +187,6 @@ const RECONNECT_MAX_MS = 30_000
  * @returns The delay in milliseconds.
  */
 export function reconnectDelayMs(attempt: number, random: () => number = Math.random): number {
-  const window = Math.min(RECONNECT_MAX_MS, RECONNECT_BASE_MS * 2 ** Math.max(1, attempt))
-  return Math.round(RECONNECT_BASE_MS + random() * Math.max(0, window - RECONNECT_BASE_MS))
+	const window = Math.min(RECONNECT_MAX_MS, RECONNECT_BASE_MS * 2 ** Math.max(1, attempt));
+	return Math.round(RECONNECT_BASE_MS + random() * Math.max(0, window - RECONNECT_BASE_MS));
 }

@@ -3,14 +3,12 @@ import { mkdirSync, mkdtempSync, realpathSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
-  run,
-  out,
-  tempAppData,
-  pairWithBearer,
-  projectDir,
-  createStateStore,
   BRAND,
-  childSpawn
+  childSpawn,
+  out,
+  pairWithBearer,
+  run,
+  tempAppData
 } from './cli-harness'
 
 describe('cli routing - terminal', () => {
@@ -28,7 +26,9 @@ describe('cli routing - terminal', () => {
   it('"terminal --cli" rejects a CLI that cannot be driven interactively', async () => {
     const solo = tempAppData('terminal-cli')
     const state = await pairWithBearer(solo, 'https://termx.example')
-    // OpenCode is connectable but was never spike-verified in INTERACTIVE mode, so it is not a terminal CLI.
+    // Any id outside the terminal set is refused; `opencode` is one (it left the connectable set on
+    // 2026-08-02 and was never spike-verified in INTERACTIVE mode either). The assertion is on the
+    // REFUSAL and the names it offers instead, not on this id in particular.
     state.upsertConnection('https://termx.example', {
       toolId: 'opencode',
       source: 'reused',
@@ -50,7 +50,7 @@ describe('cli routing - terminal', () => {
 
     vi.stubGlobal('fetch', async (target: string) => {
       const body = target.endsWith('/connect')
-        ? { companionId: 'u1:d1', wireToken: 'poll-token' }
+        ? { runnerId: 'u1:d1', wireToken: 'poll-token' }
         : {
             sessionId: 'sess-1',
             instructions: 'wired',
@@ -70,7 +70,7 @@ describe('cli routing - terminal', () => {
     const config = JSON.parse(args[args.indexOf('--mcp-config') + 1] ?? '{}') as {
       mcpServers: Record<string, unknown>
     }
-    expect(config.mcpServers['linear']).toEqual({ type: 'stdio', command: 'npx', args: ['-y', 'linear-mcp'] })
+    expect(config.mcpServers.linear).toEqual({ type: 'stdio', command: 'npx', args: ['-y', 'linear-mcp'] })
     expect(config.mcpServers[`${BRAND.binary}-tools`]).toBeDefined()
   })
 
@@ -99,7 +99,7 @@ describe('cli routing - terminal', () => {
 
     vi.stubGlobal('fetch', async (target: string) => {
       const body = target.endsWith('/connect')
-        ? { companionId: 'u1:d1', wireToken: 'poll-token' }
+        ? { runnerId: 'u1:d1', wireToken: 'poll-token' }
         : {
             sessionId: 'sess-1',
             instructions: 'wired',
@@ -115,13 +115,69 @@ describe('cli routing - terminal', () => {
 
     const [, args, opts] = childSpawn.mock.calls[0] ?? []
     const env = (opts as { env?: Record<string, string> } | undefined)?.env ?? {}
-    expect(env['LINEAR_API_KEY']).toBe('lin_secret_abc')
+    expect(env.LINEAR_API_KEY).toBe('lin_secret_abc')
     expect(JSON.stringify(args)).not.toContain('lin_secret_abc')
     // And the wire token - a 12-hour credential for the user's ACCOUNT - is in neither.
     expect(JSON.stringify(args)).not.toContain('wire-token-secret')
     expect(Object.values(env)).not.toContain('wire-token-secret')
   })
 
+
+  // `terminal` POSTs its own connections snapshot to `/connect`, which UPSERTS the durable device
+  // record - so an unfiltered one re-advertises codex on a host where every dispatched codex run is
+  // refused, reopening the offer the daemon's poll/connect path withholds.
+
+  /** The `toolId`s a `terminal` session reported to `/connect`, run with `process.platform` spoofed. */
+  async function reportedConnections(platform: NodeJS.Platform, url: string): Promise<string[]> {
+    const posted: string[] = []
+    vi.stubGlobal('fetch', async (target: string, init?: { body?: string }) => {
+      if (target.endsWith('/connect')) {
+        const body = JSON.parse(init?.body ?? '{}') as { connections?: { toolId: string }[] }
+        for (const connection of body.connections ?? []) posted.push(connection.toolId)
+        return new Response(JSON.stringify({ runnerId: 'u1:d1', wireToken: 'poll-token' }), {
+          status: 200,
+          headers: { 'content-type': 'application/json' }
+        })
+      }
+      return new Response(
+        JSON.stringify({
+          sessionId: 'sess-1',
+          instructions: 'wired',
+          webToolManifest: [],
+          wireToken: 'wire-token'
+        }),
+        { status: 200, headers: { 'content-type': 'application/json' } }
+      )
+    })
+    const real = Object.getOwnPropertyDescriptor(process, 'platform')
+    Object.defineProperty(process, 'platform', { value: platform, configurable: true })
+    try {
+      await run(['terminal', 'acme', '--url', url, '--cli', 'claude-code'])
+    } finally {
+      if (real) Object.defineProperty(process, 'platform', real)
+    }
+    return posted
+  }
+
+  /** Pairs a backend with both CLIs connected, so the filter has something to remove. */
+  async function pairWithBothClis(label: string, url: string): Promise<void> {
+    const solo = tempAppData(label)
+    const state = await pairWithBearer(solo, url)
+    state.upsertConnection(url, { toolId: 'claude-code', source: 'reused', authHealth: 'healthy' })
+    state.upsertConnection(url, { toolId: 'codex', source: 'reused', authHealth: 'healthy' })
+  }
+
+  it('"terminal" does not re-advertise codex from a host whose sandbox is not OS-enforced', async () => {
+    const url = 'https://termunconfined.example'
+    await pairWithBothClis('termunconfined', url)
+    expect(await reportedConnections('win32', url)).toEqual(['claude-code'])
+  })
+
+  it('"terminal" reports codex where its sandbox IS OS-enforced', async () => {
+    const url = 'https://termconfined.example'
+    await pairWithBothClis('termconfined', url)
+    expect(await reportedConnections('darwin', url)).toEqual(['claude-code', 'codex'])
+  })
 
   // A `--cwd` IS THE USER'S OWN CONSENT. The daemon's terminal defaults to the product's work folder,
   // which would delete the one thing people actually open a terminal for: their own project. `--cwd`
@@ -130,7 +186,7 @@ describe('cli routing - terminal', () => {
 
   /** A real project folder on disk (canonical, so expectations match what the daemon resolves). */
   function projectDir(name: string): string {
-    return realpathSync(mkdtempSync(join(tmpdir(), `companion-project-${name}-`)))
+    return realpathSync(mkdtempSync(join(tmpdir(), `runner-project-${name}-`)))
   }
 
   it('"terminal --cwd" runs in the user\'s own project and records the cwd in the audit entry', async () => {
@@ -143,7 +199,7 @@ describe('cli routing - terminal', () => {
 
     vi.stubGlobal('fetch', async (target: string) => {
       const body = target.endsWith('/connect')
-        ? { companionId: 'u1:d1', wireToken: 'poll-token' }
+        ? { runnerId: 'u1:d1', wireToken: 'poll-token' }
         : { sessionId: 'sess-1', instructions: 'wired', webToolManifest: [], wireToken: 'wire-token' }
       return new Response(JSON.stringify(body), {
         status: 200,
@@ -160,8 +216,8 @@ describe('cli routing - terminal', () => {
     expect(out.exitCode).not.toBe(1)
 
     // The trust log must still say WHERE the session ran.
-    const { createAuditLog } = await import('@opencompanion/core/runtime/audit-log')
-    const { auditDir } = await import('@opencompanion/core/runtime/paths')
+    const { createAuditLog } = await import('@agentrunner/core/runtime/audit-log')
+    const { auditDir } = await import('@agentrunner/core/runtime/paths')
     const entry = createAuditLog({ dir: auditDir(solo) })
       .read({ backendUrl: url })
       .find((e) => e.event === 'terminal')

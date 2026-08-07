@@ -1,4 +1,4 @@
-import type { RunStart } from '@opencompanion/protocol'
+import type { RunStart } from "@agentrunner/protocol";
 
 /**
  * The run kind the daemon DERIVES from a dispatched {@link RunStart}, so a device can locally refuse a
@@ -7,12 +7,14 @@ import type { RunStart } from '@opencompanion/protocol'
  * OPTIONAL freeform `origin` tag (stamped only by a product-code dispatch). A run carrying neither is
  * a chat turn.
  *
- * HONEST LIMIT: a backend that omits `origin` on a product dispatch is wire-indistinguishable from
- * chat, so the daemon-side `dispatch` deny defends against HONEST backends only; the real dispatch
- * gate remains the backend-side per-device grant (default deny); a trusted wire-level surface field is
- * future post-freeze work.
+ * HONEST LIMIT, AND IT IS THE WHOLE STORY NOW: a backend that omits `origin` on a product dispatch is
+ * wire-indistinguishable from chat, so the daemon-side `dispatch` deny only refuses a backend that
+ * VOLUNTARILY stamped the tag. There is no backend-side per-device dispatch grant behind it - pairing
+ * is the authorization on that end, so this deny (plus unpairing) is the only refusal lever a device
+ * owner has left. A trusted wire-level surface field is future post-freeze work. The `schedule` deny
+ * has no such hole: `scheduleId` is stamped by the scheduled-dispatch path itself.
  */
-export type RunKind = 'schedule' | 'dispatch' | 'chat'
+export type RunKind = "schedule" | "dispatch" | "chat";
 
 /**
  * A device's per-backend origin policy: which DERIVED run kinds this machine refuses locally. Deny-only
@@ -21,18 +23,19 @@ export type RunKind = 'schedule' | 'dispatch' | 'chat'
  * both (see {@link DEFAULT_ORIGIN_POLICY}).
  */
 export interface OriginPolicy {
-  /** Refuse SCHEDULED runs (derived: a run carrying `scheduleId`) from this backend. Default false. */
-  denySchedule: boolean
-  /** Refuse APP-DISPATCHED runs (derived: a run carrying `origin` but no `scheduleId`) from this backend. Default false. */
-  denyDispatch: boolean
+	/** Refuse SCHEDULED runs (derived: a run carrying `scheduleId`) from this backend. Default false. */
+	denySchedule: boolean;
+	/** Refuse APP-DISPATCHED runs (derived: a run carrying `origin` but no `scheduleId`) from this backend. Default false. */
+	denyDispatch: boolean;
 }
 
 /**
  * The default origin policy: allow every kind. A device does not refuse app-dispatched or scheduled
- * work unless the operator opts in; the consent default-deny lives in the shipped backend-side
- * per-device grant, not here.
+ * work unless its owner opts in, because pairing already said yes to exactly that - it is the
+ * authorization, and there is no default-deny gate behind it on the backend either. This is an
+ * override for an owner who changed their mind about a machine, not a consent step.
  */
-export const DEFAULT_ORIGIN_POLICY: OriginPolicy = { denySchedule: false, denyDispatch: false }
+export const DEFAULT_ORIGIN_POLICY: OriginPolicy = { denySchedule: false, denyDispatch: false };
 
 /**
  * Derives a dispatched run's kind from the frozen wire fields, never from a trusted surface field (none
@@ -44,10 +47,10 @@ export const DEFAULT_ORIGIN_POLICY: OriginPolicy = { denySchedule: false, denyDi
  * @param start - The dispatched run descriptor (only `scheduleId` and `origin` are read).
  * @returns The derived run kind.
  */
-export function deriveRunKind(start: Pick<RunStart, 'scheduleId' | 'origin'>): RunKind {
-  if (start.scheduleId) return 'schedule'
-  if (start.origin) return 'dispatch'
-  return 'chat'
+export function deriveRunKind(start: Pick<RunStart, "scheduleId" | "origin">): RunKind {
+	if (start.scheduleId) return "schedule";
+	if (start.origin) return "dispatch";
+	return "chat";
 }
 
 /**
@@ -59,7 +62,7 @@ export function deriveRunKind(start: Pick<RunStart, 'scheduleId' | 'origin'>): R
  * @returns True when the policy refuses this kind locally.
  */
 export function isRunKindDenied(policy: OriginPolicy, kind: RunKind): boolean {
-  if (kind === 'schedule') return policy.denySchedule
-  if (kind === 'dispatch') return policy.denyDispatch
-  return false
+	if (kind === "schedule") return policy.denySchedule;
+	if (kind === "dispatch") return policy.denyDispatch;
+	return false;
 }

@@ -3,14 +3,14 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { BRAND } from '../src/brand'
-import { LOCAL_SCOPE } from '@opencompanion/core/runtime/local/scope'
-import type { LocalMcpSpec } from '@opencompanion/core/runtime/local-mcp-spec'
+import { LOCAL_SCOPE } from '@agentrunner/core/runtime/local/scope'
+import type { LocalMcpSpec } from '@agentrunner/core/runtime/local-mcp-spec'
 
 // The app-data dir the mocked `appDataDir()` returns; each test points it at its own fresh temp dir.
-let appDataOverride = mkdtempSync(join(tmpdir(), 'companion-mcp-local-'))
+let appDataOverride = mkdtempSync(join(tmpdir(), 'runner-mcp-local-'))
 
-vi.mock('@opencompanion/core/runtime/paths', async (importOriginal) => {
-  const actual = await importOriginal<typeof import('@opencompanion/core/runtime/paths')>()
+vi.mock('@agentrunner/core/runtime/paths', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@agentrunner/core/runtime/paths')>()
   return { ...actual, appDataDir: () => appDataOverride }
 })
 // Fake the clack UI so commands never touch a real TTY: message helpers echo to stdout (so the text
@@ -34,13 +34,11 @@ const { main } = await import('../src/cli')
 
 let exitCode: number | undefined
 let stdout: string
-let stderr: string
 
 beforeEach(() => {
   exitCode = undefined
   stdout = ''
-  stderr = ''
-  appDataOverride = mkdtempSync(join(tmpdir(), 'companion-mcp-local-'))
+  appDataOverride = mkdtempSync(join(tmpdir(), 'runner-mcp-local-'))
   vi.clearAllMocks()
   // Non-TTY so the no-`--local` resolver never blocks on an interactive backend pick.
   Object.defineProperty(process.stdin, 'isTTY', { value: false, configurable: true })
@@ -53,10 +51,9 @@ beforeEach(() => {
     stdout += String(chunk)
     return true
   })
-  vi.spyOn(process.stderr, 'write').mockImplementation((chunk) => {
-    stderr += String(chunk)
-    return true
-  })
+  // Silenced but NOT captured: nothing here asserts on stderr, so accumulating it built a string no
+  // test ever read.
+  vi.spyOn(process.stderr, 'write').mockImplementation(() => true)
 })
 
 afterEach(() => {
@@ -74,7 +71,7 @@ async function run(argv: string[]): Promise<void> {
 
 /** The local MCP servers keyed under `LOCAL_SCOPE`, read through a FRESH store (the daemon's own read). */
 async function localServers(appDataRoot: string): Promise<Record<string, LocalMcpSpec>> {
-  const { createStateStore } = await import('@opencompanion/core/runtime/storage/state-store')
+  const { createStateStore } = await import('@agentrunner/core/runtime/storage/state-store')
   return createStateStore({ cwd: appDataRoot }).listMcpServers(LOCAL_SCOPE)
 }
 
@@ -86,10 +83,10 @@ async function readLocalMcpSecret(
   appDataRoot: string,
   serverName: string
 ): Promise<Record<string, string> | null> {
-  const { createFileSecretStore } = await import('@opencompanion/core/runtime/storage/secret-store')
-  const { makeMasterKey } = await import('@opencompanion/core/runtime/master-key')
-  const { secretsDir } = await import('@opencompanion/core/runtime/paths')
-  const { mcpEnvKey } = await import('@opencompanion/core/runtime/mcp-secrets')
+  const { createFileSecretStore } = await import('@agentrunner/core/runtime/storage/secret-store')
+  const { makeMasterKey } = await import('@agentrunner/core/runtime/master-key')
+  const { secretsDir } = await import('@agentrunner/core/runtime/paths')
+  const { mcpEnvKey } = await import('@agentrunner/core/runtime/mcp-secrets')
   const dir = secretsDir(appDataRoot)
   const raw = createFileSecretStore({ dir, masterKey: makeMasterKey(dir) }).get(mcpEnvKey(LOCAL_SCOPE, serverName))
   return raw === null ? null : (JSON.parse(raw) as Record<string, string>)
@@ -133,7 +130,7 @@ describe('mcp --local', () => {
 
   it('"mcp list --local" prints exactly the local servers and never the paired backends', async () => {
     const solo = appDataOverride
-    const { createStateStore } = await import('@opencompanion/core/runtime/storage/state-store')
+    const { createStateStore } = await import('@agentrunner/core/runtime/storage/state-store')
     const state = createStateStore({ cwd: solo })
     // A paired backend with its OWN local server: `mcp list --local` must ignore it entirely.
     state.upsertPairedBackend('https://paired.example', { backendUrl: 'https://paired.example', deviceId: 'dp', userId: 'u1' })
@@ -151,7 +148,7 @@ describe('mcp --local', () => {
 
   it('"mcp remove --local" drops a local server with no pairing', async () => {
     const solo = appDataOverride
-    const { createStateStore } = await import('@opencompanion/core/runtime/storage/state-store')
+    const { createStateStore } = await import('@agentrunner/core/runtime/storage/state-store')
     const spec: LocalMcpSpec = { type: 'http', url: 'https://mcp.local.test/mcp' }
     createStateStore({ cwd: solo }).upsertMcpServer(LOCAL_SCOPE, 'docs', spec)
 
@@ -194,7 +191,7 @@ describe('mcp --local: the env asymmetry is told to the user', () => {
   })
 
   it('"mcp add --env" on a PAIRED backend says nothing: its chat runs are the backend own, not local', async () => {
-    const { createStateStore } = await import('@opencompanion/core/runtime/storage/state-store')
+    const { createStateStore } = await import('@agentrunner/core/runtime/storage/state-store')
     createStateStore({ cwd: appDataOverride }).upsertPairedBackend('https://paired.example', {
       backendUrl: 'https://paired.example',
       deviceId: 'dp',
@@ -208,7 +205,7 @@ describe('mcp --local: the env asymmetry is told to the user', () => {
   })
 
   it('"mcp list --local" MARKS an env-backed server terminal-only, and leaves the others plain', async () => {
-    const { createStateStore } = await import('@opencompanion/core/runtime/storage/state-store')
+    const { createStateStore } = await import('@agentrunner/core/runtime/storage/state-store')
     const state = createStateStore({ cwd: appDataOverride })
     state.upsertMcpServer(LOCAL_SCOPE, 'linear', {
       type: 'stdio',
@@ -230,7 +227,7 @@ describe('mcp --local: the env asymmetry is told to the user', () => {
   })
 
   it('"mcp list --local" explains nothing when no server needs an env (no noise)', async () => {
-    const { createStateStore } = await import('@opencompanion/core/runtime/storage/state-store')
+    const { createStateStore } = await import('@agentrunner/core/runtime/storage/state-store')
     createStateStore({ cwd: appDataOverride }).upsertMcpServer(LOCAL_SCOPE, 'docs', {
       type: 'http',
       url: 'https://mcp.local.test/mcp'

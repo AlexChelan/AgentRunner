@@ -1,6 +1,6 @@
-import { homedir } from 'node:os'
-import { join } from 'node:path'
-import { codexHomeDir } from './paths'
+import { homedir } from "node:os";
+import { join } from "node:path";
+import { codexHomeDir } from "./paths";
 
 /**
  * Home-relative credential + secret trees a DISPATCHED run's CLI is denied any read of, ON TOP OF the
@@ -24,53 +24,53 @@ import { codexHomeDir } from './paths'
  * @returns Absolute paths whose reads are denied to a dispatched run's CLI.
  */
 export function sensitiveHomeReadDenyPaths(home: string = homedir()): string[] {
-  return [
-    // Shell / cloud / infra credentials (cross-platform under the home dir).
-    join(home, '.ssh'),
-    join(home, '.aws'),
-    join(home, '.gnupg'),
-    join(home, '.config', 'gcloud'),
-    join(home, '.kube'),
-    join(home, '.docker', 'config.json'),
-    join(home, '.netrc'),
-    join(home, '.config', 'gh'),
-    join(home, '.claude', 'secrets'),
-    // macOS keychain + browser profile stores (cookies, saved logins); inert on non-macOS.
-    join(home, 'Library', 'Keychains'),
-    join(home, 'Library', 'Application Support', 'Google', 'Chrome'),
-    join(home, 'Library', 'Application Support', 'Chromium'),
-    join(home, 'Library', 'Application Support', 'BraveSoftware'),
-    join(home, 'Library', 'Application Support', 'Microsoft Edge'),
-    join(home, 'Library', 'Application Support', 'Firefox'),
-    // Linux browser profile stores; inert on non-Linux.
-    join(home, '.config', 'google-chrome'),
-    join(home, '.config', 'chromium'),
-    join(home, '.config', 'BraveSoftware'),
-    join(home, '.config', 'microsoft-edge'),
-    join(home, '.mozilla', 'firefox')
-  ]
+	return [
+		// Shell / cloud / infra credentials (cross-platform under the home dir).
+		join(home, ".ssh"),
+		join(home, ".aws"),
+		join(home, ".gnupg"),
+		join(home, ".config", "gcloud"),
+		join(home, ".kube"),
+		join(home, ".docker", "config.json"),
+		join(home, ".netrc"),
+		join(home, ".config", "gh"),
+		join(home, ".claude", "secrets"),
+		// macOS keychain + browser profile stores (cookies, saved logins); inert on non-macOS.
+		join(home, "Library", "Keychains"),
+		join(home, "Library", "Application Support", "Google", "Chrome"),
+		join(home, "Library", "Application Support", "Chromium"),
+		join(home, "Library", "Application Support", "BraveSoftware"),
+		join(home, "Library", "Application Support", "Microsoft Edge"),
+		join(home, "Library", "Application Support", "Firefox"),
+		// Linux browser profile stores; inert on non-Linux.
+		join(home, ".config", "google-chrome"),
+		join(home, ".config", "chromium"),
+		join(home, ".config", "BraveSoftware"),
+		join(home, ".config", "microsoft-edge"),
+		join(home, ".mozilla", "firefox")
+	];
 }
 
 /** The user's real Codex home (`$CODEX_HOME` or `~/.codex`) - a codex run's login source. */
 function realCodexHome(home: string): string {
-  return process.env.CODEX_HOME ?? join(home, '.codex')
+	return process.env.CODEX_HOME ?? join(home, ".codex");
 }
 
 /**
  * The Codex credential homes denied to a NON-codex run. A prompt-injected Claude (or any non-codex) run
  * must not reach the user's Codex login, so it is denied BOTH the user's real `~/.codex` (or `$CODEX_HOME`)
- * AND the companion-managed isolated home ({@link codexHomeDir}) - whose `auth.json` is a symlink to the
- * real login on POSIX but a plaintext COPY on the symlink-forbidden Windows fallback, so that copy is denied
- * too. A CODEX run itself must NOT deny these (its `CODEX_HOME/auth.json` resolves into `~/.codex`), so
- * callers add this list ONLY for non-codex runs.
+ * AND the runner-managed isolated home ({@link codexHomeDir}) - whose `auth.json` is a symlink to the
+ * real login on a plain POSIX desktop but a plaintext COPY on a contained host and on the
+ * symlink-forbidden Windows fallback, so that copy is denied too. A CODEX run itself must NOT deny these
+ * (its `CODEX_HOME/auth.json` is its login), so callers add this list ONLY for non-codex runs.
  *
  * @param appDataRoot - The daemon's app-data root (locates the isolated codex home).
  * @param home - The user's home dir (defaults to {@link homedir}); injectable for tests.
  * @returns The Codex credential homes to deny a non-codex run.
  */
 export function codexCredentialReadDenyPaths(
-  appDataRoot: string,
-  home: string = homedir()
+	appDataRoot: string,
+	home: string = homedir()
 ): string[] {
-  return [realCodexHome(home), codexHomeDir(appDataRoot)]
+	return [realCodexHome(home), codexHomeDir(appDataRoot)];
 }

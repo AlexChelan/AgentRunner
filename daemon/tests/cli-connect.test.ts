@@ -1,14 +1,14 @@
 import { describe, expect, it } from 'vitest'
 import {
-  run,
-  out,
   APP_DATA,
-  tempAppData,
-  pairBackend,
-  createStateStore,
-  runConnect,
   clackMultiselect,
-  connectTool
+  connectTool,
+  createStateStore,
+  out,
+  pairBackend,
+  run,
+  runConnect,
+  tempAppData
 } from './cli-harness'
 
 describe('cli routing - connect / disconnect', () => {
@@ -41,7 +41,7 @@ describe('cli routing - connect / disconnect', () => {
   it('routes "connect <tool>" with no --url to the single paired backend (dev convenience)', async () => {
     // A fresh app-data dir so exactly one backend is paired (the shared APP_DATA has several from
     // earlier tests). The resolver must pick that single paired backend when --url is absent, so
-    // `companion connect codex` works flagless.
+    // `runner connect codex` works flagless.
     const solo = tempAppData('solo')
     pairBackend(solo, { backendUrl: 'https://solo.example', deviceId: 'd7' })
     await run(['connect', 'codex'])
@@ -105,7 +105,7 @@ describe('cli routing - connect / disconnect', () => {
   })
 
   it('routes "connect --local <tool>" to a local-scoped connect with no pairing required', async () => {
-    const solo = tempAppData('connlocal')
+    tempAppData('connlocal')
     // No backend is paired. Without --local this prints "Not paired" and never reaches runConnect; with
     // --local the connect is scoped to LOCAL_SCOPE and the pairing guard is skipped entirely.
     runConnect.mockResolvedValueOnce([{ kind: 'reused', toolId: 'codex', authHealth: 'healthy' }])
@@ -117,7 +117,7 @@ describe('cli routing - connect / disconnect', () => {
 
   it('routes "disconnect --local <tool>" to removing the local-scoped connection with no pairing', async () => {
     const solo = tempAppData('disclocal')
-    const { LOCAL_SCOPE } = await import('@opencompanion/core/runtime/local/scope')
+    const { LOCAL_SCOPE } = await import('@agentrunner/core/runtime/local/scope')
     const state = createStateStore({ cwd: solo })
     // A LOCAL-mode connection with NO paired backend; --local must resolve to it and remove it.
     state.upsertConnection(LOCAL_SCOPE, { toolId: 'codex', source: 'reused', authHealth: 'healthy' })

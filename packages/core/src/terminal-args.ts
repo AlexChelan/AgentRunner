@@ -1,13 +1,13 @@
-import { isSafeTerminalToolName } from '@opencompanion/core-types'
-import type { McpServerSpec } from '@opencompanion/protocol'
+import { isSafeTerminalToolName } from "@agentrunner/core-types";
+import type { McpServerSpec } from "@agentrunner/protocol";
 import {
-  mapCodexMcpServers,
-  mapMcpServers,
-  serializeCodexConfigOverrides
-} from './adapters/mapping'
+	mapCodexMcpServers,
+	mapMcpServers,
+	serializeCodexConfigOverrides
+} from "./adapters/mapping";
 
 // These templates are the ONE AND ONLY argv source for an interactive terminal session, whoever hosts
-// it (the desktop's main process today, the companion daemon's `terminal` command next): the caller
+// it (the desktop's main process today, the runner daemon's `terminal` command next): the caller
 // supplies only a `toolId`, a `kind`, and a validated `modelId`, never a command/args/cwd/env/url. The
 // host derives everything else (the loopback app-MCP url + token, the composed instructions, the
 // resolved workspace roots, the pre-approved app-MCP tool names) and hands it here, so an untrusted
@@ -30,10 +30,10 @@ import {
  * tuple so {@link TerminalCliId} is DERIVED from it: a host cannot narrow to a hand-written union that
  * silently stops matching this list when an id is added.
  */
-export const TERMINAL_CLI_IDS = ['claude-code', 'codex'] as const
+export const TERMINAL_CLI_IDS = ["claude-code", "codex"] as const;
 
 /** A CLI that may be driven as an interactive terminal session (derived from {@link TERMINAL_CLI_IDS}). */
-export type TerminalCliId = (typeof TERMINAL_CLI_IDS)[number]
+export type TerminalCliId = (typeof TERMINAL_CLI_IDS)[number];
 
 /**
  * True when `value` is a CLI the terminal can drive. The narrowing is derived from
@@ -44,17 +44,21 @@ export type TerminalCliId = (typeof TERMINAL_CLI_IDS)[number]
  * @returns Whether the id is terminal-capable.
  */
 export function isTerminalCliId(value: string): value is TerminalCliId {
-  return TERMINAL_CLI_IDS.some((id) => id === value)
+	// `.includes()` on a readonly literal tuple narrows its argument to that tuple's union, which is
+	// precisely what this guard must NOT require: it exists to test an arbitrary `string`. The
+	// `.some()` form compares with `===`, which permits the wider operand.
+	// eslint-disable-next-line unicorn/prefer-includes -- see above; the autofix does not typecheck
+	return TERMINAL_CLI_IDS.some((id) => id === value);
 }
 
-// The tool-name charset (TERMINAL_TOOL_NAME_PATTERN) lives in `@opencompanion/core-types` and is
+// The tool-name charset (TERMINAL_TOOL_NAME_PATTERN) lives in `@agentrunner/core-types` and is
 // re-exported here unchanged, so every consumer keeps its import. It is shared because BOTH ends of the
 // permission-flag pipe must agree on one regex: these builders WRITE the names onto the flag, and the
 // capability registry in `@repo/ai` DECLARES them (where a buyer names its app's tools) - a second copy
-// could be widened on one side and quietly re-open the hole on the other. `@opencompanion/core-types` ships
-// in EVERY generated build, which `@opencompanion/core` does not (a companion-off build strips it), so the
+// could be widened on one side and quietly re-open the hole on the other. `@agentrunner/core-types` ships
+// in EVERY generated build, which `@agentrunner/core` does not (a runner-off build strips it), so the
 // web capability registry can depend on the charset without dragging the CLI-driving seam back in.
-export { isSafeTerminalToolName, TERMINAL_TOOL_NAME_PATTERN } from '@opencompanion/core-types'
+export { isSafeTerminalToolName, TERMINAL_TOOL_NAME_PATTERN } from "@agentrunner/core-types";
 
 /**
  * Host-derived inputs for one interactive terminal session. Assembled entirely from trusted state; an
@@ -62,31 +66,31 @@ export { isSafeTerminalToolName, TERMINAL_TOOL_NAME_PATTERN } from '@opencompani
  * this is a hard security boundary.
  */
 export interface TerminalArgsInput {
-  /** The loopback (127.0.0.1) app-MCP url, token-scoped, the CLI connects to for the app's tools. */
-  mcpUrl: string
-  /**
-   * The MCP server name the app's capability layer is exposed under. Supplied by the host (each one
-   * derives it from its own product identity - the desktop from `config.desktop`, the daemon from its
-   * brand), so this publishable package carries no product name of its own.
-   */
-  localServerName: string
-  /** The composed static instructions injected as the CLI's system / developer prompt. */
-  instructions: string
-  /** The session's workspace roots; the first is the cwd, the rest are extra readable/writable dirs. */
-  workspaces: string[]
-  /** App-MCP tool names to pre-approve for `claude` (so its own tools still prompt, ours do not). */
-  localToolNames: string[]
-  /** Integration MCP servers (Linear, etc.) threaded alongside the app-MCP, keyed by server name. */
-  mcpServers: Record<string, McpServerSpec>
-  /** The validated model id, or `undefined` to let the CLI pick its own default. */
-  modelId?: string
-  /**
-   * When true, the CLI runs with its OWN approval prompts bypassed (claude
-   * `--dangerously-skip-permissions`, codex full-auto), so it acts freely like the built-in chat.
-   * The app's capability tools are auto-approved regardless; this governs the CLI's own file/shell
-   * tools.
-   */
-  bypassPermissions?: boolean
+	/** The loopback (127.0.0.1) app-MCP url, token-scoped, the CLI connects to for the app's tools. */
+	mcpUrl: string;
+	/**
+	 * The MCP server name the app's capability layer is exposed under. Supplied by the host (each one
+	 * derives it from its own product identity - the desktop from `config.desktop`, the daemon from its
+	 * brand), so this publishable package carries no product name of its own.
+	 */
+	localServerName: string;
+	/** The composed static instructions injected as the CLI's system / developer prompt. */
+	instructions: string;
+	/** The session's workspace roots; the first is the cwd, the rest are extra readable/writable dirs. */
+	workspaces: string[];
+	/** App-MCP tool names to pre-approve for `claude` (so its own tools still prompt, ours do not). */
+	localToolNames: string[];
+	/** Integration MCP servers (Linear, etc.) threaded alongside the app-MCP, keyed by server name. */
+	mcpServers: Record<string, McpServerSpec>;
+	/** The validated model id, or `undefined` to let the CLI pick its own default. */
+	modelId?: string;
+	/**
+	 * When true, the CLI runs with its OWN approval prompts bypassed (claude
+	 * `--dangerously-skip-permissions`, codex full-auto), so it acts freely like the built-in chat.
+	 * The app's capability tools are auto-approved regardless; this governs the CLI's own file/shell
+	 * tools.
+	 */
+	bypassPermissions?: boolean;
 }
 
 /**
@@ -108,29 +112,32 @@ export interface TerminalArgsInput {
  * @returns The `claude` argv (without the binary itself).
  */
 export function claudeTerminalArgs(input: TerminalArgsInput): string[] {
-  const servers = mapMcpServers({
-    ...input.mcpServers,
-    [input.localServerName]: { type: 'http', url: input.mcpUrl }
-  })
-  const args = [
-    '--mcp-config',
-    JSON.stringify({ mcpServers: servers }),
-    '--strict-mcp-config',
-    '--append-system-prompt',
-    input.instructions
-  ]
-  // In bypass mode every tool runs without a prompt, so pre-approving individual tools is moot.
-  if (input.bypassPermissions) {
-    args.push('--dangerously-skip-permissions')
-  } else {
-    const approved = input.localToolNames.filter(isSafeTerminalToolName)
-    if (approved.length > 0) {
-      args.push('--allowedTools', approved.map((n) => `mcp__${input.localServerName}__${n}`).join(','))
-    }
-  }
-  for (const dir of input.workspaces.slice(1)) args.push('--add-dir', dir)
-  if (input.modelId) args.push('--model', input.modelId)
-  return args
+	const servers = mapMcpServers({
+		...input.mcpServers,
+		[input.localServerName]: { type: "http", url: input.mcpUrl }
+	});
+	const args = [
+		"--mcp-config",
+		JSON.stringify({ mcpServers: servers }),
+		"--strict-mcp-config",
+		"--append-system-prompt",
+		input.instructions
+	];
+	// In bypass mode every tool runs without a prompt, so pre-approving individual tools is moot.
+	if (input.bypassPermissions) {
+		args.push("--dangerously-skip-permissions");
+	} else {
+		const approved = input.localToolNames.filter(isSafeTerminalToolName);
+		if (approved.length > 0) {
+			args.push(
+				"--allowedTools",
+				approved.map((n) => `mcp__${input.localServerName}__${n}`).join(",")
+			);
+		}
+	}
+	for (const dir of input.workspaces.slice(1)) args.push("--add-dir", dir);
+	if (input.modelId) args.push("--model", input.modelId);
+	return args;
 }
 
 /**
@@ -150,16 +157,16 @@ export function claudeTerminalArgs(input: TerminalArgsInput): string[] {
  * @returns The `codex` argv (without the binary itself).
  */
 export function codexTerminalArgs(input: TerminalArgsInput, cwd: string): string[] {
-  const config: Record<string, unknown> = {
-    developer_instructions: input.instructions,
-    mcp_servers: mapCodexMcpServers({
-      ...input.mcpServers,
-      [input.localServerName]: { type: 'http', url: input.mcpUrl }
-    })
-  }
-  const args = ['-C', cwd]
-  if (input.bypassPermissions) args.push('--dangerously-bypass-approvals-and-sandbox')
-  if (input.modelId) args.push('-m', input.modelId)
-  for (const override of serializeCodexConfigOverrides(config)) args.push('-c', override)
-  return args
+	const config: Record<string, unknown> = {
+		developer_instructions: input.instructions,
+		mcp_servers: mapCodexMcpServers({
+			...input.mcpServers,
+			[input.localServerName]: { type: "http", url: input.mcpUrl }
+		})
+	};
+	const args = ["-C", cwd];
+	if (input.bypassPermissions) args.push("--dangerously-bypass-approvals-and-sandbox");
+	if (input.modelId) args.push("-m", input.modelId);
+	for (const override of serializeCodexConfigOverrides(config)) args.push("-c", override);
+	return args;
 }

@@ -1,23 +1,25 @@
 {
-  "name": "@opencompanion/core-types",
-  "version": "0.2.0",
+  "name": "@agentrunner/core-types",
+  "version": "1.0.0",
   "private": false,
   "type": "module",
   "exports": {
     ".": "./src/index.ts"
   },
   "dependencies": {
-    "@opencompanion/protocol": "workspace:*",
+    "@agentrunner/protocol": "workspace:*",
     "ai": "6.0.208"
   },
   "devDependencies": {
     "@types/node": "25.6.0",
+    "eslint": "^10.2.0",
     "typescript": "6.0.3",
     "vitest": "4.1.5"
   },
   "sideEffects": false,
   "scripts": {
     "check-types": "tsc --noEmit",
+    "lint": "eslint --cache .",
     "test": "vitest run"
   }
 }

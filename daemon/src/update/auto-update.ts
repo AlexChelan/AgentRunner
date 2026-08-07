@@ -1,6 +1,7 @@
-import { messageOf } from '@opencompanion/core/runtime/error-message'
-import type { UpdateState } from '@opencompanion/core/runtime/stream-client'
-import { checkLatest, flipCurrent, hasReleaseBase, pruneVersions, stageVersion, type UpdaterDeps } from './updater'
+import { messageOf } from '@agentrunner/core/runtime/error-message'
+import type { UpdateState } from '@agentrunner/core/runtime/stream-client'
+import { checkLatest, flipCurrent, hasReleaseBase, pruneVersions, stageVersion  } from './updater'
+import type {UpdaterDeps} from './updater';
 
 /** The default full-check cadence (ms): every six hours. */
 const DEFAULT_INTERVAL_MS = 6 * 60 * 60 * 1_000
@@ -95,11 +96,16 @@ export function startAutoUpdate(deps: AutoUpdateDeps): AutoUpdateHandle {
   const scheduleIdleRetry = (): void => {
     if (stopped) return
     clearIdle()
-    idleTimer = setTimeout(() => applyWhenIdle(), idleRetryMs)
+    idleTimer = setTimeout(applyWhenIdle, idleRetryMs)
   }
 
+  // A FUNCTION DECLARATION, not a const arrow like its neighbours: it and `scheduleIdleRetry` are
+  // mutually recursive (idle -> retry -> idle), so whichever is written second is referenced before it
+  // is defined. A declaration hoists within this closure, which makes the cycle legal instead of
+  // needing a rule suppression. Safe because neither runs during setup - the only entry point is the
+  // `void runCycle()` at the end, by which time every binding above is initialized.
   /** Applies a staged version once the daemon is idle; otherwise waits and re-checks on the retry timer. */
-  const applyWhenIdle = (): void => {
+  function applyWhenIdle(): void {
     if (stopped || staged === null) return
     if (!deps.isIdle()) {
       scheduleIdleRetry()
@@ -123,9 +129,10 @@ export function startAutoUpdate(deps: AutoUpdateDeps): AutoUpdateHandle {
     deps.requestShutdown()
   }
 
-  const runCycle = async (): Promise<void> => {
+  // Hoisted for the same reason as `applyWhenIdle`: it and `scheduleCycle` are mutually recursive.
+  async function runCycle(): Promise<void> {
     if (stopped) return
-    // No release base configured (a companion that has not published yet): skip the check silently and
+    // No release base configured (a runner that has not published yet): skip the check silently and
     // try again next cycle, rather than firing a doomed fetch against a malformed URL every interval.
     if (!hasReleaseBase(deps.updater.releaseBase)) {
       scheduleCycle()

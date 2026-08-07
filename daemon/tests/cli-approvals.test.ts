@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { run, out, tempAppData, pairBackend, createStateStore, BRAND } from './cli-harness'
+import { BRAND, createStateStore, out, pairBackend, run, tempAppData } from './cli-harness'
 
 /**
  * `approvals` is the one permission control the user still owns: whether an interactive terminal session
@@ -68,7 +68,7 @@ describe('cli routing - approvals show / set', () => {
 
   // The trust log has to be able to show a permission the user turned OFF, after the fact.
   it('audits the change with its before and after', async () => {
-    const solo = tempAppData('approvalsaudit')
+    tempAppData('approvalsaudit')
     await run(['approvals', 'set', '--local', '--mode', 'prompt'])
     out.stdout = ''
     await run(['log', '--json'])

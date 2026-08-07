@@ -1,5 +1,5 @@
-import { mkdirSync, renameSync, writeFileSync } from 'node:fs'
-import { dirname } from 'node:path'
+import { mkdirSync, renameSync, writeFileSync } from "node:fs";
+import { dirname } from "node:path";
 
 /**
  * Atomically writes `value` as JSON to `file`, crash-safe and owner-only. The file's PARENT directory is
@@ -16,20 +16,15 @@ import { dirname } from 'node:path'
  * @param value - The JSON-serializable value to persist.
  */
 export function writeJsonFileAtomic(file: string, value: unknown): void {
-  mkdirSync(dirname(file), { recursive: true, mode: 0o700 })
-  const tmp = `${file}.tmp-${process.pid}`
-  writeFileSync(tmp, JSON.stringify(value), { mode: 0o600 })
-  renameSync(tmp, file)
+	mkdirSync(dirname(file), { recursive: true, mode: 0o700 });
+	const tmp = `${file}.tmp-${process.pid}`;
+	writeFileSync(tmp, JSON.stringify(value), { mode: 0o600 });
+	renameSync(tmp, file);
 }
 
 /**
- * Narrows an unknown value to a non-null, non-array object record. The single shared guard the
- * daemon-local JSON stores (chat, schedule, task-override) validate parsed documents through, so their
- * shape-check posture stays identical rather than drifting between hand-rolled copies.
- *
- * @param value - The parsed value to narrow.
- * @returns Whether `value` is a plain object record.
+ * The shared record guard the daemon-local JSON stores validate parsed documents through lives in
+ * `./is-record`. It is deliberately NOT re-exported from here: this file imports `node:fs`, which a
+ * renderer bundle replaces with a stub that throws on first access, so importing that guard through
+ * this module crashed the renderer at module evaluation. Import it from `./is-record` directly.
  */
-export function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null && !Array.isArray(value)
-}

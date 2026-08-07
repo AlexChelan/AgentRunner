@@ -1,16 +1,20 @@
 import { hostname } from 'node:os'
-import { canonicalizeBackendUrl, DEFAULT_CLIENT_ID, findPairedBackend, findPairedScopes } from '@opencompanion/core/runtime/backend-url'
-import { BRAND } from '../brand'
-import { buildCompanionRegistry, connectTool, type ConnectableToolId } from '@opencompanion/core/runtime/connect'
+import { canonicalizeBackendUrl, DEFAULT_CLIENT_ID, findPairedBackend, findPairedScopes } from '@agentrunner/core/runtime/backend-url'
+import { BRAND, envVar } from '../brand'
+import { AGENT_GID, AGENT_UID, containerHomeDir, isContained } from '../container'
+import { buildRunnerRegistry,  connectTool } from '@agentrunner/core/runtime/connect'
+import type {ConnectableToolId} from '@agentrunner/core/runtime/connect';
 import { isDaemonRunning } from '../lifecycle'
-import { runPair } from '@opencompanion/core/runtime/pair'
-import { appDataDir, managedCliDir } from '@opencompanion/core/runtime/paths'
-import { startDaemon, type Daemon } from '../serve'
-import { createStateStore, type StateStore } from '@opencompanion/core/runtime/storage/state-store'
+import { runPair } from '@agentrunner/core/runtime/pair'
+import { appDataDir, managedCliDir } from '@agentrunner/core/runtime/paths'
+import {  startDaemon } from '../serve'
+import type {Daemon, ServeDeps} from '../serve';
+import { createStateStore  } from '@agentrunner/core/runtime/storage/state-store'
+import type {StateStore} from '@agentrunner/core/runtime/storage/state-store';
 import * as ui from '../ui'
 import { daemonVersion } from '../version'
 import { buildUpdaterDeps } from './update'
-import { CLI_OPTIONS, flagValue, openStores } from './shared'
+import { CLI_OPTIONS, enrollCodeArg, flagValue, openStores } from './shared'
 
 /**
  * For a foreground `serve` in a real terminal: when the paired backend has no connected coding CLI
@@ -37,12 +41,93 @@ async function ensureCliConnected(
   if (ui.p.isCancel(choice) || choice === 'skip') return
   const baseDir = managedCliDir(appDataRoot)
   await connectTool(choice, {
-    registry: buildCompanionRegistry(baseDir),
+    registry: buildRunnerRegistry(baseDir),
     baseDir,
     state,
     backendUrl: scope,
     write: ui.line
   })
+}
+
+/** The default wait between a contained daemon's boot attempts: slow enough never to hammer a backend. */
+const CONTAINED_RETRY_MS = 30_000
+
+/**
+ * The container identity the daemon needs, or nothing at all off a container. Spread into `ServeDeps`, so
+ * a native install is byte-for-byte the shape it always was.
+ *
+ * @param contained - Whether this daemon runs in a container.
+ * @param appDataRoot - The app-data root (the container's volume mount point).
+ * @returns The `contained`/`agentUid`/`agentGid`/`homeDir` deps, or `{}`.
+ */
+function containedDeps(
+  contained: boolean,
+  appDataRoot: string
+): Pick<ServeDeps, 'contained' | 'agentUid' | 'agentGid' | 'homeDir'> {
+  return contained
+    ? { contained: true, agentUid: AGENT_UID, agentGid: AGENT_GID, homeDir: containerHomeDir(appDataRoot) }
+    : {}
+}
+
+/** Injected seams for the CONTAINED boot-retry loop, so a test drives it without any real waiting. */
+export interface ServeRetryDeps {
+  /** Milliseconds between boot attempts (defaults to {@link CONTAINED_RETRY_MS}). */
+  retryMs?: number
+  /** Maximum boot attempts (defaults to unbounded: a container waits for its enrollment indefinitely). */
+  maxAttempts?: number
+  /** The wait between attempts (defaults to a real timer). */
+  sleep?: (ms: number) => Promise<void>
+}
+
+/**
+ * Boots the daemon, and in CONTAINER MODE keeps retrying instead of letting a failed boot exit.
+ *
+ * Under `--restart unless-stopped` an exiting daemon is not a failure that surfaces - it is a restart
+ * loop that hammers the backend and burns whatever enrollment TTL is left. An unpaired container (no
+ * code, a spent code, a refused redemption) is a NORMAL state that resolves when a human runs
+ * `pair --enroll` against the same volume, so the container stays up and re-checks its pairing state
+ * on an interval until it can serve. A LIVE daemon already holding the single-instance lock is handed
+ * back as `null` instead: that is a good state, and retrying against it would restart-fight a healthy
+ * process. Off a container nothing changes - one boot, and the caller's exit code decides.
+ *
+ * Only the FIRST attempt carries the enrollment code: it is one-shot, so a code that did not pair the
+ * container is spent, expired or refused, and re-posting it every interval would hammer a rate-limited
+ * endpoint with a redemption that cannot succeed. Every later attempt is a local pairing-state re-read.
+ *
+ * @param boot - Starts the daemon (returns `null` when it could not). Its argument is whether this is the
+ *   first attempt, which is what decides whether the one-shot enrollment code rides along.
+ * @param retryUntilPaired - Whether a failed boot waits and retries (container mode, and not `--if-paired`,
+ *   which is the opportunistic dev run that must stay a quiet no-op).
+ * @param appDataRoot - The app-data root holding the single-instance lock (probed for the live-daemon case).
+ * @param retry - The injectable interval/attempt-cap/sleep seams.
+ * @returns The booted daemon, or `null` (a live lock, or a retrying boot that ran out of attempts).
+ */
+async function bootDaemon(
+  boot: (firstAttempt: boolean) => Promise<Daemon | null>,
+  retryUntilPaired: boolean,
+  appDataRoot: string,
+  retry: ServeRetryDeps
+): Promise<Daemon | null> {
+  const daemon = await boot(true)
+  if (daemon !== null || !retryUntilPaired) return daemon
+  const retryMs = retry.retryMs ?? CONTAINED_RETRY_MS
+  const maxAttempts = retry.maxAttempts ?? Number.POSITIVE_INFINITY
+  const sleep =
+    retry.sleep ??
+    ((ms: number): Promise<void> =>
+      new Promise<void>((resolve) => {
+        setTimeout(resolve, ms)
+      }))
+  for (let attempt = 1; attempt < maxAttempts; attempt++) {
+    if (isDaemonRunning({ dir: appDataRoot })) return null
+    ui.line(
+      `Not paired yet; waiting for enrollment. Re-run with a fresh --enroll, or pair this container in place: docker exec -it <container> ${BRAND.binary} pair --enroll <code> --url <backend>`
+    )
+    await sleep(retryMs)
+    const next = await boot(false)
+    if (next !== null) return next
+  }
+  return null
 }
 
 /**
@@ -92,21 +177,40 @@ async function blockUntilDrained(
 
 /**
  * Runs the `serve` command. With NO `--url` the one daemon serves EVERY paired backend concurrently
- * and hot-picks up a backend paired later (a separate `companion pair`), so there is nothing to resolve
+ * and hot-picks up a backend paired later (a separate `runner pair`), so there is nothing to resolve
  * or pair on demand - it just boots against the current pairing set. With `--url <backend>` it FILTERS
  * to that one backend, pairing it on demand via the RFC-8628 device-authorization flow when needed and
  * - in an interactive terminal with no CLI connected yet - offering to connect a coding CLI (see
  * {@link ensureCliConnected}); this is how the boot service pins a backend and how a fresh machine goes
  * unpaired -> running in one command.
  *
+ * `--enroll <code>` (or the brand-scoped `<PREFIX>_ENROLL` variable, since a container entrypoint takes
+ * no arguments) carries a one-time, server-pre-approved enrollment code instead of a person at a
+ * terminal: the interactive on-demand pairing above is skipped and the daemon redeems the code at boot.
+ *
  * `--if-paired` makes `serve` a quiet no-op on an unpaired machine: this is how `pnpm dev` runs the
  * daemon alongside the app. When no backend is paired (or the `--url` filter is unpaired) it prints one
  * hint and exits 0 - never opening the encrypted secret store or dropping into device pairing - and a
- * failed boot also exits 0 rather than non-zero, so a companion that cannot run never fails `pnpm dev`.
+ * failed boot also exits 0 rather than non-zero, so a runner that cannot run never fails `pnpm dev`.
+ *
+ * In CONTAINER MODE it hands the daemon the container identity (unprivileged uid/gid + the volume-backed
+ * `HOME` for CLI children) and NEVER exits on a failed boot - see {@link bootDaemon}.
+ *
+ * @param argv - The process arguments (`argv[0]` is `"serve"`).
+ * @param retry - The contained boot-retry seams (interval, attempt cap, sleep); real defaults.
  */
-export async function cmdServe(argv: string[]): Promise<void> {
+export async function cmdServe(argv: string[], retry: ServeRetryDeps = {}): Promise<void> {
   const ifPaired = argv.includes('--if-paired')
-  const explicitUrl = flagValue(argv, '--url')
+  // A compose file sets environment, not arguments, so the backend URL arrives the same way the
+  // enrollment code does. A blank value reads as absent (a declared-but-unset compose entry).
+  const envUrl = process.env[envVar('BACKEND_URL')]?.trim()
+  const explicitUrl = flagValue(argv, '--url') ?? (envUrl === undefined || envUrl === '' ? undefined : envUrl)
+  // The container's pairing credential, redeemed by the daemon at boot (see `startDaemon`).
+  const enrollCode = enrollCodeArg(argv)
+  const contained = isContained()
+  // Only a real container run waits for a pairing: `--if-paired` is the opportunistic dev/boot run whose
+  // whole contract is to give up quietly, and it must never sit in a retry loop.
+  const waitForPairing = contained && !ifPaired
   const idleHint =
     `${BRAND.name} idle: no backend paired. Run '${BRAND.binary} pair' (or '${BRAND.binary} setup') to start the daemon.`
   const pairingState = createStateStore({ cwd: appDataDir() })
@@ -124,22 +228,34 @@ export async function cmdServe(argv: string[]): Promise<void> {
         ui.line(idleHint)
         return
       }
-      ui.p.cancel(`No backend paired. Run '${BRAND.binary} pair --url <backend>', or 'serve --url <backend>' to pair on demand.`)
-      process.exit(1)
-      return
+      // A CONTAINER falls through to the retry loop below instead: refusing here is the same crash loop
+      // a failed enrollment would be, and a pairing written by `docker exec … pair` must be picked up.
+      if (!contained) {
+        ui.p.cancel(`No backend paired. Run '${BRAND.binary} pair --url <backend>', or 'serve --url <backend>' to pair on demand.`)
+        process.exit(1)
+        return
+      }
     }
     ui.intro()
     const { appDataRoot, state, secrets } = openStores()
     await blockUntilDrained(
-      await startDaemon({
+      await bootDaemon(
+        (firstAttempt) =>
+          startDaemon({
+            appDataRoot,
+            state,
+            secrets,
+            version: daemonVersion(),
+            updater: buildUpdaterDeps(ui.line),
+            ...(machineName ? { hostname: machineName } : {}),
+            ...(enrollCode !== undefined && firstAttempt ? { enrollCode } : {}),
+            ...containedDeps(contained, appDataRoot),
+            write: ui.line
+          }),
+        waitForPairing,
         appDataRoot,
-        state,
-        secrets,
-        version: daemonVersion(),
-        updater: buildUpdaterDeps(ui.line),
-        ...(machineName ? { hostname: machineName } : {}),
-        write: ui.line
-      }),
+        retry
+      ),
       ifPaired,
       'all paired backends',
       appDataRoot
@@ -160,7 +276,10 @@ export async function cmdServe(argv: string[]): Promise<void> {
   // stored under a raw URL variant still counts as paired (its store re-key happens lock-held inside
   // startDaemon), so a variant `--url` (case/slash/default-port) never re-pairs or forks a session.
   const targetUrl = canonicalizeBackendUrl(explicitUrl)
-  if (!findPairedBackend(targetUrl, state)) {
+  // An enrollment code REPLACES the on-demand device flow: nobody is at a terminal to approve a grant in
+  // a container, and the daemon redeems the code itself at boot (which is also where a re-`serve` on an
+  // already-paired volume correctly skips it), so never start the interactive flow here.
+  if (enrollCode === undefined && !findPairedBackend(targetUrl, state)) {
     const clientId = flagValue(argv, '--client-id') ?? DEFAULT_CLIENT_ID
     const { ok } = await runPair({ backendUrl: targetUrl, clientId }, { state, secrets, write: ui.line })
     if (!ok) {
@@ -175,16 +294,24 @@ export async function cmdServe(argv: string[]): Promise<void> {
   const only = paired.length === 1 ? paired[0] : undefined
   if (only) await ensureCliConnected(appDataRoot, state, only.scope)
   await blockUntilDrained(
-    await startDaemon({
+    await bootDaemon(
+      (firstAttempt) =>
+        startDaemon({
+          appDataRoot,
+          filterUrl: targetUrl,
+          state,
+          secrets,
+          version: daemonVersion(),
+          updater: buildUpdaterDeps(ui.line),
+          ...(machineName ? { hostname: machineName } : {}),
+          ...(enrollCode !== undefined && firstAttempt ? { enrollCode } : {}),
+          ...containedDeps(contained, appDataRoot),
+          write: ui.line
+        }),
+      waitForPairing,
       appDataRoot,
-      filterUrl: targetUrl,
-      state,
-      secrets,
-      version: daemonVersion(),
-      updater: buildUpdaterDeps(ui.line),
-      ...(machineName ? { hostname: machineName } : {}),
-      write: ui.line
-    }),
+      retry
+    ),
     ifPaired,
     targetUrl,
     appDataRoot

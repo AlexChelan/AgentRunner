@@ -1,23 +1,23 @@
-import { brand } from './brand'
-import type { PairedBackend, PairedScope, StateStore } from './storage/state-store'
+import { brand } from "./brand";
+import type { PairedBackend, PairedScope, StateStore } from "./storage/state-store";
 
 /**
- * The device-authorization client id the companion presents when pairing. WIRE-FROZEN: deployed
+ * The device-authorization client id the runner presents when pairing. WIRE-FROZEN: deployed
  * buyer backends (v1.42.0+) allowlist exactly this string in their Better Auth device grant, so
  * renaming it would break pairing against every existing deployment.
  */
-export const DEFAULT_CLIENT_ID = 'companion'
+export const DEFAULT_CLIENT_ID = "runner";
 
 /** Options for {@link resolveBackendUrl}. */
 export interface ResolveBackendUrlOpts {
-  /** Whether an interactive picker may be shown to disambiguate several pairings. */
-  interactive: boolean
-  /** Picks one of the paired backend URLs (an arrow-key select); used only on the interactive path. */
-  prompt?: (urls: string[]) => Promise<string>
+	/** Whether an interactive picker may be shown to disambiguate several pairings. */
+	interactive: boolean;
+	/** Picks one of the paired backend URLs (an arrow-key select); used only on the interactive path. */
+	prompt?: (urls: string[]) => Promise<string>;
 }
 
 /**
- * Resolves which BACKEND a pairing command targets now that the companion carries no baked-in default:
+ * Resolves which BACKEND a pairing command targets now that the runner carries no baked-in default:
  * an explicit `--url` wins; else the sole paired backend is used; else - when several are paired and
  * `opts.interactive` allows it - the injected `prompt` picks one; else it throws. Never invents a
  * URL from an empty pairing set: with nothing paired it throws the pair hint, so pairing (which
@@ -41,41 +41,43 @@ export interface ResolveBackendUrlOpts {
  * @throws When nothing is paired, or several are paired and no explicit or interactive choice resolves one.
  */
 export async function resolveBackendUrl(
-  explicit: string | undefined,
-  state: StateStore,
-  opts: ResolveBackendUrlOpts
+	explicit: string | undefined,
+	state: StateStore,
+	opts: ResolveBackendUrlOpts
 ): Promise<string> {
-  if (explicit) {
-    const paired = findPairedBackend(explicit, state)
-    return paired ? paired.backendUrl : canonicalizeBackendUrl(explicit)
-  }
-  // DISTINCT backends, in first-paired order: two accounts on one backend are one choice here, since
-  // this resolver names a backend to pair with, not a pairing to read.
-  const urls = [...new Set(state.listPairedBackends().map((backend) => backend.backendUrl))]
-  if (urls.length === 1) return urls[0]!
-  if (urls.length === 0) {
-    throw new Error(`Not paired with any backend. Run '${brand().binary} pair --url <backend>' first.`)
-  }
-  if (opts.interactive && opts.prompt) {
-    return opts.prompt(urls)
-  }
-  throw new Error('Multiple backends are paired. Pass --url <backend>.')
+	if (explicit) {
+		const paired = findPairedBackend(explicit, state);
+		return paired ? paired.backendUrl : canonicalizeBackendUrl(explicit);
+	}
+	// DISTINCT backends, in first-paired order: two accounts on one backend are one choice here, since
+	// this resolver names a backend to pair with, not a pairing to read.
+	const urls = [...new Set(state.listPairedBackends().map((backend) => backend.backendUrl))];
+	if (urls.length === 1) return urls[0]!;
+	if (urls.length === 0) {
+		throw new Error(
+			`Not paired with any backend. Run '${brand().binary} pair --url <backend>' first.`
+		);
+	}
+	if (opts.interactive && opts.prompt) {
+		return opts.prompt(urls);
+	}
+	throw new Error("Multiple backends are paired. Pass --url <backend>.");
 }
 
 /** One choice in the account-scope picker: the scope it resolves to, and the line the user reads. */
 export interface ScopeChoice {
-  /** The account scope (the store key) this choice resolves to. */
-  value: string
-  /** The human line shown in the picker. */
-  label: string
+	/** The account scope (the store key) this choice resolves to. */
+	value: string;
+	/** The human line shown in the picker. */
+	label: string;
 }
 
 /** Options for {@link resolveBackendScope}. */
 export interface ResolveBackendScopeOpts {
-  /** Whether an interactive picker may be shown to disambiguate several pairings. */
-  interactive: boolean
-  /** Picks one of the paired scopes (an arrow-key select); used only on the interactive path. */
-  prompt?: (choices: ScopeChoice[]) => Promise<string>
+	/** Whether an interactive picker may be shown to disambiguate several pairings. */
+	interactive: boolean;
+	/** Picks one of the paired scopes (an arrow-key select); used only on the interactive path. */
+	prompt?: (choices: ScopeChoice[]) => Promise<string>;
 }
 
 /**
@@ -90,15 +92,15 @@ export interface ResolveBackendScopeOpts {
  * @returns Every matching pairing with its scope, in stored order (empty when none matches).
  */
 export function findPairedScopes(input: string, state: StateStore): PairedScope[] {
-  const canonical = canonicalizeBackendUrl(input)
-  return state
-    .listPairedScopes()
-    .filter(
-      (paired) =>
-        canonicalizeBackendUrl(paired.record.backendUrl) === canonical ||
-        paired.scope === input ||
-        paired.scope === canonical
-    )
+	const canonical = canonicalizeBackendUrl(input);
+	return state
+		.listPairedScopes()
+		.filter(
+			(paired) =>
+				canonicalizeBackendUrl(paired.record.backendUrl) === canonical ||
+				paired.scope === input ||
+				paired.scope === canonical
+		);
 }
 
 /**
@@ -109,8 +111,8 @@ export function findPairedScopes(input: string, state: StateStore): PairedScope[
  * @returns The human label.
  */
 function scopeChoiceLabel(paired: PairedScope): string {
-  const userId = paired.record.userId
-  return userId ? `${paired.record.backendUrl} (user ${userId})` : paired.record.backendUrl
+	const userId = paired.record.userId;
+	return userId ? `${paired.record.backendUrl} (user ${userId})` : paired.record.backendUrl;
 }
 
 /**
@@ -137,35 +139,45 @@ function scopeChoiceLabel(paired: PairedScope): string {
  * @throws When nothing is paired, or the choice stays ambiguous, or an explicit `--user` matches nothing.
  */
 export async function resolveBackendScope(
-  explicitUrl: string | undefined,
-  explicitUser: string | undefined,
-  state: StateStore,
-  opts: ResolveBackendScopeOpts
+	explicitUrl: string | undefined,
+	explicitUser: string | undefined,
+	state: StateStore,
+	opts: ResolveBackendScopeOpts
 ): Promise<string> {
-  const all = explicitUrl ? findPairedScopes(explicitUrl, state) : state.listPairedScopes()
-  const matches = explicitUser ? all.filter((paired) => paired.record.userId === explicitUser) : all
-  if (matches.length === 1) return matches[0]!.scope
-  if (matches.length === 0) {
-    if (explicitUser !== undefined) {
-      const where = explicitUrl ? ` with ${canonicalizeBackendUrl(explicitUrl)}` : ''
-      throw new Error(`No pairing for user "${explicitUser}"${where}. Run '${brand().binary} backends' to list pairings.`)
-    }
-    if (explicitUrl) return canonicalizeBackendUrl(explicitUrl)
-    throw new Error(`Not paired with any backend. Run '${brand().binary} pair --url <backend>' first.`)
-  }
-  // Several pairings left. An explicit `--url` means the user already pinned the backend, so the only
-  // thing still ambiguous is WHICH ACCOUNT: name them and require `--user` rather than prompting behind
-  // a flag they already gave.
-  if (explicitUrl) {
-    const users = matches.map((paired) => paired.record.userId || paired.scope).join(', ')
-    throw new Error(
-      `Several accounts are paired with ${canonicalizeBackendUrl(explicitUrl)}: ${users}. Pass --user <id>.`
-    )
-  }
-  if (opts.interactive && opts.prompt) {
-    return opts.prompt(matches.map((paired) => ({ value: paired.scope, label: scopeChoiceLabel(paired) })))
-  }
-  throw new Error('Multiple backends are paired. Pass --url <backend> (and --user <id> when one backend has two accounts).')
+	const all = explicitUrl ? findPairedScopes(explicitUrl, state) : state.listPairedScopes();
+	const matches = explicitUser
+		? all.filter((paired) => paired.record.userId === explicitUser)
+		: all;
+	if (matches.length === 1) return matches[0]!.scope;
+	if (matches.length === 0) {
+		if (explicitUser !== undefined) {
+			const where = explicitUrl ? ` with ${canonicalizeBackendUrl(explicitUrl)}` : "";
+			throw new Error(
+				`No pairing for user "${explicitUser}"${where}. Run '${brand().binary} backends' to list pairings.`
+			);
+		}
+		if (explicitUrl) return canonicalizeBackendUrl(explicitUrl);
+		throw new Error(
+			`Not paired with any backend. Run '${brand().binary} pair --url <backend>' first.`
+		);
+	}
+	// Several pairings left. An explicit `--url` means the user already pinned the backend, so the only
+	// thing still ambiguous is WHICH ACCOUNT: name them and require `--user` rather than prompting behind
+	// a flag they already gave.
+	if (explicitUrl) {
+		const users = matches.map((paired) => paired.record.userId || paired.scope).join(", ");
+		throw new Error(
+			`Several accounts are paired with ${canonicalizeBackendUrl(explicitUrl)}: ${users}. Pass --user <id>.`
+		);
+	}
+	if (opts.interactive && opts.prompt) {
+		return opts.prompt(
+			matches.map((paired) => ({ value: paired.scope, label: scopeChoiceLabel(paired) }))
+		);
+	}
+	throw new Error(
+		"Multiple backends are paired. Pass --url <backend> (and --user <id> when one backend has two accounts)."
+	);
 }
 
 /**
@@ -182,19 +194,20 @@ export async function resolveBackendScope(
  * @returns The canonical backend base URL, or the input unchanged when it does not parse.
  */
 export function canonicalizeBackendUrl(raw: string): string {
-  let url: URL
-  try {
-    url = new URL(raw)
-  } catch {
-    return raw
-  }
-  const pathname = url.pathname.replace(/\/+$/, '')
-  const port =
-    (url.protocol === 'https:' && url.port === '443') || (url.protocol === 'http:' && url.port === '80')
-      ? ''
-      : url.port
-  const host = port ? `${url.hostname.toLowerCase()}:${port}` : url.hostname.toLowerCase()
-  return `${url.protocol}//${host}${pathname}`
+	let url: URL;
+	try {
+		url = new URL(raw);
+	} catch {
+		return raw;
+	}
+	const pathname = url.pathname.replace(/\/+$/, "");
+	const port =
+		(url.protocol === "https:" && url.port === "443") ||
+		(url.protocol === "http:" && url.port === "80")
+			? ""
+			: url.port;
+	const host = port ? `${url.hostname.toLowerCase()}:${port}` : url.hostname.toLowerCase();
+	return `${url.protocol}//${host}${pathname}`;
 }
 
 /**
@@ -212,5 +225,5 @@ export function canonicalizeBackendUrl(raw: string): string {
  * @returns The first matching paired record, or `null`.
  */
 export function findPairedBackend(input: string, state: StateStore): PairedBackend | null {
-  return findPairedScopes(input, state)[0]?.record ?? null
+	return findPairedScopes(input, state)[0]?.record ?? null;
 }

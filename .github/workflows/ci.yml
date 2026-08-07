@@ -1,4 +1,4 @@
-# Quality gate for the OpenCompanion daemon. Runs check-types once and the test suite on every OS,
+# Quality gate for the AgentRunner daemon. Runs check-types once and the test suite on every OS,
 # because the daemon builds OS-specific service definitions (launchd / systemd / Scheduled Task)
 # whose builders are exercised per platform. Every action is pinned to a full commit SHA (the
 # trailing comment records the human-readable version) so a moved tag cannot change what runs.

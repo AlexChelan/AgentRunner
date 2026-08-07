@@ -1,4 +1,4 @@
-import type { LocalAppConfig } from './app-config'
+import type { LocalAppConfig } from "./app-config";
 
 /**
  * The ONE on-device system-prompt composition, shared by every local run shape: the chat composer
@@ -14,5 +14,5 @@ import type { LocalAppConfig } from './app-config'
  * @returns The composed system prompt, or `undefined` when there is nothing to ground.
  */
 export function composeLocalSystemPrompt(config: LocalAppConfig): string | undefined {
-  return config.instructions ? config.instructions : undefined
+	return config.instructions ? config.instructions : undefined;
 }

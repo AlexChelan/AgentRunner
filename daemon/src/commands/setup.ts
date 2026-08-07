@@ -1,11 +1,12 @@
 import { rmSync } from 'node:fs'
-import { DEFAULT_CLIENT_ID, findPairedBackend, resolveBackendScope, resolveBackendUrl } from '@opencompanion/core/runtime/backend-url'
+import { DEFAULT_CLIENT_ID, findPairedBackend, resolveBackendScope, resolveBackendUrl } from '@agentrunner/core/runtime/backend-url'
 import { BRAND } from '../brand'
-import { buildCompanionRegistry } from '@opencompanion/core/runtime/connect'
-import { runPair, runUnpair } from '@opencompanion/core/runtime/pair'
-import { managedCliDir } from '@opencompanion/core/runtime/paths'
+import { buildRunnerRegistry } from '@agentrunner/core/runtime/connect'
+import { runEnroll } from '@agentrunner/core/runtime/enroll'
+import { runPair, runUnpair } from '@agentrunner/core/runtime/pair'
+import { managedCliDir } from '@agentrunner/core/runtime/paths'
 import { installService, uninstallService } from '../service'
-import { messageOf } from '@opencompanion/core/runtime/error-message'
+import { messageOf } from '@agentrunner/core/runtime/error-message'
 import * as ui from '../ui'
 import { connectCliInteractively } from './connect'
 import { buildServiceSpec } from './service'
@@ -15,7 +16,7 @@ import { flagValue, openStores, selectBackendUrl, selectPairedScope } from './sh
  * Runs the one-shot `setup`: pair with the backend (skipping pairing when already paired), connect
  * the user's coding CLIs, then - unless `--app-scoped` - install the always-on OS service. This is the
  * single command an installer chains, so a fresh machine goes from nothing to a running, paired,
- * boot-starting companion in one step. Connect failures are non-fatal (the user can `opencompanion
+ * boot-starting runner in one step. Connect failures are non-fatal (the user can `agentrunner
  * connect` more later); a failed pairing aborts before the service is installed.
  *
  * `--user <id>` picks the account when this machine already has two SaaS logins paired to the backend.
@@ -23,7 +24,7 @@ import { flagValue, openStores, selectBackendUrl, selectPairedScope } from './sh
  * With `--app-scoped` it stops BEFORE installing the boot service: the product app supervises a plain
  * `serve` child itself, so no OS service is installed. Either way the resolved lifecycle mode is
  * recorded locally (never wired) so `status --json` can report how the daemon is supervised; the boot
- * service stays available on demand via `opencompanion service install`.
+ * service stays available on demand via `agentrunner service install`.
  */
 export async function cmdSetup(argv: string[]): Promise<void> {
   ui.intro()
@@ -41,8 +42,21 @@ export async function cmdSetup(argv: string[]): Promise<void> {
     return
   }
 
+  // `--enroll <code>` pairs from a one-time, server-pre-approved enrollment code instead of the
+  // interactive device flow, so an unattended install (the container path) needs no terminal.
+  const enrollFlag = flagValue(argv, '--enroll')
   if (findPairedBackend(backendUrl, state)) {
     ui.line(`Already paired with ${backendUrl}.`)
+  } else if (enrollFlag !== undefined) {
+    const { ok } = await runEnroll(
+      { backendUrl, enrollCode: enrollFlag, clientId: DEFAULT_CLIENT_ID },
+      { state, secrets, write: ui.line }
+    )
+    if (!ok) {
+      ui.p.cancel('Enrollment failed.')
+      process.exit(1)
+      return
+    }
   } else {
     const clientId = flagValue(argv, '--client-id') ?? DEFAULT_CLIENT_ID
     const { ok } = await runPair({ backendUrl, clientId }, { state, secrets, write: ui.line })
@@ -71,7 +85,7 @@ export async function cmdSetup(argv: string[]): Promise<void> {
 
   const baseDir = managedCliDir(appDataRoot)
   const { connected } = await connectCliInteractively({
-    registry: buildCompanionRegistry(baseDir),
+    registry: buildRunnerRegistry(baseDir),
     baseDir,
     state,
     backendUrl: scope,
@@ -83,7 +97,7 @@ export async function cmdSetup(argv: string[]): Promise<void> {
   state.setAppScoped(appScoped)
 
   // App-scoped: the product app supervises a plain `serve` child, so stop before installing the boot
-  // service. The always-on service stays available on demand via `opencompanion service install`.
+  // service. The always-on service stays available on demand via `agentrunner service install`.
   if (appScoped) {
     ui.outro(
       connected > 0
@@ -106,7 +120,7 @@ export async function cmdSetup(argv: string[]): Promise<void> {
 
 /**
  * Runs `uninstall`: stop + remove the OS service, drop every backend pairing (revoking the stored
- * bearer locally), and delete the companion's app-data directory (state, secrets, managed CLIs). A
+ * bearer locally), and delete the runner's app-data directory (state, secrets, managed CLIs). A
  * clean, single-command removal that leaves nothing behind. Idempotent: safe to run when nothing is
  * installed.
  */

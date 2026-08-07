@@ -1,35 +1,35 @@
-import type { AuthStatus } from '../index'
-import type { AuthHealth } from '@opencompanion/protocol'
+import type { AuthStatus } from "../index";
+import type { AuthHealth } from "@agentrunner/protocol";
 
 /** Minimum ms between probes so a burst of dispatch failures cannot hammer the CLI. */
-const DEBOUNCE_MS = 60_000
+const DEBOUNCE_MS = 60_000;
 /** Default slow interval (30 min) - lazy enough to never burn the user's paid quota. */
-const DEFAULT_INTERVAL_MS = 30 * 60_000
+const DEFAULT_INTERVAL_MS = 30 * 60_000;
 
 /** Injected dependencies for {@link createAuthHealthMonitor}. */
 export interface AuthHealthMonitorDeps {
-  /** Probes one connection's CLI auth via the runtime adapter (`adapter.authStatus`). */
-  probe(): Promise<AuthStatus>
-  /** Pushes the resolved health up over the daemon transport (e.g. the poll client's `setAuthHealth`). */
-  report(health: AuthHealth): void
-  /** Slow background interval in ms (default 30 min) to spare subscription quota. */
-  intervalMs?: number
-  /** Scheduler (injectable for tests; defaults to `setInterval`/`clearInterval`). */
-  setTimer?(fn: () => void, ms: number): { clear(): void }
-  /** Clock (injectable for tests; defaults to `Date.now`). */
-  now?(): number
+	/** Probes one connection's CLI auth via the runtime adapter (`adapter.authStatus`). */
+	probe(): Promise<AuthStatus>;
+	/** Pushes the resolved health up over the daemon transport (e.g. the poll client's `setAuthHealth`). */
+	report(health: AuthHealth): void;
+	/** Slow background interval in ms (default 30 min) to spare subscription quota. */
+	intervalMs?: number;
+	/** Scheduler (injectable for tests; defaults to `setInterval`/`clearInterval`). */
+	setTimer?(fn: () => void, ms: number): { clear(): void };
+	/** Clock (injectable for tests; defaults to `Date.now`). */
+	now?(): number;
 }
 
 /** The lazy CLI-auth-health monitor. */
 export interface AuthHealthMonitor {
-  /** The last resolved health (`"unknown"` until the first probe completes). */
-  current(): AuthHealth
-  /** Starts the slow background interval. Idempotent. */
-  start(): void
-  /** Forces an immediate probe (called on a dispatch failure). Debounced. */
-  probeNow(): Promise<AuthHealth>
-  /** Stops the interval. */
-  stop(): void
+	/** The last resolved health (`"unknown"` until the first probe completes). */
+	current(): AuthHealth;
+	/** Starts the slow background interval. Idempotent. */
+	start(): void;
+	/** Forces an immediate probe (called on a dispatch failure). Debounced. */
+	probeNow(): Promise<AuthHealth>;
+	/** Stops the interval. */
+	stop(): void;
 }
 
 /**
@@ -45,56 +45,56 @@ export interface AuthHealthMonitor {
  * @returns The monitor.
  */
 export function createAuthHealthMonitor(deps: AuthHealthMonitorDeps): AuthHealthMonitor {
-  const intervalMs = deps.intervalMs ?? DEFAULT_INTERVAL_MS
-  const now = deps.now ?? Date.now
-  const schedule =
-    deps.setTimer ??
-    ((fn, ms): { clear(): void } => {
-      const id = setInterval(fn, ms)
-      return { clear: () => clearInterval(id) }
-    })
+	const intervalMs = deps.intervalMs ?? DEFAULT_INTERVAL_MS;
+	const now = deps.now ?? Date.now;
+	const schedule =
+		deps.setTimer ??
+		((fn, ms): { clear(): void } => {
+			const id = setInterval(fn, ms);
+			return { clear: () => clearInterval(id) };
+		});
 
-  let health: AuthHealth = 'unknown'
-  let lastProbeAt = 0
-  let timer: { clear(): void } | null = null
-  let inflight: Promise<AuthHealth> | null = null
+	let health: AuthHealth = "unknown";
+	let lastProbeAt = 0;
+	let timer: { clear(): void } | null = null;
+	let inflight: Promise<AuthHealth> | null = null;
 
-  const run = async (): Promise<AuthHealth> => {
-    lastProbeAt = now()
-    try {
-      const status: AuthStatus = await deps.probe()
-      health = status.authenticated ? 'healthy' : 'needs-reauth'
-      deps.report(health)
-    } catch {
-      // Transient probe failure: keep the last known health, never false-flag a re-auth.
-    }
-    return health
-  }
+	const run = async (): Promise<AuthHealth> => {
+		lastProbeAt = now();
+		try {
+			const status: AuthStatus = await deps.probe();
+			health = status.authenticated ? "healthy" : "needs-reauth";
+			deps.report(health);
+		} catch {
+			// Transient probe failure: keep the last known health, never false-flag a re-auth.
+		}
+		return health;
+	};
 
-  const probeNow = async (): Promise<AuthHealth> => {
-    if (inflight) return inflight
-    if (now() - lastProbeAt < DEBOUNCE_MS) return health
-    inflight = run().finally(() => {
-      inflight = null
-    })
-    return inflight
-  }
+	const probeNow = async (): Promise<AuthHealth> => {
+		if (inflight) return inflight;
+		if (now() - lastProbeAt < DEBOUNCE_MS) return health;
+		inflight = run().finally(() => {
+			inflight = null;
+		});
+		return inflight;
+	};
 
-  return {
-    current: () => health,
-    start(): void {
-      if (timer) return
-      // Probe once at startup (presence-based, no spawn - effectively free): a stale
-      // persisted "needs-reauth" self-heals on boot instead of waiting a full interval.
-      void probeNow()
-      timer = schedule(() => {
-        void run()
-      }, intervalMs)
-    },
-    probeNow,
-    stop(): void {
-      timer?.clear()
-      timer = null
-    }
-  }
+	return {
+		current: () => health,
+		start(): void {
+			if (timer) return;
+			// Probe once at startup (presence-based, no spawn - effectively free): a stale
+			// persisted "needs-reauth" self-heals on boot instead of waiting a full interval.
+			void probeNow();
+			timer = schedule(() => {
+				void run();
+			}, intervalMs);
+		},
+		probeNow,
+		stop(): void {
+			timer?.clear();
+			timer = null;
+		}
+	};
 }

@@ -1,7 +1,8 @@
 import { describe, expect, it, vi } from "vitest";
-import { PROVIDER_CATALOG, getProviderSpec, buildLanguageModel } from "../src/index";
+import type { AnthropicProviderSettings } from "@ai-sdk/anthropic";
+import { buildLanguageModel, getProviderSpec, PROVIDER_CATALOG } from "../src/index";
 
-describe("PROVIDER_CATALOG", () => {
+describe("pROVIDER_CATALOG", () => {
 	it("contains the curated providers with unique ids, no groq/mistral, no dropped oauth-only rows", () => {
 		const ids = PROVIDER_CATALOG.map((p) => p.id);
 		expect(new Set(ids).size).toBe(ids.length);
@@ -63,7 +64,11 @@ describe("buildLanguageModel", () => {
 		const createAnthropic = vi.fn(() => factory);
 		vi.doMock("@ai-sdk/anthropic", () => ({ createAnthropic }));
 		const spec = getProviderSpec("minimax")!;
-		await buildLanguageModel(spec, { apiKey: "k", baseUrl: spec.defaultBaseUrl, modelId: "MiniMax-M2" });
+		await buildLanguageModel(spec, {
+			apiKey: "k",
+			baseUrl: spec.defaultBaseUrl,
+			modelId: "MiniMax-M2"
+		});
 		expect(createAnthropic).toHaveBeenCalledWith({
 			authToken: "k",
 			baseURL: "https://api.minimax.io/anthropic/v1"
@@ -101,7 +106,11 @@ describe("buildLanguageModel", () => {
 		const spec = getProviderSpec("deepseek")!;
 		await buildLanguageModel(spec, { apiKey: "k", modelId: "deepseek-chat" });
 		expect(createOpenAICompatible).toHaveBeenCalledWith(
-			expect.objectContaining({ baseURL: "https://api.deepseek.com", apiKey: "k", name: "deepseek" })
+			expect.objectContaining({
+				baseURL: "https://api.deepseek.com",
+				apiKey: "k",
+				name: "deepseek"
+			})
 		);
 	});
 	it("forwards a base-url override to the openrouter transport", async () => {
@@ -140,7 +149,11 @@ describe("buildLanguageModel auth-header fidelity", () => {
 		const createAnthropic = vi.fn(() => model);
 		vi.doMock("@ai-sdk/anthropic", () => ({ createAnthropic }));
 		const spec = getProviderSpec("minimax")!;
-		await buildLanguageModel(spec, { apiKey: "mm-key", baseUrl: spec.defaultBaseUrl, modelId: "MiniMax-M2" });
+		await buildLanguageModel(spec, {
+			apiKey: "mm-key",
+			baseUrl: spec.defaultBaseUrl,
+			modelId: "MiniMax-M2"
+		});
 		expect(createAnthropic).toHaveBeenCalledWith({
 			authToken: "mm-key",
 			baseURL: "https://api.minimax.io/anthropic/v1"
@@ -167,7 +180,11 @@ describe("buildLanguageModel auth-header fidelity", () => {
 		const spec = getProviderSpec("kimi")!;
 		await buildLanguageModel(spec, { apiKey: "sk-legacy", modelId: "moonshot-v1" });
 		expect(createOpenAICompatible).toHaveBeenCalledWith(
-			expect.objectContaining({ baseURL: "https://api.moonshot.ai/v1", apiKey: "sk-legacy", name: "kimi" })
+			expect.objectContaining({
+				baseURL: "https://api.moonshot.ai/v1",
+				apiKey: "sk-legacy",
+				name: "kimi"
+			})
 		);
 	});
 
@@ -231,7 +248,11 @@ describe("buildLanguageModel auth-header fidelity", () => {
 		const createOpenAICompatible = vi.fn(() => model);
 		vi.doMock("@ai-sdk/openai-compatible", () => ({ createOpenAICompatible }));
 		const spec = getProviderSpec("deepseek")!;
-		await buildLanguageModel(spec, { apiKey: "k", modelId: "deepseek-chat", extraHeaders: { "X-Test": "1" } });
+		await buildLanguageModel(spec, {
+			apiKey: "k",
+			modelId: "deepseek-chat",
+			extraHeaders: { "X-Test": "1" }
+		});
 		expect(createOpenAICompatible).toHaveBeenCalledWith(
 			expect.objectContaining({ headers: { "X-Test": "1" } })
 		);
@@ -240,7 +261,7 @@ describe("buildLanguageModel auth-header fidelity", () => {
 
 it("buildLanguageModel sends an OAuth access token as Bearer (never as an apiKey) with any extra headers", async () => {
 	const model = vi.fn(() => "MODEL");
-	const createAnthropic = vi.fn(() => model);
+	const createAnthropic = vi.fn((_options: AnthropicProviderSettings) => model);
 	vi.doMock("@ai-sdk/anthropic", () => ({ createAnthropic }));
 	const spec = getProviderSpec("anthropic")!;
 	// The subscription/OAuth arm of `buildLanguageModel`: an `accessToken` authenticates as `authToken`
@@ -251,14 +272,15 @@ it("buildLanguageModel sends an OAuth access token as Bearer (never as an apiKey
 		modelId: "claude-sonnet-4",
 		extraHeaders: { "anthropic-beta": "oauth-2025-04-20", "x-app": "cli" }
 	});
-	const call = createAnthropic.mock.calls[0][0];
+	const call = createAnthropic.mock.calls[0]?.[0];
+	if (!call) throw new Error("expected createAnthropic to have been called");
 	expect(call.apiKey).toBeUndefined();
 	expect(call.authToken).toBe("sk-ant-oat01-tok");
-	expect(call.headers["anthropic-beta"]).toContain("oauth-2025-04-20");
-	expect(call.headers["x-app"]).toBe("cli");
+	expect(call.headers?.["anthropic-beta"]).toContain("oauth-2025-04-20");
+	expect(call.headers?.["x-app"]).toBe("cli");
 });
 
-describe("OAuth provider specs", () => {
+describe("oAuth provider specs", () => {
 	it("minimax carries a device-code oauth spec with the scope (no client id - that is buyer config)", () => {
 		const oauth = getProviderSpec("minimax")?.oauth;
 		expect(oauth?.flow).toBe("device-code");

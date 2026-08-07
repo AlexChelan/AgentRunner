@@ -1,14 +1,14 @@
 /** Serializes async work per tool id so a single tool's operations never overlap. */
 export interface ToolSerializer {
-  /**
-   * Chains `fn` onto the tool's serial queue: different tool ids run concurrently, but two runs for the
-   * SAME tool id run strictly in enqueue order, so the later-enqueued one starts only after the earlier
-   * one settles.
-   *
-   * @param toolId - The tool whose work serializes.
-   * @param fn - The work to run once the tool's prior work settles.
-   */
-  run(toolId: string, fn: () => Promise<void>): void
+	/**
+	 * Chains `fn` onto the tool's serial queue: different tool ids run concurrently, but two runs for the
+	 * SAME tool id run strictly in enqueue order, so the later-enqueued one starts only after the earlier
+	 * one settles.
+	 *
+	 * @param toolId - The tool whose work serializes.
+	 * @param fn - The work to run once the tool's prior work settles.
+	 */
+	run(toolId: string, fn: () => Promise<void>): void;
 }
 
 /**
@@ -22,12 +22,12 @@ export interface ToolSerializer {
  * @returns A tool serializer.
  */
 export function createToolSerializer(): ToolSerializer {
-  const chains = new Map<string, Promise<void>>()
-  return {
-    run(toolId, fn): void {
-      const prior = chains.get(toolId) ?? Promise.resolve()
-      const next = prior.then(fn).catch(() => undefined)
-      chains.set(toolId, next)
-    }
-  }
+	const chains = new Map<string, Promise<void>>();
+	return {
+		run(toolId, fn): void {
+			const prior = chains.get(toolId) ?? Promise.resolve();
+			const next = prior.then(fn).catch(() => undefined);
+			chains.set(toolId, next);
+		}
+	};
 }

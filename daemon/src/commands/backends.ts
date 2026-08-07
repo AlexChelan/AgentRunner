@@ -1,10 +1,11 @@
-import { parseAccountScope, scopeBackendUrl } from '@opencompanion/core/runtime/account-scope'
+import { parseAccountScope, scopeBackendUrl } from '@agentrunner/core/runtime/account-scope'
 import { BRAND } from '../brand'
+import { isContained } from '../container'
 import { isDaemonRunning } from '../lifecycle'
-import { LOCAL_SCOPE } from '@opencompanion/core/runtime/local/scope'
-import type { TerminalApproval } from '@opencompanion/core/runtime/policies'
+import { LOCAL_SCOPE } from '@agentrunner/core/runtime/local/scope'
+import type { TerminalApproval } from '@agentrunner/core/runtime/policies'
 import { serviceStatus } from '../service'
-import type { StateStore } from '@opencompanion/core/runtime/storage/state-store'
+import type { StateStore } from '@agentrunner/core/runtime/storage/state-store'
 import * as ui from '../ui'
 import { daemonVersion } from '../version'
 import { openStores } from './shared'
@@ -53,7 +54,7 @@ interface StatusJson {
    * entirely - and a missing command is a usage banner and exit 1, which is a dead end for the user
    * unless the app can SEE it coming and name the fix. This field is that signal: it ships in the SAME
    * release those commands do, so a status document WITHOUT it is, exactly, a daemon that cannot open a
-   * terminal session (see the app's `companionSupportsTerminal`). It is additive and non-secret.
+   * terminal session (see the app's `runnerSupportsTerminal`). It is additive and non-secret.
    */
   version: string
   /** This install's stable device id (from the state store). */
@@ -114,40 +115,38 @@ const FLOOR_DISCLOSURE =
 /**
  * The line printed when a connected CLI cannot have that guarantee OS-enforced on this host. Named per
  * CLI, with the reason, because a guarantee that quietly stops holding is worse than one that was never
- * claimed - the user keeps their preferred CLI and is told exactly what it costs.
+ * claimed - a user whose host cannot enforce it is told exactly what it costs there.
  *
- * - Codex has no per-tool disable and its shell is a core tool, so its floor is a sandbox filesystem
- *   deny. That is OS-enforced by seatbelt on macOS and by the sandbox helper on Linux, and by nothing on
- *   Windows.
- * - OpenCode and Hermes are ALLOWED for backend-dispatched work and NOT confined, which makes their
- *   line the one a user actually has to weigh. They are driven over ACP, which exposes no
- *   tool-restriction control at all, so the daemon can only ASK them to stay in the work folder. The
- *   adversarial suite settled what that means on 2026-07-29 against the real binaries: a floored run
- *   reached a file outside the work folder on both, and on Hermes it read `~/.ssh` and printed key
- *   material back. The wording says what was observed rather than what is theoretically possible,
- *   because "may be able to read files" reads as boilerplate and "read ~/.ssh in testing" does not.
+ * Codex is the only connectable CLI this can fire for, and only on one platform class: it has no
+ * per-tool disable and its shell is a core tool, so its floor is a sandbox filesystem deny. That is
+ * OS-enforced by seatbelt on macOS and by the sandbox helper on Linux, and by nothing on Windows. Claude
+ * Code's floor is its own tool base, which holds everywhere.
+ *
+ * A second arm stood here for OpenCode and Hermes, which were allowed for dispatched work and disclosed
+ * as unconfined. Both left the connectable set on 2026-08-02 - a warning is not containment - so neither
+ * can be a connection any more and the arm could never fire. It went with them.
+ *
+ * A CONTAINED daemon reduces nothing, on any platform: the container IS the boundary (no host disk to
+ * reach, and the Codex child drops to an unprivileged uid inside it), so the host platform stops deciding
+ * anything. Warning there would tell a Docker user their files are exposed when they are not.
  *
  * @param toolIds - The tool ids connected on this machine (any scope).
  * @param platform - The host platform (`process.platform`).
+ * @param contained - Whether this daemon runs in a container (defaults to `false`, a native install).
  * @returns One line per CLI whose containment is reduced here, or `[]` when every connected CLI is contained.
  */
-export function reducedContainmentLines(toolIds: readonly string[], platform: string): string[] {
+export function reducedContainmentLines(
+  toolIds: readonly string[],
+  platform: string,
+  contained = false
+): string[] {
+  if (contained) return []
   const connected = new Set(toolIds)
   const lines: string[] = []
   if (connected.has('codex') && platform !== 'darwin' && platform !== 'linux') {
     lines.push(
       'Codex: reduced containment on this host. Its floor needs an OS sandbox, which this platform does not provide, so a Codex run is not prevented from reaching your files.'
     )
-  }
-  for (const [toolId, name] of [
-    ['opencode', 'OpenCode'],
-    ['hermes', 'Hermes']
-  ] as const) {
-    if (connected.has(toolId)) {
-      lines.push(
-        `${name}: NOT CONFINED for app-dispatched work. It offers no way to switch its own file and shell tools off, so this daemon can ask it to stay in the work folder but cannot make it. Testing against the real binary showed a dispatched run reading files outside that folder - on Hermes, the contents of ~/.ssh. A paired app can therefore reach files on this machine through it. Your own terminal sessions are unaffected. Claude Code and Codex are confined; connect one of those for dispatched work if that matters to you.`
-      )
-    }
   }
   return lines
 }
@@ -163,7 +162,7 @@ function printFloorDisclosure(state: StateStore): void {
   const toolIds = [...state.listPairedScopes().map((paired) => paired.scope), LOCAL_SCOPE].flatMap(
     (scope) => state.listConnections(scope).map((connection) => connection.toolId)
   )
-  const reduced = reducedContainmentLines(toolIds, process.platform)
+  const reduced = reducedContainmentLines(toolIds, process.platform, isContained())
   ui.p.note([FLOOR_DISCLOSURE, ...(reduced.length > 0 ? ['', ...reduced] : [])].join('\n'), 'What a paired app can do')
 }
 

@@ -10,42 +10,42 @@
 
 /** Exact operational variable names passed through (case-insensitive match). */
 export const ENV_ALLOWLIST_EXACT: readonly string[] = [
-  'PATH',
-  'HOME',
-  'USER',
-  'LOGNAME',
-  'SHELL',
-  'TERM',
-  'TMPDIR',
-  'TEMP',
-  'TMP',
-  'LANG',
-  'LANGUAGE',
-  'TZ',
-  'HTTP_PROXY',
-  'HTTPS_PROXY',
-  'ALL_PROXY',
-  'NO_PROXY',
-  'NODE_EXTRA_CA_CERTS',
-  'SSL_CERT_FILE',
-  'SSL_CERT_DIR',
-  'COLORTERM',
-  'PATHEXT',
-  'SYSTEMROOT',
-  'WINDIR',
-  'COMSPEC',
-  'SYSTEMDRIVE',
-  'HOMEDRIVE',
-  'HOMEPATH',
-  'USERPROFILE',
-  'APPDATA',
-  'LOCALAPPDATA',
-  'PROGRAMFILES',
-  'PROGRAMFILES(X86)',
-  'PROGRAMDATA',
-  'NUMBER_OF_PROCESSORS',
-  'PROCESSOR_ARCHITECTURE'
-]
+	"PATH",
+	"HOME",
+	"USER",
+	"LOGNAME",
+	"SHELL",
+	"TERM",
+	"TMPDIR",
+	"TEMP",
+	"TMP",
+	"LANG",
+	"LANGUAGE",
+	"TZ",
+	"HTTP_PROXY",
+	"HTTPS_PROXY",
+	"ALL_PROXY",
+	"NO_PROXY",
+	"NODE_EXTRA_CA_CERTS",
+	"SSL_CERT_FILE",
+	"SSL_CERT_DIR",
+	"COLORTERM",
+	"PATHEXT",
+	"SYSTEMROOT",
+	"WINDIR",
+	"COMSPEC",
+	"SYSTEMDRIVE",
+	"HOMEDRIVE",
+	"HOMEPATH",
+	"USERPROFILE",
+	"APPDATA",
+	"LOCALAPPDATA",
+	"PROGRAMFILES",
+	"PROGRAMFILES(X86)",
+	"PROGRAMDATA",
+	"NUMBER_OF_PROCESSORS",
+	"PROCESSOR_ARCHITECTURE"
+];
 
 /**
  * Allowlisted name prefixes (case-insensitive); any var whose name begins with one passes.
@@ -57,16 +57,16 @@ export const ENV_ALLOWLIST_EXACT: readonly string[] = [
  * needs npm config; node resolution for npm-shim CLIs is handled by the
  * node-dir-on-PATH helper, not `npm_config_*`.
  */
-export const ENV_ALLOWLIST_PREFIXES: readonly string[] = ['LC_', 'XDG_']
+export const ENV_ALLOWLIST_PREFIXES: readonly string[] = ["LC_", "XDG_"];
 
-const EXACT_UPPER = new Set(ENV_ALLOWLIST_EXACT.map((n) => n.toUpperCase()))
-const PREFIX_UPPER = ENV_ALLOWLIST_PREFIXES.map((p) => p.toUpperCase())
+const EXACT_UPPER = new Set(ENV_ALLOWLIST_EXACT.map((n) => n.toUpperCase()));
+const PREFIX_UPPER = ENV_ALLOWLIST_PREFIXES.map((p) => p.toUpperCase());
 
 /** True when a variable name is on the operational allowlist (case-insensitive). */
 function isAllowedName(name: string): boolean {
-  const upper = name.toUpperCase()
-  if (EXACT_UPPER.has(upper)) return true
-  return PREFIX_UPPER.some((p) => upper.startsWith(p))
+	const upper = name.toUpperCase();
+	if (EXACT_UPPER.has(upper)) return true;
+	return PREFIX_UPPER.some((p) => upper.startsWith(p));
 }
 
 /**
@@ -79,15 +79,15 @@ function isAllowedName(name: string): boolean {
  * @returns The allowlisted environment (string values only).
  */
 export function buildCliEnv(
-  source: Record<string, string | undefined>,
-  extra: Record<string, string> = {}
+	source: Record<string, string | undefined>,
+	extra: Record<string, string> = {}
 ): Record<string, string> {
-  const out: Record<string, string> = {}
-  for (const [name, value] of Object.entries(source)) {
-    if (typeof value !== 'string') continue
-    if (!isAllowedName(name)) continue
-    out[name] = value
-  }
-  for (const [name, value] of Object.entries(extra)) out[name] = value
-  return out
+	const out: Record<string, string> = {};
+	for (const [name, value] of Object.entries(source)) {
+		if (typeof value !== "string") continue;
+		if (!isAllowedName(name)) continue;
+		out[name] = value;
+	}
+	for (const [name, value] of Object.entries(extra)) out[name] = value;
+	return out;
 }

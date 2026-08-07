@@ -1,12 +1,17 @@
-import { createAuditLog, type AuditLog } from '@opencompanion/core/runtime/audit-log'
-import { resolveBackendScope, type ScopeChoice } from '@opencompanion/core/runtime/backend-url'
-import { type ConnectableToolId } from '@opencompanion/core/runtime/connect'
-import { LOCAL_SCOPE } from '@opencompanion/core/runtime/local/scope'
-import { makeMasterKey } from '@opencompanion/core/runtime/master-key'
-import { appDataDir, auditDir, secretsDir } from '@opencompanion/core/runtime/paths'
-import { createFileSecretStore } from '@opencompanion/core/runtime/storage/secret-store'
-import { createStateStore, type StateStore } from '@opencompanion/core/runtime/storage/state-store'
-import { messageOf } from '@opencompanion/core/runtime/error-message'
+import { flagValue } from '@agentrunner/core/runtime/argv'
+import {  createAuditLog } from '@agentrunner/core/runtime/audit-log'
+import type {AuditLog} from '@agentrunner/core/runtime/audit-log';
+import { resolveBackendScope  } from '@agentrunner/core/runtime/backend-url'
+import type {ScopeChoice} from '@agentrunner/core/runtime/backend-url';
+import type {ConnectableToolId} from '@agentrunner/core/runtime/connect';
+import { envVar } from '../brand'
+import { LOCAL_SCOPE } from '@agentrunner/core/runtime/local/scope'
+import { makeMasterKey } from '@agentrunner/core/runtime/master-key'
+import { appDataDir, auditDir, secretsDir } from '@agentrunner/core/runtime/paths'
+import { createFileSecretStore } from '@agentrunner/core/runtime/storage/secret-store'
+import { createStateStore  } from '@agentrunner/core/runtime/storage/state-store'
+import type {StateStore} from '@agentrunner/core/runtime/storage/state-store';
+import { messageOf } from '@agentrunner/core/runtime/error-message'
 import * as ui from '../ui'
 
 /**
@@ -19,26 +24,35 @@ const VALUELESS_FLAGS = new Set(['--local'])
 /** The connectable CLIs shown in the interactive picker, with friendly labels (one per connectable tool id). */
 export const CLI_OPTIONS: { value: ConnectableToolId; label: string }[] = [
   { value: 'claude-code', label: 'Claude Code' },
-  { value: 'codex', label: 'Codex' },
-  { value: 'opencode', label: 'OpenCode' },
-  { value: 'hermes', label: 'Hermes Agent' }
+  { value: 'codex', label: 'Codex' }
 ]
 
 /**
- * Reads the value following a `--flag` token in argv, or `undefined` when absent.
- *
- * @param argv - The process arguments.
- * @param flag - The flag name (e.g. `"--url"`).
- * @returns The flag's value, or `undefined`.
+ * The shared argv flag reader, re-exported so every command keeps importing it from `./shared` while
+ * the desktop runtime fork reads the same implementation.
  */
-export function flagValue(argv: string[], flag: string): string | undefined {
-  const index = argv.indexOf(flag)
-  if (index === -1) return undefined
-  return argv[index + 1]
+export { flagValue }
+
+/**
+ * The one-time enrollment code this invocation was given: the `--enroll <code>` flag, else the
+ * brand-scoped `<PREFIX>_ENROLL` environment variable - the form a container image passes it in, since
+ * its entrypoint takes no arguments. A blank value reads as absent, so an image that DECLARES the
+ * variable without setting it (a compose `environment:` entry) boots as an ordinary unpaired daemon
+ * instead of reporting a failed redemption on every start.
+ *
+ * Deliberately NOT used by `pair`/`setup`: those pair on an explicit, interactive request, where a
+ * stale code left in the environment must never silently replace the device-authorization flow.
+ *
+ * @param argv - The process arguments (the command is `argv[0]`).
+ * @returns The enrollment code, or `undefined` when none was given.
+ */
+export function enrollCodeArg(argv: string[]): string | undefined {
+  const value = flagValue(argv, '--enroll') ?? process.env[envVar('ENROLL')]
+  return value === undefined || value.trim() === '' ? undefined : value
 }
 
 /**
- * Reads EVERY value following a repeated `--flag` token in argv, in order (empty when the flag is
+ * Returns EVERY value following a repeated `--flag` token in argv, in order (empty when the flag is
  * absent). Used by the flags a command may take more than once (`mcp add --arg`, `--env`), where
  * {@link flagValue} would silently keep only the first.
  *
@@ -115,7 +129,7 @@ export function openAuditLog(appDataRoot: string): AuditLog {
 }
 
 /**
- * The interactive backend picker {@link import('@opencompanion/core/runtime/backend-url').resolveBackendUrl} uses when several
+ * The interactive backend picker {@link import('@agentrunner/core/runtime/backend-url').resolveBackendUrl} uses when several
  * backends are paired and no `--url` was given: an arrow-key select styled like the rest of the CLI.
  * Throws (so the command aborts with the `--url` hint) when the user cancels, since no backend can be
  * chosen.
@@ -163,7 +177,7 @@ export async function selectPairedScope(choices: ScopeChoice[]): Promise<string>
  * `const scope = await resolveCommandScope(...); if (scope === undefined) return`.
  *
  * Callers that require a pairing must skip that check when the returned scope is local
- * ({@link import('@opencompanion/core/runtime/local/scope').isLocalScope}); an explicit `--url` that matches no pairing comes
+ * ({@link import('@agentrunner/core/runtime/local/scope').isLocalScope}); an explicit `--url` that matches no pairing comes
  * back as the canonical URL, which is what makes their own "Not paired with X" line read correctly.
  *
  * @param argv - The command argv (read for `--local`, `--url` and `--user`).
