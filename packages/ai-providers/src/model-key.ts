@@ -1,5 +1,5 @@
 /**
- * The browser-safe model-selection key codec, shared by every frontend's model picker
+ * The browser-safe model-selection key codec, shared by every model picker
  * AND the backend run resolvers so the key contract has a SINGLE definition that can
  * never drift. A model key encodes its provider next to its provider-native model id
  * (`provider::modelId`) so a stored selection round-trips without the registry: the
