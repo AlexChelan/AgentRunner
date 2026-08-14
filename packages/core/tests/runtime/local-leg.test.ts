@@ -10,6 +10,7 @@ import type {
 	ConnectionRef,
 	DetectResult,
 	ModelInfo,
+	RuntimeRunRequest,
 	RuntimeToolAdapter
 } from "../../src/index";
 import { afterEach, describe, expect, it } from "vitest";
@@ -18,7 +19,7 @@ import { DRIVE_HOST } from "../../src/runtime/local/drive-server";
 import { loadLocalAppConfig } from "../../src/runtime/local/app-config";
 import { startLocalLeg } from "../../src/runtime/local/local-leg";
 import type { LocalLeg } from "../../src/runtime/local/local-leg";
-import { auditDir } from "../../src/runtime/paths";
+import { auditDir, localDataDir } from "../../src/runtime/paths";
 import { createFileSecretStore } from "../../src/runtime/storage/secret-store";
 import { createStateStore } from "../../src/runtime/storage/state-store";
 import type { StateStore } from "../../src/runtime/storage/state-store";
@@ -60,6 +61,7 @@ function deps(): {
 	secrets: ReturnType<typeof createFileSecretStore>;
 	audit: ReturnType<typeof createAuditLog>;
 	serviceUnitPresent: () => boolean;
+	launchIdentity: { productId: string; productName: string };
 	version: string;
 	socketPath: string;
 	write: (line: string) => void;
@@ -86,6 +88,7 @@ function deps(): {
 		// Exactly what the shell's former defaults produced under vitest: no OS service unit is installed,
 		// and `daemonVersion()` falls back to '0.0.0-dev' with tsup's version define absent.
 		serviceUnitPresent: () => false,
+		launchIdentity: { productId: "demo", productName: "Demo" },
 		version: "0.0.0-dev",
 		socketPath: socketFor(),
 		write: (line) => void lines.push(line)
@@ -173,6 +176,21 @@ function fakeAdapter(
 		listModels: async (): Promise<ModelInfo[]> => [],
 		run: (): never => {
 			throw new Error("never run in this test");
+		}
+	};
+}
+
+/**
+ * An installed, signed-in adapter that RECORDS every request it is driven with and completes the run at
+ * once - so a case can prove where a run really landed, through the whole booted leg.
+ */
+function recordingAdapter(id: string, reqs: RuntimeRunRequest[]): RuntimeToolAdapter {
+	return {
+		...fakeAdapter(id, { installed: true, authenticated: true }),
+		run: (req, _ctx, _resolvers, emit) => {
+			reqs.push(req);
+			emit({ type: "done" });
+			return { cancel: () => undefined, respondToPermission: () => undefined };
 		}
 	};
 }
@@ -510,5 +528,108 @@ describe("startLocalLeg - CLI catalog + in-app connect", () => {
 		expect(JSON.parse(connectRes.text)).toEqual({ status: "needs-login" });
 		// A signed-out CLI is never recorded, so it stays out of the runnable connection list.
 		expect(JSON.parse((await drive(leg, "GET", "/v1/tools")).text)).toEqual({ tools: [] });
+	});
+
+	it("writes an accepted connected-folder grant under local/, where runs cannot read it", async () => {
+		// The store root is the wiring this pins: moved anywhere else, the grant document leaves the tree
+		// that is on every run's `denyReadPaths` and every route suite stays green regardless.
+		const d = deps();
+		writeFileSync(
+			join(d.appDataRoot, "app-config.json"),
+			JSON.stringify({
+				productId: "demo",
+				productName: "Demo",
+				projectScoped: true,
+				projectsEnabled: true
+			})
+		);
+		const leg = await startLocalLeg(d);
+		running.push(leg);
+		// A sibling of the app-data root, so it is neither inside the protected tree nor an ancestor of it.
+		const target = mkdtempSync(join(tmpdir(), "runner-leg-folder-"));
+		const project = "AbC123xYz456AbC123xYz456AbC12345";
+
+		const put = await drive(
+			leg,
+			"PUT",
+			"/v1/connected-folders",
+			JSON.stringify({ project, path: target })
+		);
+		expect(put.status).toBe(200);
+		expect(existsSync(join(localDataDir(d.appDataRoot), "connected-folders.json"))).toBe(true);
+
+		const read = await drive(leg, "GET", `/v1/connected-folders?project=${project}`);
+		expect(JSON.parse(read.text)).toEqual({ path: JSON.parse(put.text).path });
+	});
+
+	it("runs a project's chat AND its automation in the folder it connected, and audits that folder", async () => {
+		// The positive control for the whole seam, through a REAL booted leg: consent (the PUT), then a chat
+		// turn and an unattended fire, both landing in the user's folder rather than the managed work tree,
+		// and both recorded there. It is also the wiring pin for the automation runner's grant seam - dropped
+		// from `local-leg`, every runner and drive-server suite stays green and only this fails.
+		const d = deps();
+		const reqs: RuntimeRunRequest[] = [];
+		d.registry = registryOf({ codex: recordingAdapter("codex", reqs) });
+		writeFileSync(
+			join(d.appDataRoot, "app-config.json"),
+			JSON.stringify({
+				productId: "demo",
+				productName: "Demo",
+				projectScoped: true,
+				projectsEnabled: true,
+				defaultCli: "codex"
+			})
+		);
+		const leg = await startLocalLeg(d);
+		running.push(leg);
+		expect((await drive(leg, "POST", "/v1/tools/codex/connect")).status).toBe(200);
+
+		const project = "AbC123xYz456AbC123xYz456AbC12345";
+		const target = mkdtempSync(join(tmpdir(), "runner-leg-folder-"));
+		const put = await drive(
+			leg,
+			"PUT",
+			"/v1/connected-folders",
+			JSON.stringify({ project, path: target })
+		);
+		expect(put.status).toBe(200);
+		const granted: string = JSON.parse(put.text).path;
+
+		const chat = await drive(
+			leg,
+			"POST",
+			"/v1/chat",
+			JSON.stringify({
+				namespace: `u1-${project}`,
+				sessionId: "s1",
+				prompt: "go",
+				cli: "codex",
+				project
+			})
+		);
+		expect(chat.status).toBe(200);
+
+		const created = await drive(
+			leg,
+			"PUT",
+			`/v1/automations/new?project=${project}`,
+			JSON.stringify({ name: "Nightly", prompt: "do it", intervalMinutes: 60, enabled: true })
+		);
+		expect(created.status).toBe(200);
+		const automationId: string = JSON.parse(created.text).automation.id;
+		const fired = await drive(
+			leg,
+			"POST",
+			`/v1/automations/${automationId}/run-now?project=${project}`
+		);
+		expect(fired.status).toBe(202);
+
+		// Both runs really executed, and both executed in the connected folder - never `work/local-<id>/demo`.
+		expect(reqs).toHaveLength(2);
+		expect(reqs.map((req) => req.cwd)).toEqual([granted, granted]);
+		// And the trust log says so: an entry naming the managed sandbox would be a false record.
+		const dispatched = d.audit.read().filter((entry) => entry.event === "dispatched");
+		expect(dispatched).toHaveLength(2);
+		expect(dispatched.map((entry) => entry.detail?.cwd)).toEqual([granted, granted]);
 	});
 });

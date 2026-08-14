@@ -20,17 +20,17 @@ function root(): string {
 }
 
 describe("resolveWorkFolder (confined)", () => {
-	it("creates work/<backendKey>/<productId>/ under the app-data root", () => {
+	it("creates work/<workKey>/<productId>/ under the app-data root", () => {
 		const appDataRoot = root();
-		const dir = resolveWorkFolder({ appDataRoot, backendKey: "be1", productId: "p1" });
+		const dir = resolveWorkFolder({ appDataRoot, workKey: "be1", productId: "p1" });
 		expect(dir).toBe(join(appDataRoot, "work", "be1", "p1"));
 		expect(existsSync(dir)).toBe(true);
 	});
 
 	it("nests distinct backends under distinct keys", () => {
 		const appDataRoot = root();
-		const a = resolveWorkFolder({ appDataRoot, backendKey: "be1", productId: "p1" });
-		const b = resolveWorkFolder({ appDataRoot, backendKey: "be2", productId: "p1" });
+		const a = resolveWorkFolder({ appDataRoot, workKey: "be1", productId: "p1" });
+		const b = resolveWorkFolder({ appDataRoot, workKey: "be2", productId: "p1" });
 		expect(a).not.toBe(b);
 		expect(a).toBe(join(appDataRoot, "work", "be1", "p1"));
 		expect(b).toBe(join(appDataRoot, "work", "be2", "p1"));
@@ -39,34 +39,34 @@ describe("resolveWorkFolder (confined)", () => {
 	it("rejects a productId that escapes the backend key folder", () => {
 		const appDataRoot = root();
 		expect(() =>
-			resolveWorkFolder({ appDataRoot, backendKey: "be1", productId: "../secrets" })
+			resolveWorkFolder({ appDataRoot, workKey: "be1", productId: "../secrets" })
 		).toThrow(/confined/i);
 	});
 
 	it("rejects an absolute productId", () => {
 		const appDataRoot = root();
-		expect(() => resolveWorkFolder({ appDataRoot, backendKey: "be1", productId: "/etc" })).toThrow(
+		expect(() => resolveWorkFolder({ appDataRoot, workKey: "be1", productId: "/etc" })).toThrow(
 			/confined/i
 		);
 	});
 
-	it("rejects a crafted backendKey that escapes the work root", () => {
+	it("rejects a crafted workKey that escapes the work root", () => {
 		const appDataRoot = root();
-		expect(() => resolveWorkFolder({ appDataRoot, backendKey: "../x", productId: "p1" })).toThrow(
+		expect(() => resolveWorkFolder({ appDataRoot, workKey: "../x", productId: "p1" })).toThrow(
 			/confined/i
 		);
 	});
 
-	it("rejects a backendKey that introduces a nested subdirectory", () => {
+	it("rejects a workKey that introduces a nested subdirectory", () => {
 		const appDataRoot = root();
-		expect(() => resolveWorkFolder({ appDataRoot, backendKey: "a/b", productId: "p1" })).toThrow(
+		expect(() => resolveWorkFolder({ appDataRoot, workKey: "a/b", productId: "p1" })).toThrow(
 			/confined/i
 		);
 	});
 
 	it("never returns the app-data root itself (the parent holds secrets)", () => {
 		const appDataRoot = root();
-		const dir = resolveWorkFolder({ appDataRoot, backendKey: "be1", productId: "p1" });
+		const dir = resolveWorkFolder({ appDataRoot, workKey: "be1", productId: "p1" });
 		expect(dir).not.toBe(appDataRoot);
 		expect(dir).toBe(join(appDataRoot, "work", "be1", "p1"));
 	});
@@ -81,12 +81,12 @@ describe("resolveWorkFolder (container agent share)", () => {
 		const shares: [string, number, number, number][] = [];
 		const dir = resolveWorkFolder({
 			appDataRoot,
-			backendKey: "be1",
+			workKey: "be1",
 			productId: "p1",
 			agent: { uid: 1000, gid: 1000 },
 			share: (path, uid, gid, mode) => void shares.push([path, uid, gid, mode])
 		});
-		// The per-backend namespace dir is created by the same mkdir, so a run that could not reach it
+		// The per-work-key namespace dir is created by the same mkdir, so a run that could not reach it
 		// could not use its product folder. Ownership stays with the daemon: without CAP_DAC_OVERRIDE a
 		// parent handed to the agent is one the daemon can no longer mkdir the NEXT product folder in.
 		// The parent is STICKY (0o1770): its entries are all daemon-owned, and sticky is what stops a run
@@ -98,12 +98,12 @@ describe("resolveWorkFolder (container agent share)", () => {
 		]);
 	});
 
-	it("gives the per-backend parent the sticky bit and the leaf none", () => {
+	it("gives the per-work-key parent the sticky bit and the leaf none", () => {
 		const appDataRoot = root();
 		const shares: [string, number][] = [];
 		resolveWorkFolder({
 			appDataRoot,
-			backendKey: "be1",
+			workKey: "be1",
 			productId: "p1",
 			agent: { uid: 1000, gid: 1000 },
 			share: (path, _uid, _gid, mode) => void shares.push([path, mode])
@@ -118,15 +118,15 @@ describe("resolveWorkFolder (container agent share)", () => {
 		"lets the daemon still create a SIBLING product folder after the share",
 		() => {
 			// The REAL share (no seam), so this exercises the no-follow open + fchown/fchmod. A hand-over
-			// would leave the per-backend parent unwritable by the daemon, and the second product's run
+			// would leave the per-work-key parent unwritable by the daemon, and the second product's run
 			// folder could never be created. Runs unprivileged: the share targets this process's own gid.
 			const appDataRoot = root();
 			const agent = { uid: 1000, gid: process.getgid?.() ?? 0 };
-			const first = resolveWorkFolder({ appDataRoot, backendKey: "be1", productId: "p1", agent });
+			const first = resolveWorkFolder({ appDataRoot, workKey: "be1", productId: "p1", agent });
 			// The share really happened (this is what makes the sibling assertion meaningful).
 			expect(statSync(join(appDataRoot, "work", "be1")).mode & 0o7777).toBe(0o1770);
 			expect(statSync(first).mode & 0o7777).toBe(0o770);
-			const second = resolveWorkFolder({ appDataRoot, backendKey: "be1", productId: "p2", agent });
+			const second = resolveWorkFolder({ appDataRoot, workKey: "be1", productId: "p2", agent });
 			expect(existsSync(second)).toBe(true);
 			expect(statSync(second).mode & 0o7777).toBe(0o770);
 		}
@@ -139,13 +139,13 @@ describe("resolveWorkFolder (container agent share)", () => {
 			// the NEXT run's share must refuse it rather than chmod the secrets tree open.
 			const appDataRoot = root();
 			const agent = { uid: 1000, gid: process.getgid?.() ?? 0 };
-			const dir = resolveWorkFolder({ appDataRoot, backendKey: "be1", productId: "p1", agent });
+			const dir = resolveWorkFolder({ appDataRoot, workKey: "be1", productId: "p1", agent });
 			const secrets = join(appDataRoot, "secrets");
 			mkdirSync(secrets, { recursive: true, mode: 0o700 });
 			rmSync(dir, { recursive: true, force: true });
 			symlinkSync(secrets, dir);
 
-			resolveWorkFolder({ appDataRoot, backendKey: "be1", productId: "p1", agent });
+			resolveWorkFolder({ appDataRoot, workKey: "be1", productId: "p1", agent });
 
 			expect(statSync(secrets).mode & 0o7777).toBe(0o700);
 			expect(statSync(secrets).mode & 0o070).toBe(0);
@@ -168,7 +168,7 @@ describe("resolveWorkFolder (container agent share)", () => {
 			const leaf = join(appDataRoot, "work", "be1", "future");
 			symlinkSync(outside, leaf);
 
-			const dir = resolveWorkFolder({ appDataRoot, backendKey: "be1", productId: "future" });
+			const dir = resolveWorkFolder({ appDataRoot, workKey: "be1", productId: "future" });
 
 			expect(dir).toBe(leaf);
 			expect(lstatSync(dir).isSymbolicLink()).toBe(false);
@@ -184,7 +184,7 @@ describe("resolveWorkFolder (container agent share)", () => {
 		mkdirSync(join(appDataRoot, "work", "be1"), { recursive: true });
 		writeFileSync(join(appDataRoot, "work", "be1", "p1"), "not a directory");
 
-		const dir = resolveWorkFolder({ appDataRoot, backendKey: "be1", productId: "p1" });
+		const dir = resolveWorkFolder({ appDataRoot, workKey: "be1", productId: "p1" });
 
 		expect(statSync(dir).isDirectory()).toBe(true);
 	});
@@ -194,7 +194,7 @@ describe("resolveWorkFolder (container agent share)", () => {
 		const shares: string[] = [];
 		const dir = resolveWorkFolder({
 			appDataRoot,
-			backendKey: "be1",
+			workKey: "be1",
 			productId: "p1",
 			share: (path) => void shares.push(path)
 		});
@@ -206,7 +206,7 @@ describe("resolveWorkFolder (container agent share)", () => {
 		const appDataRoot = root();
 		const dir = resolveWorkFolder({
 			appDataRoot,
-			backendKey: "be1",
+			workKey: "be1",
 			productId: "p1",
 			agent: { uid: 1000, gid: 1000 },
 			share: () => {

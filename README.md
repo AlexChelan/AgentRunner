@@ -22,7 +22,7 @@ single work folder, and records what it did to a log only it can write.
   backend asks for. You do not configure this and a backend cannot raise it. A run that asks for egress
   gets it, so the CLI keeps its own web tools; one that asks for nothing stays off the network.
 - **You can refuse a whole class of work.** `agentrunner origin` decides whether this machine
-  accepts scheduled or app-dispatched runs at all, per backend. See [docs/confinement.md](docs/confinement.md).
+  accepts automation or app-dispatched runs at all, per backend. See [docs/confinement.md](docs/confinement.md).
 - **Work-folder confinement.** Each backend's runs are pinned to one `work/<product>/` folder.
   The rest of your machine, including AgentRunner's own data and secrets, is off-limits, and any
   MCP server a backend tries to push is dropped. Enforced by the daemon, not trusted to the backend.
@@ -75,8 +75,8 @@ not code-signed yet, so SmartScreen may warn on first run until signing lands; t
 ```sh
 agentrunner setup --url https://your-saas.example/api   # pair + connect CLIs + install the service
 agentrunner backends                                    # list paired backends and their state
-agentrunner origin show                                 # does this machine accept scheduled / dispatched work
-agentrunner origin set --url https://your-saas.example/api --schedule deny --dispatch deny
+agentrunner origin show                                 # does this machine accept automation / dispatched work
+agentrunner origin set --url https://your-saas.example/api --automation deny --dispatch deny
 agentrunner status                                      # pairing + per-CLI connection state
 ```
 
@@ -97,8 +97,8 @@ agentrunner status                                      # pairing + per-CLI conn
 | `status` | Print pairing and per-CLI connection state. |
 | `backends` | List paired backends with device id, connected CLIs, and daemon state. |
 | `log [--url <backend>] [-n <count>] [--json]` | Print this machine's local audit trail. |
-| `origin [show] [--url <backend>]` | Show whether this machine accepts scheduled and app-dispatched work. |
-| `origin set --url <backend> [--schedule <allow\|deny>] [--dispatch <allow\|deny>]` | Refuse a class of work here. |
+| `origin [show] [--url <backend>]` | Show whether this machine accepts automation and app-dispatched work. |
+| `origin set --url <backend> [--automation <allow\|deny>] [--dispatch <allow\|deny>]` | Refuse a class of work here. |
 | `serve [--url <backend>] [--if-paired]` | Run the daemon in the foreground. |
 | `service <install\|uninstall\|status>` | Manage the always-on OS service. |
 | `update [--check\|--rollback\|--auto <on\|off>]` | Update now, check, roll back, or toggle auto-updates. |

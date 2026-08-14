@@ -1,3 +1,4 @@
+import { isAbsolute } from "node:path";
 import { makeRunContext } from "../index";
 import type { ConnectionRef, RunContext, RunContextResolvers, RuntimeRunRequest } from "../index";
 import { clampPolicy, comparePermissionModes } from "@agentrunner/protocol";
@@ -16,6 +17,22 @@ export interface BuildRunOpts {
 	appDataRoot: string;
 	/** The paired-backend key namespacing the work tree (`work/<backendKey>/<productId>/`). */
 	backendKey: string;
+	/**
+	 * Overrides ONLY the work-folder segment (`work/<key>/<productId>/`) for this run. Every posture
+	 * decision (the floor, the local-scope raise) keeps reading `backendKey` - a project workspace relocates
+	 * the folder, never the trust posture.
+	 */
+	workKey?: string;
+	/**
+	 * The project's CONNECTED folder - a real folder of the user's, outside the managed `work/` tree - which
+	 * becomes this run's cwd INSTEAD of the work folder. Already re-resolved and re-judged by the dispatch
+	 * site ({@link connectedFolderForRun}); absent for every other run, which keeps the managed folder.
+	 *
+	 * It overrides the cwd and NOTHING else. The work folder still resolves first (that is what validates the
+	 * `productId` and hardens the leaf), the posture is still read from `backendKey`, and the folder is never
+	 * handed to the agent identity - see {@link buildRun}.
+	 */
+	connectedFolder?: string;
 	/** The dispatched run descriptor. */
 	start: RunStart;
 	/** The resolved connection (tool + auth mode) to drive. */
@@ -59,7 +76,7 @@ export interface BuiltRun {
 
 /**
  * Raises the on-device LOCAL leg's permission mode UP to at least `auto-edit`, leaving a higher mode
- * (`full`) unchanged - but only when the ceiling permits it. The desktop app's chats and schedules
+ * (`full`) unchanged - but only when the ceiling permits it. The desktop app's chats and automations
  * compose no policy of their own, so {@link clampPolicy} resolves them to the unattended `read-only`
  * default, under which the CLIs that map the mode to a static sandbox (Codex/OpenCode) refuse every
  * write and the app's assistant cannot edit anything. An EXPLICIT `read-only` ceiling is the one
@@ -126,6 +143,12 @@ function localLegPermission(mode: PermissionMode, ceiling: PermissionMode): Perm
  * and nothing to look up - and it FAILS CLOSED: anything that is not the on-device local leg is a
  * dispatched run.
  *
+ * {@link BuildRunOpts.workKey} does NOT participate in any of that. It relocates the work FOLDER only (the
+ * local leg's project workspaces run under `work/local-<projectId>/`), while `backendKey` stays the sole
+ * input to the floor and to the local-scope raise. The two are deliberately separate: `local-<projectId>` is
+ * not the LOCAL pseudo-scope string, so a single field driving both would floor every project workspace's chat
+ * into a read-only agent, and a paired backend could not lift its floor by naming a local-looking key.
+ *
  * A dispatched run IS its clamp: `DISPATCHED_POLICY.permissionMode` is the bottom of the ladder, so
  * `clampPolicy` has already landed it there whatever the run asked for, and re-stating the mode
  * afterwards would make that constant decide nothing.
@@ -139,18 +162,41 @@ function localLegPermission(mode: PermissionMode, ceiling: PermissionMode): Perm
  * (`contained` + `agentUid`/`agentGid`): the daemon creates it as root while the CLI child drops to that
  * uid, which could otherwise traverse but not write its own cwd. Off a contained host nothing changes.
  *
+ * {@link BuildRunOpts.connectedFolder} - the project's own real folder, judged at dispatch - REPLACES the
+ * cwd, and only the cwd. The work folder still resolves FIRST (it is what refuses a crafted `productId` and
+ * hardens the leaf, and the terminal path already grounds this way), the posture keeps reading `backendKey`,
+ * the read denies are unchanged, and the connected folder is NEVER handed to the agent identity: it belongs
+ * to the user, so chowning its group or widening its mode would be the daemon rewriting permissions on a
+ * folder it does not own, for a container identity that is not running on the desktop host this feature
+ * ships to. The `ctx` and the request therefore both carry the EFFECTIVE cwd, which is what the executor
+ * records in the audit entry.
+ *
  * @param opts - The descriptor, connection, resolvers, and optional containment identity.
  * @returns The prepared run.
+ * @throws When `connectedFolder` is not an absolute path (a relative cwd would anchor against whatever
+ *   directory this daemon happens to hold), or when the work folder cannot be resolved.
  */
 export function buildRun(opts: BuildRunOpts): BuiltRun {
-	const cwd = resolveWorkFolder({
+	// FIRST, and unconditionally - a connected folder replaces the RESULT, never the resolution. This is
+	// what refuses a crafted `productId`, hardens the leaf, and (on a contained host) shares the managed
+	// tree, and all of that has to happen whether or not this particular run ends up somewhere else.
+	const workFolder = resolveWorkFolder({
 		appDataRoot: opts.appDataRoot,
-		backendKey: opts.backendKey,
+		workKey: opts.workKey ?? opts.backendKey,
 		productId: opts.start.productId,
 		...(opts.contained && opts.agentUid !== undefined && opts.agentGid !== undefined
 			? { agent: { uid: opts.agentUid, gid: opts.agentGid } }
 			: {})
 	});
+	if (opts.connectedFolder !== undefined && !isAbsolute(opts.connectedFolder)) {
+		throw new Error(
+			`Connected folder must be an absolute path: refused "${opts.connectedFolder}"`
+		);
+	}
+	// The EFFECTIVE cwd - what the CLI is actually started in, and therefore what the run context and the
+	// audit entry record. A run in the user's own folder recorded as the managed one would be a false entry
+	// in the log the user opens to ask where their agent has been.
+	const cwd = opts.connectedFolder ?? workFolder;
 	const floored = !isLocalScope(opts.backendKey);
 	const ceiling = floored ? DISPATCHED_POLICY : LOCAL_TERMINAL_POLICY;
 	const clamped = clampPolicy(ceiling, opts.start.policy);

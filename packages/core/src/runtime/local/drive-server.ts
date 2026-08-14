@@ -4,15 +4,16 @@ import { rmSync, statSync } from "node:fs";
 import { createServer } from "node:http";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { connect } from "node:net";
+import { isAbsolute } from "node:path";
 import { isConnectableToolId, RunImageSchema } from "@agentrunner/protocol";
 import type { ConnectableToolId, RunConversationMsg, RunEventMsg } from "@agentrunner/protocol";
 import { z } from "zod";
 import type { RunHooks } from "../executor";
-import type { BuiltInScheduleSpec, LocalAppConfig } from "./app-config";
+import type { BuiltInAutomationSpec, LocalAppConfig } from "./app-config";
 import { assertSessionKey } from "./chat-store";
 import type { LocalChatStore } from "./chat-store";
 import type { LocalSession } from "./local-session";
-import type { ScheduleRunner } from "./schedule-runner";
+import type { AutomationRunner } from "./automation-runner";
 import {
 	cadenceOf,
 	displayNextRunAtMs,
@@ -21,10 +22,16 @@ import {
 	MAX_CRON_LENGTH,
 	MIN_INTERVAL_MINUTES,
 	toCadence
-} from "./schedule-cadence";
-import type { ScheduleCadence } from "./schedule-cadence";
-import type { LocalSchedule, LocalScheduleRunState, LocalScheduleStore } from "./schedule-store";
-import type { LocalTaskOverrideStore } from "./task-overrides";
+} from "./automation-cadence";
+import type { AutomationCadence } from "./automation-cadence";
+import type { LocalAutomation, LocalAutomationRunState, LocalAutomationStore } from "./automation-store";
+import { refuseConnectedFolder } from "./connected-folder-deny";
+import type { ConnectedFolderDenyDeps, ConnectedFolderVerdict } from "./connected-folder-deny";
+import { connectedFolderForRun } from "./connected-folder-run";
+import type { ConnectedFolderStore } from "./connected-folders";
+import { resolveExistingFolder } from "../folder-grants";
+import { isValidProjectId, PROJECT_ID_PATTERN, workspaceWorkKey } from "./workspace-scope";
+import type { WorkspaceAutomationStores, WorkspaceTaskOverrideStores } from "./workspace-stores";
 
 /** The first NDJSON frame of a chat stream: the started run's id (no run has emitted an event yet). */
 export interface RunStartedMsg {
@@ -38,8 +45,8 @@ export type LocalChatStreamFrame = RunStartedMsg | RunEventMsg | RunConversation
 
 /**
  * The daemon's supervision lifecycle, as `GET /v1/health` reports it so the desktop app can label
- * schedules honestly: `background` when this machine's always-on OS service supervises the daemon (it
- * keeps firing schedules with the app closed), else `app-scoped` (the app supervises it, so it stops
+ * automations honestly: `background` when this machine's always-on OS service supervises the daemon (it
+ * keeps firing automations with the app closed), else `app-scoped` (the app supervises it, so it stops
  * when the app quits). Read FRESH per request from the OS service state.
  */
 export type LocalLifecycle = "app-scoped" | "background";
@@ -104,12 +111,33 @@ export interface LocalDriveDeps {
 	session: LocalSession;
 	/** The daemon-owned chat store the CRUD routes read/write (Task 5). */
 	chats: LocalChatStore;
-	/** The daemon-owned per-device task-override store the `/v1/task-overrides` routes read/write (Task 7). */
-	taskOverrides: LocalTaskOverrideStore;
-	/** The daemon-owned schedule store the `/v1/schedules` routes read/write (user schedules + built-in overrides + run state). */
-	schedules: LocalScheduleStore;
-	/** The schedule runner powering `POST /v1/schedules/<id>/run-now` (it shares the tick's single-flight + cap). */
-	scheduleRunner: Pick<ScheduleRunner, "runNow">;
+	/**
+	 * The per-workspace task-override stores the `/v1/task-overrides` routes read/write. The request's
+	 * `?project=` picks the workspace; absent means the no-project bucket, the legacy root document
+	 * unchanged.
+	 */
+	taskOverrides: WorkspaceTaskOverrideStores;
+	/**
+	 * The per-workspace automation stores the `/v1/automations` routes read/write (user automations + built-in
+	 * overrides + run state), plus the project allowlist `PUT /v1/workspaces` replaces. The request's
+	 * `?project=` picks the workspace; absent means the no-project bucket, the legacy root documents unchanged.
+	 */
+	automations: WorkspaceAutomationStores;
+	/**
+	 * The per-project connected-folder grants the `/v1/connected-folders` routes read, write and revoke. A
+	 * grant is a durable capability, so the PUT judges its folder with {@link refuseConnectedFolder} before
+	 * anything reaches this store, and persists the verdict's CANONICAL path rather than the request's.
+	 */
+	connectedFolders: ConnectedFolderStore;
+	/**
+	 * The deny predicate's roots, resolved ONCE by the daemon from its OWN environment
+	 * (`resolveConnectedFolderDenyDeps`). This process is the AUTHORITY on what a project may be bound to:
+	 * the Electron main dialog checks first for fast feedback, but main and this fork can resolve different
+	 * roots on a relocated install, so main's acceptance is not binding and a disagreement fails here.
+	 */
+	connectedFolderDeny: ConnectedFolderDenyDeps;
+	/** The automation runner powering `POST /v1/automations/<id>/run-now` (it shares the tick's single-flight + cap). */
+	automationRunner: Pick<AutomationRunner, "runNow">;
 	/** Reads the on-device product config FRESH per request, so a live edit applies to the next call. */
 	config: () => LocalAppConfig;
 	/** Projects the LOCAL-scope CLI connections for `/v1/tools` (`{ toolId, authHealth, images }`). */
@@ -152,6 +180,13 @@ export interface LocalDriveDeps {
 	 * state), so a service installed/removed after boot is reflected without restarting the daemon.
 	 */
 	lifecycle: () => LocalLifecycle;
+	/**
+	 * The product identity the runtime was LAUNCHED with, used by `/v1/health` when the on-device config
+	 * cannot be read. Health is the app's adoption probe - a non-200 there reads as "not my runtime" and
+	 * takes the whole AI surface down - so it must be able to name itself without the config. Every other
+	 * route keeps reading the config and failing closed; this is the one answer that has to survive.
+	 */
+	launchIdentity: { productId: string; productName: string };
 	/** The daemon version reported by `/v1/health`. */
 	version: string;
 	/**
@@ -176,8 +211,85 @@ const PUT_BODY_CAP = 2 * 1024 * 1024;
 const RENAME_BODY_CAP = 64 * 1024;
 /** The task-overrides body cap (a per-device map of task id -> model key + effort is small). */
 const TASK_OVERRIDES_BODY_CAP = 32 * 1024;
-/** The schedule PUT body cap (a single schedule's editable fields, or a built-in's `{ enabled }`, is tiny). */
-const SCHEDULES_BODY_CAP = 32 * 1024;
+/** The automation PUT body cap (a single automation's editable fields, or a built-in's `{ enabled }`, is tiny). */
+const AUTOMATIONS_BODY_CAP = 32 * 1024;
+
+/**
+ * The workspace-allowlist body cap, its OWN constant rather than the automations one because the document is
+ * a different shape: {@link WorkspacesBody} admits 500 project ids, and 500 at the 64-character maximum
+ * serialize to roughly 33KB - past a 32KB cap, so the documented ceiling was unreachable and a user with
+ * enough projects got a silent 413 for a push the schema calls valid. 64KB clears the widest body the
+ * schema admits with room to spare, and the schema's own `max(500)` remains the real ceiling.
+ */
+const WORKSPACES_BODY_CAP = 64 * 1024;
+
+/** The connected-folder PUT body cap (one project id plus one filesystem path). */
+const CONNECTED_FOLDER_BODY_CAP = 16 * 1024;
+
+/**
+ * The largest assistant reply the daemon holds in memory per chat turn for the DETACHED-run salvage, in
+ * bytes. Matches the automated-run collector's ceiling; it bounds what this handler retains, never what it
+ * streams to an attached client.
+ */
+const MAX_SALVAGED_TEXT_BYTES = 64 * 1024;
+
+/** Maximum derived chat title length, mirroring ui's `MAX_TITLE` (chat-session-store.ts). */
+const MAX_CHAT_TITLE = 60;
+
+/**
+ * The refusal a route gives when it needs the on-device config and cannot read one. 503, not 500: the
+ * fault is transient by nature (the app re-stages the document, and the runtime re-reads it per request),
+ * so the client should come back rather than treat the runtime as broken. Every config-sensitive route
+ * answers this shape; the project-scope gate adds why it needed the config to its own copy.
+ */
+const CONFIG_UNREADABLE_ERROR = "the on-device config is unreadable";
+
+/**
+ * The project id a chat namespace NAMES, or `null` when it names none. `chatNamespace` builds a
+ * project namespace as `<userId>-<projectId>`, so the candidate is the segment after the LAST dash.
+ *
+ * The SHAPE ALONE IS NOT PROOF, which is why this only returns a candidate. The ids both sides mint are pure
+ * alphanumerics, but a buyer may mint their own user ids - and ids like `usr-a1b2c3d4e5f6` match this grammar
+ * exactly while naming no workspace at all. The caller must confirm the candidate against the workspaces
+ * this device actually runs before treating it as a project; refusing on the shape would 400 every
+ * no-project chat such a buyer's users send.
+ *
+ * @param namespace - The chat namespace from the request.
+ * @returns The trailing project-shaped segment, or `null` when the namespace has none.
+ */
+function namespaceProjectCandidate(namespace: string): string | null {
+	const dash = namespace.lastIndexOf("-");
+	if (dash <= 0) return null;
+	const tail = namespace.slice(dash + 1);
+	return isValidProjectId(tail) ? tail : null;
+}
+
+/**
+ * One salvaged transcript turn, in ui's `ChatViewMessage` shape (chat-view-message.ts). ui is NOT imported
+ * (the daemon must not depend on a frontend package), so this is a deliberate local mirror - the same
+ * posture {@link LocalChatStore}'s session type takes. Only `text` parts are ever produced here.
+ */
+interface SalvagedChatMessage {
+	/** Stable id for the app's list keys. */
+	id: string;
+	/** Who authored the turn. */
+	role: "user" | "assistant";
+	/** The rendered segments; a salvaged turn is always one text segment. */
+	parts: { kind: "text"; text: string }[];
+}
+
+/**
+ * Derives a chat title from the user prompt, mirroring ui's `deriveTitle` (chat-session-store.ts) so a
+ * transcript the daemon had to write itself is labelled the way the app would have labelled it, instead of
+ * showing as untitled in the switcher.
+ *
+ * @param prompt - The prompt the turn was fired with.
+ * @returns The trimmed title, truncated to {@link MAX_CHAT_TITLE}.
+ */
+function deriveChatTitle(prompt: string): string {
+	const text = prompt.trim();
+	return text.length > MAX_CHAT_TITLE ? `${text.slice(0, MAX_CHAT_TITLE).trimEnd()}...` : text;
+}
 
 /**
  * How long the pre-listen probe waits for a socket already at the path to accept or refuse. It is a local
@@ -215,7 +327,14 @@ const ChatBody = z
 		 * take. Absent still means the model's native behaviour.
 		 */
 		effort: z.string().min(1).optional(),
-		images: z.array(RunImageSchema).max(MAX_CHAT_IMAGES).optional()
+		images: z.array(RunImageSchema).max(MAX_CHAT_IMAGES).optional(),
+		/**
+		 * The project workspace this turn belongs to; absent means the no-project bucket, whose
+		 * dispatch stays byte-identical to the pre-workspace one. Present, it must AGREE with `namespace`
+		 * (which is `<userId>-<project>` for a project workspace) and it is the ONLY thing the run's work key
+		 * is derived from - a request string never travels to the session as a work key.
+		 */
+		project: z.string().regex(PROJECT_ID_PATTERN).optional()
 	})
 	// A turn needs SOMETHING to send: non-empty text, or at least one image (an image-only turn carries no
 	// caption). Rejecting an empty-and-imageless turn keeps the old `prompt.min(1)` guarantee.
@@ -256,28 +375,28 @@ const TaskOverrideSchema = z
 const TaskOverridesBody = z.object({ overrides: z.record(z.string(), TaskOverrideSchema) });
 
 /**
- * One schedule as `GET /v1/schedules` returns it (and the `PUT` response): a built-in spec (`builtIn: true`,
- * its EFFECTIVE enabled after any stored override, no per-fire cli/model/effort) or a user schedule
- * (`builtIn: false`, its full editable fields), each with its {@link LocalScheduleRunState}. The desktop app
- * renders this shape directly. Its cadence is the flat {@link ScheduleCadence} union, so a cron schedule
+ * One automation as `GET /v1/automations` returns it (and the `PUT` response): a built-in spec (`builtIn: true`,
+ * its EFFECTIVE enabled after any stored override, no per-fire cli/model/effort) or a user automation
+ * (`builtIn: false`, its full editable fields), each with its {@link LocalAutomationRunState}. The desktop app
+ * renders this shape directly. Its cadence is the flat {@link AutomationCadence} union, so a cron automation
  * travels as `cron` (plus an optional `timezone`) where an interval one travels as `intervalMinutes`.
  */
-export type MergedSchedule = {
+export type MergedAutomation = {
 	/**
-	 * The origin this schedule lives at: always `'local'`, the wire's honest marker that this drive answers
+	 * The origin this automation lives at: always `'local'`, the wire's honest marker that this drive answers
 	 * ONLY the on-device store and never fetches from a backend. A constant, not a discriminant - it is here
 	 * so a client can say where a row came from without inferring it from which endpoint it called.
 	 */
 	origin: "local";
-	/** The schedule id (a built-in's spec id, or a user schedule's daemon-minted id). */
+	/** The automation id (a built-in's spec id, or a user automation's daemon-minted id). */
 	id: string;
 	/** Display name. */
 	name: string;
 	/** The prompt fired on each due tick. */
 	prompt: string;
-	/** The EFFECTIVE enabled flag (a built-in's stored override or spec default; a user schedule's own flag). */
+	/** The EFFECTIVE enabled flag (a built-in's stored override or spec default; a user automation's own flag). */
 	enabled: boolean;
-	/** Whether this is a product built-in (`true`) or a user schedule (`false`). */
+	/** Whether this is a product built-in (`true`) or a user automation (`false`). */
 	builtIn: boolean;
 	/** The connection/tool id a USER fire uses (built-ins carry none). */
 	cli?: string;
@@ -291,18 +410,18 @@ export type MergedSchedule = {
 	 * unparseable expression staged in the config), so a client renders no next run rather than a wrong one.
 	 */
 	nextRunAt?: string;
-	/** The last-run record for the schedule (an empty object when it has never run). */
-	runState: LocalScheduleRunState;
-} & ScheduleCadence;
+	/** The last-run record for the automation (an empty object when it has never run). */
+	runState: LocalAutomationRunState;
+} & AutomationCadence;
 
 /**
- * The `PUT /v1/schedules/<id>` body for a USER schedule (the editable fields; the path id carries identity).
+ * The `PUT /v1/automations/<id>` body for a USER automation (the editable fields; the path id carries identity).
  * The cadence is EXACTLY one of `intervalMinutes` or `cron`, with `timezone` admitted only beside a cron -
- * the twin of the web's `createScheduleSchema`. `cron` carries the non-empty rule because
+ * the twin of the web's `createAutomationSchema`. `cron` carries the non-empty rule because
  * {@link isValidCron} deliberately does not: the parser reads the empty string as an every-minute
  * expression, so this length guard is the only thing between a blank field and a minutely fire.
  */
-const UserScheduleBody = z
+const UserAutomationBody = z
 	.object({
 		name: z.string().min(1),
 		prompt: z.string().min(1),
@@ -335,8 +454,27 @@ const UserScheduleBody = z
 		message: "timezone is only meaningful beside a cron"
 	});
 
-/** The `PUT /v1/schedules/<id>` body for a BUILT-IN id: strictly `{ enabled }` (any other shape is a 400). */
+/** The `PUT /v1/automations/<id>` body for a BUILT-IN id: strictly `{ enabled }` (any other shape is a 400). */
 const BuiltInEnabledBody = z.object({ enabled: z.boolean() }).strict();
+
+/**
+ * The `PUT /v1/workspaces` body: the FULL project allowlist the daemon's unattended tick is permitted to
+ * run. Bounded at 500 entries because every allowlisted workspace is walked each tick - the allowlist is the
+ * whole answer, never intersected with what is on disk - so an unbounded list would be an unbounded
+ * per-tick cost. An empty array clears it (no workspace ticks at all in a project-scoped product).
+ */
+const WorkspacesBody = z.object({
+	projects: z.array(z.string().regex(PROJECT_ID_PATTERN)).max(500)
+});
+
+/**
+ * The `PUT /v1/connected-folders` body. Deliberately LOOSE - two plain strings, no id pattern and no
+ * absolute-path refinement - because each way a folder can be unusable gets its OWN 400 from the handler:
+ * an id shape refusal, a relative path, a folder that does not exist, and a protected folder are four
+ * different things for the desktop to say, and a schema-level `regex` would collapse them into one message
+ * with no refusal code attached.
+ */
+const ConnectedFolderBody = z.object({ project: z.string(), path: z.string() });
 
 /**
  * Whether a value is a safe single path segment by the chat store's rule: the charset AND not all-dots.
@@ -426,19 +564,19 @@ function send404(res: ServerResponse): void {
 }
 
 /**
- * The ISO `nextRunAt` a schedule projection carries, as a spreadable fragment: the
+ * The ISO `nextRunAt` an automation projection carries, as a spreadable fragment: the
  * {@link displayNextRunAtMs} instant, or NO key at all when a cron cadence cannot be projected (an
  * unparseable expression staged in the config, which the store's own rows can never hold). Purely
  * computed - the list route must never arm anything, which would race the runner it is polled beside.
  *
- * @param cadence - The schedule's cadence.
+ * @param cadence - The automation's cadence.
  * @param runState - Its stored run state (its last run, and any instant the runner armed).
  * @param nowMs - The response's single clock read.
  * @returns `{ nextRunAt }`, or `{}` when there is nothing to project.
  */
 function nextRunAtOf(
-	cadence: ScheduleCadence,
-	runState: LocalScheduleRunState,
+	cadence: AutomationCadence,
+	runState: LocalAutomationRunState,
 	nowMs: number
 ): { nextRunAt?: string } {
 	const at = displayNextRunAtMs(
@@ -478,41 +616,107 @@ function decodeSeg(seg: string): string | null {
  * (an in-app headless connect under the local scope), `GET /v1/tools/<toolId>/models` (the per-CLI model
  * catalog the desktop picker reads), `POST /v1/chat` (an NDJSON run stream), `POST
  * /v1/runs/<runId>/cancel`, the five `/v1/chats` CRUD ops, `GET`/`PUT /v1/task-overrides` (the per-device
- * task-override document, full-document replace), and the `/v1/schedules` surface: `GET` (the merged
- * built-in + user schedules with run state), `PUT /v1/schedules/<id>` (a user upsert whose response
+ * task-override document, full-document replace), `PUT /v1/workspaces` (replaces the project allowlist the
+ * automation runner's unattended tick reads), `GET`/`PUT`/`DELETE /v1/connected-folders` (one project's
+ * durable folder grant), and the `/v1/automations` surface: `GET` (the merged
+ * built-in + user automations with run state), `PUT /v1/automations/<id>` (a user upsert whose response
  * carries the daemon-MINTED id, or a built-in enabled-override that accepts only `{ enabled }`), `DELETE
- * /v1/schedules/<id>` (user only; a built-in is 400), and `POST /v1/schedules/<id>/run-now` (the runner's
+ * /v1/automations/<id>` (user only; a built-in is 400), and `POST /v1/automations/<id>/run-now` (the runner's
  * `started`/`busy`/`unknown`/`failed` mapped to 202/409/404/500). Body caps (chat
- * 20MB, PUT 2MB, task-overrides 32KB, schedules 32KB) apply AFTER auth and answer 413
- * cleanly. A `/v1/chat` turn resumes from the stored conversation id, persists a fresh one when the run
- * reports it, and refuses a second concurrent turn on the same `namespace:sessionId` with 409 (released when
- * the run closes). EVERY turn runs on a coding CLI: the runtime holds no model credential of its own and
+ * 20MB, PUT 2MB, task-overrides 32KB, automations 32KB, workspaces 64KB - wide enough for the 500 project
+ * ids the allowlist schema admits) apply AFTER auth and answer 413 cleanly.
+ *
+ * Every automation and task-override route is WORKSPACE-ADDRESSED by an optional `?project=` (the `/v1/chat`
+ * body carries the same value as a `project` field): absent or empty is the no-project bucket, whose paths,
+ * bodies and dispatch stay byte-identical to the pre-workspace surface, while a valid project id addresses
+ * that workspace's own documents. An unusable id is `400 {"error":"invalid project"}`; a project on a device
+ * whose config is not `projectScoped` is `400 {"error":"projects are not enabled"}`; and a project whose
+ * config cannot be READ is a 503 - the same fail-safe posture a possibly-built-in PUT/DELETE takes, so an
+ * unreadable config can never admit a workspace, and a project-less request still proceeds. A chat turn's two
+ * halves must AGREE in BOTH directions, else 400: a `project` whose namespace does not end `-<project>`, and
+ * a namespace whose trailing segment names an ALLOWLISTED project with no `project` beside it - the first
+ * would run one workspace's chat in another's work tree, the second would file the transcript in a
+ * workspace whose runs went to the no-project tree. The reverse check needs the project-scope flag AND an
+ * allowlist hit, never the namespace's shape alone: a buyer minting user ids like `usr-a1b2c3d4e5f6`
+ * would otherwise have every project-less chat refused. The run's work key is DERIVED from the validated
+ * project - a request string never travels to the session as one.
+ *
+ * A turn for a project that has CONNECTED a folder runs in THAT folder instead of the managed work tree.
+ * The stored grant is re-resolved and re-judged on every turn (see {@link connectedFolderForRun}), gated on
+ * the staged `projectsEnabled` flag, and a grant that can no longer be honoured REFUSES the turn with a
+ * terminal error frame - the request never falls back to the managed folder.
+ *
+ * A `/v1/chat` turn resumes from the stored conversation id, persists a fresh one when the run
+ * reports it, and refuses a second concurrent turn on the same `namespace:sessionId` with
+ * `409 {"error":...,"runId":<the holding run>}` - the id makes the refusal actionable (cancel or await that
+ * run) instead of a dead end. That refusal
+ * follows the RUN, not the stream: a client that walks away releases the stream while the run keeps going,
+ * so the session stays busy until the run closes (or immediately, when it was refused and never started).
+ * A turn whose client detached mid-run is SALVAGED on close - the daemon appends the user prompt and the
+ * assistant reply to the stored transcript itself, because the app's save effect (the only writer while a
+ * client is attached, and one that persists a SETTLED turn) went away with the window. A turn the client
+ * watched to completion is never appended here; the app persists that one, and a second write would
+ * duplicate it.
+ * EVERY turn runs on a coding CLI: the runtime holds no model credential of its own and
  * talks to no hosted provider directly, so the only credentials on this device are the user's own CLI
- * logins. The schedule
- * list read is GUARDED - a broken on-device config omits the built-ins yet still serves user schedules -
+ * logins. The automation
+ * list read is GUARDED - a broken on-device config omits the built-ins yet still serves user automations -
  * while a PUT/DELETE of a possibly-built-in id under a broken config fails SAFE with 503, so a config
- * fault can never let a built-in be edited or deleted as a user schedule. That list is also strictly
+ * fault can never let a built-in be edited or deleted as a user automation. That list is also strictly
  * READ-ONLY: every row carries a computed `nextRunAt` off ONE clock read, and nothing is armed or written
  * there - the desktop polls it every 30 seconds, so a write would race the runner that owns the arming.
  *
- * @param deps - The local session, chat/task-override/schedule stores, schedule runner, config reader, connection projection, version, and the socket to listen on.
+ * The `/v1/connected-folders` routes carry a REQUIRED `?project=` (the PUT carries it in the body) and split
+ * their gating by DIRECTION: all three need the project-scope flag, the PUT additionally needs the projects
+ * FEATURE staged on, while the GET stays readable so an inert grant is still displayable and the DELETE is
+ * allowed regardless - revocation is strictly de-privileging and must never wait on a feature flag. The PUT
+ * is the AUTHORITY on which folders may be bound: it re-checks the absolute-path shape, re-resolves the
+ * folder, and re-judges it with the deny predicate whatever the Electron main dialog decided, answering a
+ * distinct 400 per class (a refusal carries the predicate's `code` for the desktop to translate) and storing
+ * the verdict's CANONICAL path rather than the one it was sent.
+ *
+ * @param deps - The local session, chat/task-override/automation/connected-folder stores, automation runner, config reader, connection projection, version, and the socket to listen on.
  * @returns The bound handle: its socket path, bearer token, and a disposer.
  */
 export async function startLocalDriveServer(deps: LocalDriveDeps): Promise<LocalDriveHandle> {
-	const { session, chats, taskOverrides, schedules, scheduleRunner, socketPath } = deps;
+	const { session, chats, taskOverrides, automations, automationRunner, socketPath } = deps;
 	const token = crypto.randomUUID();
-	// In-flight chat turns, keyed `namespace:sessionId`. A second turn on a live key is refused (409);
-	// the key is released when the run closes, so the next turn on that session proceeds.
-	const inFlight = new Set<string>();
+	// In-flight chat turns, keyed `namespace:sessionId`, valued by the id of the run holding the key (the
+	// empty string in the synchronous window before the run has started). A second turn on a live key is
+	// refused (409) and the refusal NAMES that run, so the client can cancel or await it instead of being
+	// told only that it may not proceed. The key tracks the RUN, not the response that started it, so it is
+	// released when the run closes (or right away when no run was ever started).
+	const inFlight = new Map<string, string>();
+
+	// Chat runs the user EXPLICITLY stopped, by run id. A cancel is not a detach: the client asked for the
+	// turn to end, so the app has already settled it and written whatever arrived - or deleted the
+	// conversation outright - and a salvage on top would either duplicate the partial reply or write a
+	// deleted conversation back to disk. Entries are added only for a run currently holding a chat key (so
+	// a cancel aimed at a finished or automated run cannot accumulate here) and removed at its `onClose`.
+	const cancelledRuns = new Set<string>();
 
 	const health = (res: ServerResponse): void => {
-		const cfg = deps.config();
+		// The ONE route that must answer even when the on-device config does not. The app probes health to
+		// decide whether the runtime on this socket is its own; a 500 reads as a foreign process, adoption
+		// fails, and every AI surface dies pointing at the wrong cause. So an unreadable config degrades to
+		// the identity the fork was launched with, and reports the fault as a field instead of a status code.
+		let identity = deps.launchIdentity;
+		let configUnreadable = false;
+		try {
+			const cfg = deps.config();
+			identity = { productId: cfg.productId, productName: cfg.productName };
+		} catch {
+			configUnreadable = true;
+		}
 		sendJson(res, 200, {
 			ok: true,
 			version: deps.version,
-			productId: cfg.productId,
-			productName: cfg.productName,
+			productId: identity.productId,
+			productName: identity.productName,
 			lifecycle: deps.lifecycle(),
+			// A fault report, so it is OMITTED when there is no fault: a client never has to read a `false`
+			// to learn that nothing is wrong.
+			...(configUnreadable ? { configUnreadable: true } : {}),
 			// The count a client needs to answer "is this runtime doing anything?" for a runtime it did NOT
 			// fork - the login-started case, where the app holds no child handle and no session count. Chat
 			// turns in flight are ADDED to the session count rather than deduplicated against it: an
@@ -580,7 +784,20 @@ export async function startLocalDriveServer(deps: LocalDriveDeps): Promise<Local
 		if (!isSafeKey(id)) return sendJson(res, 400, { error: "invalid id" });
 		if (parsed.data.session.id !== id)
 			return sendJson(res, 400, { error: "session id does not match the path id" });
-		chats.save(parsed.data.namespace, parsed.data.session);
+		try {
+			chats.save(parsed.data.namespace, parsed.data.session);
+		} catch (err) {
+			// The store's prune reads the buyer's chat cap through the on-device config, so an unreadable one
+			// surfaces HERE as a save failure. Classify it rather than answering an opaque 500: a config fault
+			// is the retryable 503 every sibling route gives, while a real store failure stays a 500, which is
+			// the honest answer for it. The extra read happens only on the failure path.
+			try {
+				deps.config();
+			} catch {
+				return sendJson(res, 503, { error: CONFIG_UNREADABLE_ERROR });
+			}
+			throw err;
+		}
 		sendJson(res, 200, { ok: true });
 	};
 
@@ -599,17 +816,256 @@ export async function startLocalDriveServer(deps: LocalDriveDeps): Promise<Local
 	};
 
 	const cancel = (res: ServerResponse, runId: string): void => {
+		// Remember an explicit stop so the run's own `onClose` can tell it from a client that merely walked
+		// away. Only a run currently holding a chat key is remembered: the app cancels best-effort (a stop
+		// on an already-finished run is a deliberate no-op), and marking one whose `onClose` has been and
+		// gone - or an automated run, which never salvages - would leave an entry nothing ever removes.
+		if ([...inFlight.values()].includes(runId)) cancelledRuns.add(runId);
 		session.cancel(runId);
 		sendJson(res, 202, { ok: true });
 	};
 
-	const getTaskOverrides = (res: ServerResponse): void => {
-		sendJson(res, 200, { overrides: taskOverrides.read() });
+	/**
+	 * A config reader that parses AT MOST ONCE, replaying the same value - or rethrowing the same failure -
+	 * to every later call. The daemon reads the on-device config FRESH per request by design, so a
+	 * re-staged config applies to the next one; what this removes is a single response paying for the same
+	 * file parse more than once, and the chance that two reads within one response straddle a re-stage and
+	 * answer with half of each. Hand one of these to every helper serving a single request.
+	 *
+	 * @returns A reader over one snapshot of the on-device config.
+	 */
+	const configOnce = (): (() => LocalAppConfig) => {
+		let outcome: { ok: true; config: LocalAppConfig } | { ok: false; error: unknown } | undefined;
+		return () => {
+			if (outcome === undefined) {
+				try {
+					outcome = { ok: true, config: deps.config() };
+				} catch (error) {
+					outcome = { ok: false, error };
+				}
+			}
+			if (!outcome.ok) throw outcome.error;
+			return outcome.config;
+		};
 	};
 
-	const putTaskOverrides = async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
+	/**
+	 * Whether the on-device config admits project workspaces AT ALL, for a request that carries one. Read
+	 * FRESH and guarded exactly as {@link classify} is: an unreadable config answers 503 rather than guessing
+	 * a flag that decides whether a second workspace exists, and a device that does not scope by project
+	 * answers 400. `!== true` so an install staged by an older app (no flag) is fail-closed to the no-project
+	 * bucket. Writes the refusal itself; a project-less request never reaches here, so the unscoped
+	 * surface is untouched.
+	 *
+	 * Named for what it DEMANDS rather than for the field it reads, deliberately: a helper one letter from
+	 * `projectScoped` would read as a mirror of the flag, and the next edit would be tempted to point it at
+	 * `projectsEnabled` - a different question entirely (see {@link LocalAppConfig}).
+	 *
+	 * @param res - The response to write a refusal to.
+	 * @param readConfig - The request's config reader; defaults to a read of its own for a route that needs
+	 *   no second look at the config.
+	 * @returns Whether the caller may proceed with the project it was given.
+	 */
+	const requireProjectScope = (res: ServerResponse, readConfig = deps.config): boolean => {
+		let scoped: boolean;
+		try {
+			scoped = readConfig().projectScoped === true;
+		} catch {
+			sendJson(res, 503, {
+				error: "cannot determine whether projects are enabled; the on-device config is unreadable"
+			});
+			return false;
+		}
+		if (!scoped) {
+			sendJson(res, 400, { error: "projects are not enabled" });
+			return false;
+		}
+		return true;
+	};
+
+	/**
+	 * Reads, validates and gates the optional `?project=` query param.
+	 *
+	 * @param url - The request URL.
+	 * @param res - The response a refusal is written to.
+	 * @param readConfig - The request's config reader, passed on to {@link requireProjectScope} so a route
+	 *   that also needs the config parses it once for both.
+	 * @returns `null` for the no-project bucket (absent or empty, always allowed), the validated project id, or
+	 *   `undefined` once a refusal has been sent (an invalid id, or a project on a device that does not scope
+	 *   by project) - in which case the caller must return without touching a store.
+	 */
+	const projectParam = (
+		url: URL,
+		res: ServerResponse,
+		readConfig = deps.config
+	): string | null | undefined => {
+		const raw = url.searchParams.get("project");
+		if (raw === null || raw === "") return null;
+		if (!isValidProjectId(raw)) {
+			sendJson(res, 400, { error: "invalid project" });
+			return undefined;
+		}
+		return requireProjectScope(res, readConfig) ? raw : undefined;
+	};
+
+	/**
+	 * Whether the PROJECTS FEATURE itself is enabled on this device, for a route that may only act when it
+	 * is. Distinct from {@link requireProjectScope}, which asks whether the local data plane scopes by
+	 * project at all: a multi-tenant build with the project surfaces OFF is scoped but not enabled, and must
+	 * not gain a connected folder no UI can show or revoke. Guarded identically - an unreadable config is the
+	 * same retryable 503 - and `!== true` so an install staged by an older app fails closed.
+	 *
+	 * The 503 arm is DEFENSIVE AND CURRENTLY UNREACHABLE: the one caller gates on {@link requireProjectScope}
+	 * first, which shares the same memoized config read and so answers ITS 503 before this helper runs. It
+	 * stays because the gate must fail closed for any future route that needs the feature flag WITHOUT the
+	 * scope flag - not because anything exercises it today.
+	 *
+	 * @param res - The response to write a refusal to.
+	 * @param readConfig - The request's config reader, so a route that also gated on scope parses once.
+	 * @returns Whether the caller may proceed.
+	 */
+	const requireProjectsEnabled = (res: ServerResponse, readConfig = deps.config): boolean => {
+		let enabled: boolean;
+		try {
+			enabled = readConfig().projectsEnabled === true;
+		} catch {
+			sendJson(res, 503, {
+				error:
+					"cannot determine whether the projects feature is enabled; the on-device config is unreadable"
+			});
+			return false;
+		}
+		if (!enabled) {
+			sendJson(res, 400, { error: "the projects feature is not enabled" });
+			return false;
+		}
+		return true;
+	};
+
+	/**
+	 * Reads, validates and gates the REQUIRED `?project=` of the connected-folder routes.
+	 *
+	 * Unlike {@link projectParam} there is no no-project bucket to fall back to: a grant is per project by
+	 * construction, so an absent or empty param is as unusable as a malformed one and gets the same 400
+	 * rather than silently addressing some device-wide grant that does not exist.
+	 *
+	 * @param url - The request URL.
+	 * @param res - The response a refusal is written to.
+	 * @param readConfig - The request's config reader, passed on to {@link requireProjectScope}.
+	 * @returns The validated project id, or `undefined` once a refusal has been sent.
+	 */
+	const requiredProjectParam = (
+		url: URL,
+		res: ServerResponse,
+		readConfig = deps.config
+	): string | undefined => {
+		const raw = url.searchParams.get("project") ?? "";
+		if (!isValidProjectId(raw)) {
+			sendJson(res, 400, { error: "invalid project" });
+			return undefined;
+		}
+		return requireProjectScope(res, readConfig) ? raw : undefined;
+	};
+
+	/**
+	 * The folder connected to one project, or `null`. Readable whenever the device scopes by project and NOT
+	 * gated on `projectsEnabled`: a grant that has gone inert behind a buyer's flip still has to be
+	 * DISPLAYABLE, or the folder row shows nothing where a standing (if unconsulted) binding exists.
+	 */
+	const getConnectedFolder = (res: ServerResponse, url: URL): void => {
+		const project = requiredProjectParam(url, res);
+		if (project === undefined) return;
+		sendJson(res, 200, { path: deps.connectedFolders.get(project) });
+	};
+
+	/**
+	 * Records one project's connected folder - the AUTHORITY for that decision, whatever the Electron main
+	 * dialog decided first.
+	 *
+	 * Validation runs in a fixed order, each class its own 400: the id shape, the two gates, the
+	 * absolute-path SHAPE (checked here rather than left to `resolveExistingFolder`, whose `resolve()` would
+	 * anchor a relative path against whatever cwd this fork happens to hold - the authority must not depend
+	 * on a coincidence to fail closed), the folder's existence, and finally the deny predicate.
+	 *
+	 * The predicate THROWS on a root that is not absolute, which is a misconfiguration of this daemon rather
+	 * than a fault in the request - but it is still a folder that could not be judged, so it is a 400 of its
+	 * own class and never a 500 that would read as "retry this and it might work".
+	 *
+	 * What is STORED and returned is the verdict's canonical path, never the request's: a lexical `..` after
+	 * a symlinked component canonicalizes to a different folder than the OS would enter, so persisting the
+	 * input would let an allowed verdict authorize a folder nobody granted.
+	 */
+	const putConnectedFolder = async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
+		const raw = await readBody(req, CONNECTED_FOLDER_BODY_CAP);
+		if (raw === null) return sendJson(res, 413, { error: "request body too large" });
+		const parsed = ConnectedFolderBody.safeParse(parseJson(raw));
+		if (!parsed.success) return sendJson(res, 400, { error: "invalid connected folder request" });
+		const { project, path } = parsed.data;
+		// ONE parse of the config for the two gates below.
+		const readConfig = configOnce();
+		if (!isValidProjectId(project)) return sendJson(res, 400, { error: "invalid project" });
+		if (!requireProjectScope(res, readConfig)) return;
+		if (!requireProjectsEnabled(res, readConfig)) return;
+		if (!isAbsolute(path))
+			return sendJson(res, 400, { error: "the connected folder must be an absolute path" });
+		let resolved: string;
+		try {
+			resolved = resolveExistingFolder(path);
+		} catch (err) {
+			// The resolver's own message names the path and why it is unusable ("no such folder", "not a
+			// folder"), which is exactly what the folder row should show.
+			return sendJson(res, 400, { error: err instanceof Error ? err.message : String(err) });
+		}
+		let verdict: ConnectedFolderVerdict;
+		try {
+			verdict = refuseConnectedFolder(resolved, deps.connectedFolderDeny);
+		} catch (err) {
+			return sendJson(res, 400, {
+				error: `cannot check the folder against the protected set: ${
+					err instanceof Error ? err.message : String(err)
+				}`
+			});
+		}
+		if (verdict.refusal !== null) {
+			// The CODE is the contract - the desktop maps it to translated copy. `detail` is English by
+			// construction (agent-core has no i18n) and rides along as a diagnostic only.
+			return sendJson(res, 400, {
+				error: "this folder cannot be connected",
+				code: verdict.refusal.code,
+				detail: verdict.refusal.detail
+			});
+		}
+		deps.connectedFolders.set(project, verdict.path);
+		sendJson(res, 200, { path: verdict.path });
+	};
+
+	/**
+	 * Revokes one project's grant, idempotently. NOT gated on `projectsEnabled`, deliberately: revocation is
+	 * strictly de-privileging, and a device whose buyer has just turned the feature off is exactly where a
+	 * standing folder capability most needs to be removable.
+	 */
+	const deleteConnectedFolder = (res: ServerResponse, url: URL): void => {
+		const project = requiredProjectParam(url, res);
+		if (project === undefined) return;
+		deps.connectedFolders.remove(project);
+		sendJson(res, 200, { ok: true });
+	};
+
+	const getTaskOverrides = (res: ServerResponse, url: URL): void => {
+		const project = projectParam(url, res);
+		if (project === undefined) return;
+		sendJson(res, 200, { overrides: taskOverrides.forWorkspace(project).read() });
+	};
+
+	const putTaskOverrides = async (
+		req: IncomingMessage,
+		res: ServerResponse,
+		url: URL
+	): Promise<void> => {
 		const raw = await readBody(req, TASK_OVERRIDES_BODY_CAP);
 		if (raw === null) return sendJson(res, 413, { error: "request body too large" });
+		const project = projectParam(url, res);
+		if (project === undefined) return;
 		const parsed = TaskOverridesBody.safeParse(parseJson(raw));
 		if (!parsed.success) return sendJson(res, 400, { error: "invalid task overrides" });
 		// Reject an unsafe task id BEFORE the store call, so a `..` key is a clean 400 (never a store 500),
@@ -617,29 +1073,51 @@ export async function startLocalDriveServer(deps: LocalDriveDeps): Promise<Local
 		for (const key of Object.keys(parsed.data.overrides)) {
 			if (!isSafeKey(key)) return sendJson(res, 400, { error: "invalid task id" });
 		}
-		taskOverrides.write(parsed.data.overrides);
+		taskOverrides.forWorkspace(project).write(parsed.data.overrides);
 		sendJson(res, 200, { ok: true });
 	};
 
-	/** Projects a user schedule (plus its run state and next-run projection) to the wire shape. */
+	/**
+	 * Replaces the project allowlist the automation runner's unattended tick reads. Gated on the project-scope
+	 * flag for EVERY call, whatever the body holds: the write creates `workspaces.json` and its directory, and
+	 * an unscoped install must gain no file from a feature it does not run - so even an empty list is
+	 * refused there rather than materializing the document. The zod parse validates every id, so
+	 * `replaceAllowlist`'s own throw is unreachable - the try/catch is there because a store fault must be a
+	 * 400, never a 500 that leaks a path.
+	 */
+	const putWorkspaces = async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
+		const raw = await readBody(req, WORKSPACES_BODY_CAP);
+		if (raw === null) return sendJson(res, 413, { error: "request body too large" });
+		if (!requireProjectScope(res)) return;
+		const parsed = WorkspacesBody.safeParse(parseJson(raw));
+		if (!parsed.success) return sendJson(res, 400, { error: "invalid workspaces" });
+		try {
+			automations.replaceAllowlist(parsed.data.projects);
+		} catch {
+			return sendJson(res, 400, { error: "invalid workspaces" });
+		}
+		sendJson(res, 200, { ok: true });
+	};
+
+	/** Projects a user automation (plus its run state and next-run projection) to the wire shape. */
 	const mergedUser = (
-		schedule: LocalSchedule,
-		runStates: ReadonlyMap<string, LocalScheduleRunState>,
+		automation: LocalAutomation,
+		runStates: ReadonlyMap<string, LocalAutomationRunState>,
 		nowMs: number
-	): MergedSchedule => {
-		const cadence = cadenceOf(schedule);
-		const runState = runStates.get(schedule.id) ?? {};
+	): MergedAutomation => {
+		const cadence = cadenceOf(automation);
+		const runState = runStates.get(automation.id) ?? {};
 		return {
 			origin: "local",
-			id: schedule.id,
-			name: schedule.name,
-			prompt: schedule.prompt,
+			id: automation.id,
+			name: automation.name,
+			prompt: automation.prompt,
 			...cadence,
-			enabled: schedule.enabled,
+			enabled: automation.enabled,
 			builtIn: false,
-			...(schedule.cli !== undefined ? { cli: schedule.cli } : {}),
-			...(schedule.modelId !== undefined ? { modelId: schedule.modelId } : {}),
-			...(schedule.effort !== undefined ? { effort: schedule.effort } : {}),
+			...(automation.cli !== undefined ? { cli: automation.cli } : {}),
+			...(automation.modelId !== undefined ? { modelId: automation.modelId } : {}),
+			...(automation.effort !== undefined ? { effort: automation.effort } : {}),
 			...nextRunAtOf(cadence, runState, nowMs),
 			runState
 		};
@@ -647,11 +1125,11 @@ export async function startLocalDriveServer(deps: LocalDriveDeps): Promise<Local
 
 	/** Projects a built-in spec (its effective enabled, run state and next-run projection) to the wire shape. */
 	const mergedBuiltIn = (
-		spec: BuiltInScheduleSpec,
+		spec: BuiltInAutomationSpec,
 		enabledOverrides: ReadonlyMap<string, boolean>,
-		runStates: ReadonlyMap<string, LocalScheduleRunState>,
+		runStates: ReadonlyMap<string, LocalAutomationRunState>,
 		nowMs: number
-	): MergedSchedule => {
+	): MergedAutomation => {
 		const cadence = cadenceOf(spec);
 		const runState = runStates.get(spec.id) ?? {};
 		return {
@@ -668,24 +1146,27 @@ export async function startLocalDriveServer(deps: LocalDriveDeps): Promise<Local
 	};
 
 	/**
-	 * Projects the config's built-in schedules to the wire, GUARDED end to end: a throwing `config()` read
-	 * (unreadable/invalid config) OR a throwing store read while resolving a built-in's override/run state
-	 * omits built-ins for THIS response and is logged, mirroring the runner's posture, so a broken config or
-	 * store fault never fails the list - user schedules are still served.
+	 * Projects the config's built-in automations to the wire for ONE workspace (its own enabled-overrides come
+	 * from `store`), GUARDED end to end: a throwing `config()` read (unreadable/invalid config) OR a throwing
+	 * store read while resolving a built-in's override/run state omits built-ins for THIS response and is
+	 * logged, mirroring the runner's posture, so a broken config or store fault never fails the list - user
+	 * automations are still served.
 	 */
 	const listBuiltInMerged = (
-		runStates: ReadonlyMap<string, LocalScheduleRunState>,
-		nowMs: number
-	): MergedSchedule[] => {
+		store: LocalAutomationStore,
+		runStates: ReadonlyMap<string, LocalAutomationRunState>,
+		nowMs: number,
+		readConfig: () => LocalAppConfig
+	): MergedAutomation[] => {
 		try {
-			const enabledOverrides = schedules.readAllBuiltInEnabled();
-			return (deps.config().schedules ?? []).map((spec) =>
+			const enabledOverrides = store.readAllBuiltInEnabled();
+			return (readConfig().automations ?? []).map((spec) =>
 				mergedBuiltIn(spec, enabledOverrides, runStates, nowMs)
 			);
 		} catch (err) {
 			const detail = err instanceof Error ? err.message : String(err);
 			process.stderr.write(
-				`local-drive: reading built-in schedules failed, omitting them from the list: ${detail}\n`
+				`local-drive: reading built-in automations failed, omitting them from the list: ${detail}\n`
 			);
 			return [];
 		}
@@ -694,96 +1175,111 @@ export async function startLocalDriveServer(deps: LocalDriveDeps): Promise<Local
 	/**
 	 * Finds the built-in spec for `id`, or returns a `configUnreadable` sentinel when the config read throws.
 	 * The route uses this to CLASSIFY a PUT/DELETE target: a broken config must never let a built-in be edited
-	 * or deleted as a user schedule, so an unreadable config fails SAFE (the caller answers 503) rather than
-	 * silently treating the id as a user schedule. This route classifies built-in-first while the runner's
+	 * or deleted as a user automation, so an unreadable config fails SAFE (the caller answers 503) rather than
+	 * silently treating the id as a user automation. This route classifies built-in-first while the runner's
 	 * `resolve` classifies user-first; the disagreement is structurally theoretical because user ids are all
 	 * `crypto.randomUUID()`-shaped and built-in ids are config slugs, so a single id can never be both.
 	 */
 	const classify = (
 		id: string
-	): { spec: BuiltInScheduleSpec | undefined } | { configUnreadable: true } => {
+	): { spec: BuiltInAutomationSpec | undefined } | { configUnreadable: true } => {
 		try {
-			return { spec: (deps.config().schedules ?? []).find((s) => s.id === id) };
+			return { spec: (deps.config().automations ?? []).find((s) => s.id === id) };
 		} catch {
 			return { configUnreadable: true };
 		}
 	};
 
-	const listSchedules = (res: ServerResponse): void => {
+	const listAutomations = (res: ServerResponse, url: URL): void => {
+		// ONE parse of the CONFIG per list request, shared by the workspace gate and the built-in list. This
+		// route is polled every 30 seconds per open surface, so a second parse is pure waste - and two reads
+		// could straddle a re-stage, answering with one scope decision and the other's built-ins.
+		const readConfig = configOnce();
+		const project = projectParam(url, res, readConfig);
+		if (project === undefined) return;
+		const store = automations.forWorkspace(project);
 		// ONE parse of each store document per list request, and ONE clock read for every next-run
-		// projection, however many schedules project from them. A pure read: this route is polled every 30s,
+		// projection, however many automations project from them. A pure read: this route is polled every 30s,
 		// so arming here would race the runner that owns it.
-		const runStates = schedules.readAllRunStates();
+		const runStates = store.readAllRunStates();
 		const nowMs = Date.now();
-		const merged: MergedSchedule[] = [
-			...listBuiltInMerged(runStates, nowMs),
-			...schedules.listUser().map((schedule) => mergedUser(schedule, runStates, nowMs))
+		const merged: MergedAutomation[] = [
+			...listBuiltInMerged(store, runStates, nowMs, readConfig),
+			...store.listUser().map((automation) => mergedUser(automation, runStates, nowMs))
 		];
-		sendJson(res, 200, { schedules: merged });
+		sendJson(res, 200, { automations: merged });
 	};
 
-	const putSchedule = async (
+	const putAutomation = async (
 		req: IncomingMessage,
 		res: ServerResponse,
+		url: URL,
 		id: string
 	): Promise<void> => {
-		const raw = await readBody(req, SCHEDULES_BODY_CAP);
+		const raw = await readBody(req, AUTOMATIONS_BODY_CAP);
 		if (raw === null) return sendJson(res, 413, { error: "request body too large" });
+		const project = projectParam(url, res);
+		if (project === undefined) return;
 		if (!isSafeKey(id)) return sendJson(res, 400, { error: "invalid id" });
+		const store = automations.forWorkspace(project);
 		const body = parseJson(raw);
 
 		const classified = classify(id);
 		if ("configUnreadable" in classified) {
 			return sendJson(res, 503, {
-				error: "cannot determine the schedule; the on-device config is unreadable"
+				error: "cannot determine the automation; the on-device config is unreadable"
 			});
 		}
 		if (classified.spec) {
 			// A built-in id accepts ONLY an enabled-override (strict); any other shape is a clean 400.
 			const parsed = BuiltInEnabledBody.safeParse(body);
 			if (!parsed.success)
-				return sendJson(res, 400, { error: "a built-in schedule accepts only { enabled }" });
-			schedules.setBuiltInEnabled(id, parsed.data.enabled);
+				return sendJson(res, 400, { error: "a built-in automation accepts only { enabled }" });
+			store.setBuiltInEnabled(id, parsed.data.enabled);
 			return sendJson(res, 200, {
-				schedule: mergedBuiltIn(
+				automation: mergedBuiltIn(
 					classified.spec,
-					schedules.readAllBuiltInEnabled(),
-					schedules.readAllRunStates(),
+					store.readAllBuiltInEnabled(),
+					store.readAllRunStates(),
 					Date.now()
 				)
 			});
 		}
-		// A user upsert: the path id updates an existing user schedule, else the daemon mints a fresh id (so the
+		// A user upsert: the path id updates an existing user automation, else the daemon mints a fresh id (so the
 		// response carries the MINTED id - the client reads it back).
-		const parsed = UserScheduleBody.safeParse(body);
-		if (!parsed.success) return sendJson(res, 400, { error: "invalid schedule" });
+		const parsed = UserAutomationBody.safeParse(body);
+		if (!parsed.success) return sendJson(res, 400, { error: "invalid automation" });
 		const { intervalMinutes, cron, timezone, ...rest } = parsed.data;
 		const cadence = toCadence({ intervalMinutes, cron, timezone });
-		if (cadence === null) return sendJson(res, 400, { error: "invalid schedule" });
-		const persisted = schedules.upsertUser({ id, ...rest, ...cadence });
+		if (cadence === null) return sendJson(res, 400, { error: "invalid automation" });
+		const persisted = store.upsertUser({ id, ...rest, ...cadence });
 		sendJson(res, 200, {
-			schedule: mergedUser(persisted, schedules.readAllRunStates(), Date.now())
+			automation: mergedUser(persisted, store.readAllRunStates(), Date.now())
 		});
 	};
 
-	const deleteSchedule = (res: ServerResponse, id: string): void => {
+	const deleteAutomation = (res: ServerResponse, url: URL, id: string): void => {
+		const project = projectParam(url, res);
+		if (project === undefined) return;
 		if (!isSafeKey(id)) return sendJson(res, 400, { error: "invalid id" });
 		const classified = classify(id);
 		if ("configUnreadable" in classified) {
 			return sendJson(res, 503, {
-				error: "cannot determine the schedule; the on-device config is unreadable"
+				error: "cannot determine the automation; the on-device config is unreadable"
 			});
 		}
 		if (classified.spec)
-			return sendJson(res, 400, { error: "a built-in schedule cannot be deleted" });
+			return sendJson(res, 400, { error: "a built-in automation cannot be deleted" });
 		// Idempotent, mirroring the chat DELETE: an unknown user id is a no-op 200.
-		schedules.deleteUser(id);
+		automations.forWorkspace(project).deleteUser(id);
 		sendJson(res, 200, { ok: true });
 	};
 
-	const runScheduleNow = (res: ServerResponse, id: string): void => {
+	const runAutomationNow = (res: ServerResponse, url: URL, id: string): void => {
+		const project = projectParam(url, res);
+		if (project === undefined) return;
 		if (!isSafeKey(id)) return sendJson(res, 400, { error: "invalid id" });
-		switch (scheduleRunner.runNow(id)) {
+		switch (automationRunner.runNow(id, project)) {
 			case "started":
 				return sendJson(res, 202, { ok: true });
 			case "busy":
@@ -791,9 +1287,9 @@ export async function startLocalDriveServer(deps: LocalDriveDeps): Promise<Local
 					error: "a run is already in flight or the concurrency limit is reached"
 				});
 			case "unknown":
-				return sendJson(res, 404, { error: "no such schedule" });
+				return sendJson(res, 404, { error: "no such automation" });
 			case "failed":
-				return sendJson(res, 500, { error: "the scheduled run failed to start" });
+				return sendJson(res, 500, { error: "the automated run failed to start" });
 		}
 	};
 
@@ -802,34 +1298,111 @@ export async function startLocalDriveServer(deps: LocalDriveDeps): Promise<Local
 		if (raw === null) return sendJson(res, 413, { error: "request body too large" });
 		const parsed = ChatBody.safeParse(parseJson(raw));
 		if (!parsed.success) return sendJson(res, 400, { error: "invalid chat request" });
-		const { namespace, sessionId, prompt, cli, modelId, effort, images } = parsed.data;
+		const { namespace, sessionId, prompt, cli, modelId, effort, images, project } = parsed.data;
+		// ONE parse of the config for this turn, shared by the workspace agreement check and the CLI default.
+		const readConfig = configOnce();
+		// The namespace picks the chat documents and the project picks the work tree, so BOTH directions of
+		// disagreement have to be refused or a turn files one workspace's conversation against another's runs.
+		if (project !== undefined) {
+			if (!requireProjectScope(res, readConfig)) return;
+			if (!namespace.endsWith(`-${project}`))
+				return sendJson(res, 400, { error: "namespace does not match project" });
+		} else {
+			// The reverse direction: a namespace that NAMES a workspace with no `project` beside it. Two things
+			// must BOTH hold before refusing, because a false positive here 400s an ordinary project-less chat.
+			//
+			// First the project-scope flag: an unscoped device has no workspaces to disagree about, and its
+			// namespaces are whatever the app has always written, so the grammar must not be read there at
+			// all. An unreadable config cannot rule on the turn either way, so it fails closed with the same
+			// 503 every workspace-sensitive route answers.
+			//
+			// Then the ALLOWLIST: the trailing segment has to be a workspace this device actually runs.
+			// Shape is not proof - a buyer minting ids like `usr-a1b2c3d4e5f6` produces namespaces that match
+			// the grammar exactly - so a tail the allowlist does not know is treated as part of the user id,
+			// which is what it is. A read per candidate is cheap next to starting a CLI.
+			const candidate = namespaceProjectCandidate(namespace);
+			if (candidate !== null) {
+				let projectScoped: boolean;
+				try {
+					projectScoped = readConfig().projectScoped === true;
+				} catch {
+					return sendJson(res, 503, {
+						error:
+							"cannot determine whether projects are enabled; the on-device config is unreadable"
+					});
+				}
+				if (projectScoped && automations.readAllowlist().has(candidate)) {
+					return sendJson(res, 400, {
+						error: "namespace names a project but project is absent"
+					});
+				}
+			}
+		}
 
 		const key = `${namespace}:${sessionId}`;
-		if (inFlight.has(key))
-			return sendJson(res, 409, { error: "a turn is already in flight for this session" });
-		inFlight.add(key);
+		const holdingRunId = inFlight.get(key);
+		if (holdingRunId !== undefined)
+			return sendJson(res, 409, {
+				error: "a turn is already in flight for this session",
+				// Omitted only in the synchronous window before the holding run started, which no other
+				// request can observe (nothing awaits between claiming the key and recording the run id).
+				...(holdingRunId.length > 0 ? { runId: holdingRunId } : {})
+			});
+		inFlight.set(key, "");
 
-		let released = false;
-		const finish = (): void => {
-			if (released) return;
-			released = true;
-			inFlight.delete(key);
+		// The RESPONSE and the in-flight KEY have different lifetimes, and conflating them let one
+		// conversation grow a second CLI. A client that disconnects mid-stream RELEASES the turn - the run
+		// keeps its own lifecycle and explicit cancel remains the way to stop it - so ending the response
+		// must NOT hand the session back: chat runs are not capped by `maxConcurrentRuns`, so a
+		// switch-away-and-back would start a second CLI on the same conversation with no 409 to stop it.
+		// The key belongs to the RUN, whose `onClose` fires exactly once on every terminal outcome
+		// (completion, cancel, refusal). Until a run has taken it, the response closing is what frees it -
+		// that covers the refusal below and any throw between here and the start.
+		let runOwnsKey = false;
+		let responseEnded = false;
+		const endResponse = (): void => {
+			if (responseEnded) return;
+			responseEnded = true;
 			res.end();
 		};
-		// A client that disconnects mid-stream releases the key (the run keeps its own lifecycle; explicit
-		// cancel remains the way to stop it).
-		res.on("close", finish);
+		let keyReleased = false;
+		const releaseKey = (): void => {
+			if (keyReleased) return;
+			keyReleased = true;
+			inFlight.delete(key);
+		};
+		// Whether the run has settled. Declared HERE, above the close listener that reads it, because that
+		// listener is what tells a client walking away apart from this handler ending a delivered stream.
+		let closed = false;
+		// The client went away while the run was still going, so nothing on the other end will render or
+		// persist this turn: the daemon becomes its writer of record (see `salvageTurn`).
+		let clientGone = false;
+		res.on("close", () => {
+			if (!closed) clientGone = true;
+			endResponse();
+			if (!runOwnsKey) releaseKey();
+		});
 
 		// The CLI that will actually run this turn - the session resolves it the same way (request cli, else
 		// the on-device default). The stored resume handle is gated to its OWNING CLI, so a turn that switched
 		// CLI starts fresh instead of replaying a foreign SDK session under a CLI that never minted it.
-		const effectiveCli = cli ?? deps.config().defaultCli;
+		//
+		// Only a turn that needs the DEFAULT touches the config, so a request naming its own cli still runs
+		// while the config is unreadable. When it is needed and missing, this is the retryable 503 every
+		// config-sensitive route gives, not the opaque 500 an escaping throw would have produced - and the
+		// key claimed above is handed straight back, since no run will ever own it.
+		let effectiveCli: string | undefined;
+		try {
+			effectiveCli = cli ?? readConfig().defaultCli;
+		} catch {
+			releaseKey();
+			return sendJson(res, 503, { error: CONFIG_UNREADABLE_ERROR });
+		}
 
 		// Buffer frames until run.started is written, so a hook that fires SYNCHRONOUSLY inside startChat
 		// (an immediate terminal close) can never race ahead of the opening line.
 		const buffered: string[] = [];
 		let live = false;
-		let closed = false;
 		const push = (frame: RunEventMsg | RunConversationMsg): void => {
 			const line = `${JSON.stringify(frame)}\n`;
 			if (!live) {
@@ -839,12 +1412,66 @@ export async function startLocalDriveServer(deps: LocalDriveDeps): Promise<Local
 			try {
 				res.write(line);
 			} catch {
-				finish();
+				// The client is gone; the run is not. End the response only - the key stays with the run - and
+				// mark the turn for salvage, since a failed write is a detached client the socket close may
+				// never report on its own.
+				clientGone = true;
+				endResponse();
+			}
+		};
+
+		// The assistant text this run has produced, collected server-side so a DETACHED turn survives. Bounded
+		// the same way the automated collector is bounded, so a runaway CLI cannot exhaust the daemon's memory.
+		const assistantText: string[] = [];
+		let assistantBytes = 0;
+		// This turn's run id once it has started, so `onClose` can ask whether the user stopped THIS run.
+		let startedRunId = "";
+
+		/**
+		 * Writes the turn the departed client never got to persist: the user prompt and the assistant reply,
+		 * appended to the stored transcript. Called ONLY when the client detached mid-run - while a client is
+		 * attached the app remains the sole transcript writer, and appending there would duplicate the reply
+		 * the user watched arrive. A turn that produced no assistant text writes nothing.
+		 *
+		 * An EXPLICITLY STOPPED run writes nothing either, however the client left afterwards. A cancel means
+		 * the user asked for this turn to end, so the app has already settled it and saved whatever arrived -
+		 * or removed the conversation entirely. Appending after a stop would store the partial reply a second
+		 * time, and appending after a delete would recreate the conversation the user just deleted (the
+		 * append seam creates a session when none exists, which is exactly what the detached-turn case needs).
+		 *
+		 * Fully guarded: this runs inside the executor's event loop, OUTSIDE the request handler's catch, so
+		 * an escaping disk-write throw would abort the run (the same reasoning the resume-handle write takes).
+		 * A salvaged user turn is TEXT ONLY - the images the request carried are full-resolution originals,
+		 * not the thumbnails the app persists, so storing them would bloat the transcript with the wrong asset.
+		 */
+		const salvageTurn = (): void => {
+			const text = assistantText.join("");
+			if (text.length === 0) return;
+			const turn: SalvagedChatMessage[] = [
+				{ id: crypto.randomUUID(), role: "user", parts: [{ kind: "text", text: prompt }] },
+				{ id: crypto.randomUUID(), role: "assistant", parts: [{ kind: "text", text }] }
+			];
+			try {
+				chats.appendMessages(namespace, sessionId, turn, deriveChatTitle(prompt));
+			} catch (err) {
+				const detail = err instanceof Error ? err.message : String(err);
+				process.stderr.write(
+					`local-drive: failed to salvage the detached turn for ${namespace}/${sessionId}: ${detail}\n`
+				);
 			}
 		};
 
 		const hooks: RunHooks = {
-			onEvent: (msg) => push(msg),
+			onEvent: (msg) => {
+				const event = msg.event;
+				// `delta` is the only assistant-text source; stop appending past the ceiling (the client still
+				// receives every frame - the bound is on what this handler HOLDS, not on what it forwards).
+				if (event.type === "delta" && assistantBytes < MAX_SALVAGED_TEXT_BYTES) {
+					assistantText.push(event.text);
+					assistantBytes += encoder.encode(event.text).length;
+				}
+				push(msg);
+			},
 			onConversation: (msg) => {
 				// Best-effort sidecar write, guarded: this fires inside the executor's event loop, OUTSIDE the
 				// request handler's catch, so a disk-write throw here would escape and abort the run. The resume
@@ -865,41 +1492,84 @@ export async function startLocalDriveServer(deps: LocalDriveDeps): Promise<Local
 			},
 			onClose: () => {
 				closed = true;
-				if (live) finish();
+				// The run is over, so the session is free for the next turn whether or not a client is
+				// still attached to this response.
+				releaseKey();
+				if (live) endResponse();
+				// Read the stop mark BEFORE clearing it: this is the one place that can tell an explicit stop
+				// from a client that walked away, and the entry belongs to this run alone.
+				const stopped = cancelledRuns.delete(startedRunId);
+				if (clientGone && !stopped) salvageTurn();
 			}
 		};
+
+		// The project's CONNECTED folder, re-resolved and RE-JUDGED right here rather than trusted from the
+		// store: the grant is durable, so between consent and this turn the folder can have been deleted,
+		// replaced by a file, or swapped for a symlink into a tree the predicate protects. A grant that cannot
+		// be honoured FAILS the turn through the same refusal path an unresolvable CLI takes - never a quiet
+		// fall back to the managed work folder, which would run the user's assistant somewhere they did not
+		// point it and then report success. No grant (or the feature off) answers null: the managed folder,
+		// the ordinary case.
+		let connectedFolder: string | null = null;
+		let grantRefusal: string | null = null;
+		try {
+			connectedFolder = connectedFolderForRun(project ?? null, {
+				connectedFolders: deps.connectedFolders,
+				connectedFolderDeny: deps.connectedFolderDeny,
+				config: readConfig
+			});
+		} catch (err) {
+			grantRefusal = err instanceof Error ? err.message : String(err);
+		}
 
 		const conversationId = effectiveCli
 			? (chats.getConversationId(namespace, sessionId, effectiveCli) ?? undefined)
 			: undefined;
-		const started = session.startChat({
-			prompt,
-			...(cli !== undefined ? { cli } : {}),
-			...(modelId !== undefined ? { modelId } : {}),
-			...(effort !== undefined ? { effort } : {}),
-			...(conversationId !== undefined ? { conversationId } : {}),
-			...(images !== undefined ? { images } : {}),
-			hooks
-		});
+		const started =
+			grantRefusal !== null
+				? { refused: grantRefusal }
+				: session.startChat({
+						prompt,
+						...(cli !== undefined ? { cli } : {}),
+						...(modelId !== undefined ? { modelId } : {}),
+						...(effort !== undefined ? { effort } : {}),
+						...(conversationId !== undefined ? { conversationId } : {}),
+						...(images !== undefined ? { images } : {}),
+						// DERIVED from the validated project, never relayed from the request: a project-less turn
+						// carries no work key at all, so its dispatch is byte-identical to the pre-workspace one.
+						...(project !== undefined ? { workKey: workspaceWorkKey(project) } : {}),
+						...(connectedFolder !== null ? { connectedFolder } : {}),
+						hooks
+					});
 
 		res.writeHead(200, NDJSON_HEADERS);
 		if ("refused" in started) {
-			// The run never started: a single terminal error line, no run.started and no run id.
+			// The run never started: a single terminal error line, no run.started and no run id. No `onClose`
+			// will ever fire for it, so the key is handed back here rather than waiting on the response.
 			const frame: RunEventMsg = {
 				type: "run.event",
 				runId: "",
 				event: { type: "error", message: started.refused }
 			};
 			res.write(`${JSON.stringify(frame)}\n`);
-			finish();
+			releaseKey();
+			endResponse();
 			return;
 		}
+		// From here the run owns the key: only its `onClose` releases it, so walking away from the stream
+		// leaves the session busy for as long as the CLI is actually working on it.
+		runOwnsKey = true;
+		startedRunId = started.runId;
+		// Name the holder on the key so a refused second turn knows which run to wait on or cancel - but only
+		// while the key is still HELD: a run that closed synchronously inside `startChat` has already handed
+		// it back, and re-adding it here would 409 that session forever with no `onClose` left to release it.
+		if (!keyReleased) inFlight.set(key, started.runId);
 		const startedFrame: RunStartedMsg = { type: "run.started", runId: started.runId };
 		res.write(`${JSON.stringify(startedFrame)}\n`);
 		for (const line of buffered) res.write(line);
 		buffered.length = 0;
 		live = true;
-		if (closed) finish();
+		if (closed) endResponse();
 	};
 
 	const handle = async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
@@ -918,9 +1588,20 @@ export async function startLocalDriveServer(deps: LocalDriveDeps): Promise<Local
 			if (method === "GET" && segs[1] === "tools") return tools(res);
 			if (method === "GET" && segs[1] === "chats") return listChats(res, url);
 			if (method === "POST" && segs[1] === "chat") return chat(req, res);
-			if (method === "GET" && segs[1] === "task-overrides") return getTaskOverrides(res);
-			if (method === "PUT" && segs[1] === "task-overrides") return putTaskOverrides(req, res);
-			if (method === "GET" && segs[1] === "schedules") return listSchedules(res);
+			if (method === "GET" && segs[1] === "task-overrides") return getTaskOverrides(res, url);
+			if (method === "PUT" && segs[1] === "task-overrides") return putTaskOverrides(req, res, url);
+			if (method === "GET" && segs[1] === "automations") return listAutomations(res, url);
+			// A length-2 route, so it structurally cannot shadow `PUT /v1/automations/<id>` (length 3) - not even
+			// for the id `workspaces`, which reaches the automation upsert exactly like any other.
+			if (method === "PUT" && segs[1] === "workspaces") return putWorkspaces(req, res);
+			// Length-2 as well, on a segment no other route reads, so it neither shadows nor is shadowed: the
+			// length-3 routes all sit under `automations`/`chats`/`tools`, and a project rides the QUERY (and the
+			// PUT body) rather than a path segment - so no project id, however named, can be read as a route.
+			if (segs[1] === "connected-folders") {
+				if (method === "GET") return getConnectedFolder(res, url);
+				if (method === "PUT") return putConnectedFolder(req, res);
+				if (method === "DELETE") return deleteConnectedFolder(res, url);
+			}
 		}
 		if (
 			method === "GET" &&
@@ -953,22 +1634,22 @@ export async function startLocalDriveServer(deps: LocalDriveDeps): Promise<Local
 			if (toolId === null) return sendJson(res, 400, { error: "invalid tool id" });
 			return connectTool(res, toolId);
 		}
-		if (segs[0] === "v1" && segs[1] === "schedules" && segs.length === 3) {
+		if (segs[0] === "v1" && segs[1] === "automations" && segs.length === 3) {
 			const id = decodeSeg(segs[2]!);
 			if (id === null) return sendJson(res, 400, { error: "invalid id" });
-			if (method === "PUT") return putSchedule(req, res, id);
-			if (method === "DELETE") return deleteSchedule(res, id);
+			if (method === "PUT") return putAutomation(req, res, url, id);
+			if (method === "DELETE") return deleteAutomation(res, url, id);
 		}
 		if (
 			method === "POST" &&
 			segs[0] === "v1" &&
-			segs[1] === "schedules" &&
+			segs[1] === "automations" &&
 			segs.length === 4 &&
 			segs[3] === "run-now"
 		) {
 			const id = decodeSeg(segs[2]!);
 			if (id === null) return sendJson(res, 400, { error: "invalid id" });
-			return runScheduleNow(res, id);
+			return runAutomationNow(res, url, id);
 		}
 		if (
 			method === "POST" &&
@@ -1013,7 +1694,7 @@ export async function startLocalDriveServer(deps: LocalDriveDeps): Promise<Local
 	// A crashed previous run leaves its socket INODE behind (only the listener died, not the file), and
 	// `listen` fails EADDRINUSE on it - so a STALE inode is unlinked first. A LIVE one is not: unlinking it
 	// would silently displace a runtime that is still serving this very app-data root, leaving two runtimes
-	// on one schedule store, one chat store and one secret store - both firing every schedule, both writing
+	// on one automation store, one chat store and one secret store - both firing every automation, both writing
 	// the same JSON, and the displaced one unreachable (its inode is gone) and unkillable (its pid record has
 	// been overwritten). Refusing is the only safe answer, and it is what the single-instance lock the local
 	// boot used to take said too. Windows named pipes are kernel objects with no filesystem entry to unlink,

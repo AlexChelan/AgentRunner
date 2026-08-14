@@ -84,7 +84,7 @@ interface EventsChunk {
  * Whether a buffered frame ENDS its run.
  *
  * It is the backend's only release for the run's in-flight slot and the only trigger for finalizing a
- * scheduled run, which is why it is the one thing salvaged out of a chunk that is being abandoned.
+ * automated run, which is why it is the one thing salvaged out of a chunk that is being abandoned.
  *
  * @param frame - The buffered frame.
  * @returns True for a `run.event` carrying a terminal `done`/`error`.
@@ -392,7 +392,7 @@ export function createStreamClient(deps: StreamClientDeps): StreamClient {
 	 * A decline is carried ONLY by `POST /capacity`, and it is the only thing that frees a refused run's
 	 * server-side slot: the run never started, so no terminal frame is coming, and an owner cancel is not
 	 * either. Dropping one on a failed report therefore leaks that slot for the life of the socket, and
-	 * enough of them take the device's budget to zero - at which point the user's scheduled runs stop
+	 * enough of them take the device's budget to zero - at which point the user's automated runs stop
 	 * being handed to their own machine and go to the paid cloud fallback instead. So a failed report
 	 * keeps its runIds here and every later report re-sends them until one lands.
 	 *
@@ -408,7 +408,7 @@ export function createStreamClient(deps: StreamClientDeps): StreamClient {
 	 * The free-slot count is a LEVEL the backend holds until the daemon restates it, and under the held
 	 * stream the only two things that restate it are a decline and a run closing. A failed report therefore
 	 * strands the device at whatever it last said: told zero, it is handed no work, so no run closes, so
-	 * nothing re-reports, and it sits idle for the life of the socket while its schedules run in the paid
+	 * nothing re-reports, and it sits idle for the life of the socket while its automations run in the paid
 	 * cloud. Polling used to restate the level unconditionally every tick, which is what made a transient
 	 * failure self-heal; this flag is what puts that property back without putting the poll back.
 	 */
@@ -868,7 +868,7 @@ export function createStreamClient(deps: StreamClientDeps): StreamClient {
 	 * run out of the 24h queue hash, so after a 200 there is no copy left to redeliver. The run's
 	 * server-side in-flight slot is released by exactly one thing - its terminal frame - so a silent bail
 	 * also gave up a slot the device never got back, and enough of those leave it handed no work for the
-	 * life of its socket while reading perfectly online, with its schedules billing to the paid cloud
+	 * life of its socket while reading perfectly online, with its automations billing to the paid cloud
 	 * fallback. So a terminal error frame is buffered instead, and `stop()`'s final flush carries it: by
 	 * construction that flush runs AFTER this delivery settles, so the frame is always drained. The run
 	 * is remembered too, so a redelivery that somehow raced the HDEL cannot re-run what was reported
@@ -1007,8 +1007,8 @@ export function createStreamClient(deps: StreamClientDeps): StreamClient {
 	 *
 	 * The transcript loses what was in it, which is the price of the buffer behind it draining at all.
 	 * The terminal frames are the exception because nothing else can stand in for them: the backend
-	 * releases a run's in-flight slot and finalizes its scheduled row on that frame alone, so a run whose
-	 * `done` went down with the chunk would hold its slot until the socket dropped, and its schedule
+	 * releases a run's in-flight slot and finalizes its automated row on that frame alone, so a run whose
+	 * `done` went down with the chunk would hold its slot until the socket dropped, and its automation
 	 * would never record an outcome. They are re-buffered as ordinary frames, so they go out in a FRESH
 	 * batch - which is also why they tend to succeed where the original chunk did not: a lone terminal
 	 * frame carries none of whatever the backend objected to.
@@ -1074,7 +1074,7 @@ export function createStreamClient(deps: StreamClientDeps): StreamClient {
 	 * the request path performs, so an expired token costs a round trip rather than a whole reconnect
 	 * cycle. The retry's status FALLS THROUGH to the checks below rather than being answered inline: a
 	 * 429 on the retry names a cooldown exactly as one on the first attempt does, and returning early
-	 * would drop it and send the daemon back on its ordinary schedule against a backend that named a
+	 * would drop it and send the daemon back on its ordinary automation against a backend that named a
 	 * longer one. A 429 itself is honored on the same contract the request path uses - the backend names
 	 * when this device may come back, and reconnecting sooner spends budget it does not have.
 	 *
@@ -1148,7 +1148,7 @@ export function createStreamClient(deps: StreamClientDeps): StreamClient {
 	 * in lockstep against a backend that is still coming up. A stream that opened successfully resets
 	 * the attempt counter, so a long-lived device that blips once does not inherit a long backoff.
 	 *
-	 * A server-named cooldown from a 429 WINS over the backoff schedule: it is the backend telling this
+	 * A server-named cooldown from a 429 WINS over the backoff automation: it is the backend telling this
 	 * device when it may come back, and guessing sooner spends budget it does not have.
 	 *
 	 * The backoff is raced against shutdown so `stop()`, which awaits this loop, is not held for the

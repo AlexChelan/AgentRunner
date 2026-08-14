@@ -54,7 +54,7 @@ Queue a `RunStart` (prompt, tool manifest, requested policy, target `runnerId = 
 
 There is deliberately **no way to push an MCP server over the wire**: `RunStart` carries no `mcpServers` field, and a backend that sends one has the key stripped. A `stdio` spec would spawn an arbitrary local command outside the run's work-folder confinement, permission mode, and network sandbox, so the only MCP a run gets is the daemon's own loopback proxy for your manifest.
 
-How you store frames and surface them (SSE to a dashboard, plain persistence, a schedule's output) is your product's design; the wire does not care.
+How you store frames and surface them (SSE to a dashboard, plain persistence, an automation's output) is your product's design; the wire does not care.
 
 ## 4. Security invariants to keep
 

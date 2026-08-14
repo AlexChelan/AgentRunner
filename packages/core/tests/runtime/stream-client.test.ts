@@ -916,7 +916,7 @@ describe("stream client - poll", () => {
 	 * it for the next boot": it destroyed the run. Worse, the backend's in-flight slot for it is
 	 * released by exactly one thing, the run's terminal frame, so the device also gave up a slot it
 	 * never got back - five of those and it is handed no more work for the life of its socket while
-	 * reading perfectly online, and its schedules quietly bill to the paid cloud fallback.
+	 * reading perfectly online, and its automations quietly bill to the paid cloud fallback.
 	 *
 	 * So the run is reported, not forgotten: a terminal error frame is buffered, and `stop()`'s final
 	 * flush - which runs after this delivery settles, by construction - carries it to the backend.
@@ -1199,7 +1199,7 @@ describe("stream client - concurrency cap", () => {
 	 * A decline rides ONE carrier. The refused run never started, so no terminal frame is coming for it,
 	 * and an owner cancel is not either - `POST /capacity` is the only thing that will ever release its
 	 * server-side slot. Drop it on a failed report and that slot leaks for the life of the socket; a few
-	 * of those take the device's budget to zero, its schedules stop running on the user's own machine,
+	 * of those take the device's budget to zero, its automations stop running on the user's own machine,
 	 * and the work goes to the paid cloud fallback instead.
 	 */
 	it("re-sends a declined runId after a refused capacity report, so its slot is never lost", async () => {
@@ -1296,7 +1296,7 @@ describe("stream client - concurrency cap", () => {
 	 * THE STRANDING. Polling restated the free-slot level unconditionally every tick, so a report that
 	 * failed self-healed on the next one. The held stream restates it only when a run declines or closes -
 	 * and a device the backend believes has zero slots is handed no work, so nothing closes and nothing
-	 * re-reports. It sits idle for the life of the socket while its schedules run in the paid cloud.
+	 * re-reports. It sits idle for the life of the socket while its automations run in the paid cloud.
 	 *
 	 * The keep-alive is the tick that was already there: the backend writes one every 30s to stop a proxy
 	 * closing a quiet socket, so restating on it bounds the recovery without putting a poll back.
@@ -1800,7 +1800,7 @@ describe("stream client - events + tool calls", () => {
 	 * carry the same frames under the same id - and the overflow trim, which eats the OLDEST buffered
 	 * frames, must not be able to reshape a chunk whose id is already spent. Getting this wrong loses a
 	 * contiguous block of the run's output, and a run whose terminal frame was in that block never
-	 * finalizes: the viewer hangs and the schedule is never recorded as done.
+	 * finalizes: the viewer hangs and the automation is never recorded as done.
 	 */
 	it("retries a lost POST with the SAME frames under its spent batch id, even after overflow trimming", async () => {
 		const posts: Array<{ batchId: number; texts: string[] }> = [];
@@ -2682,7 +2682,7 @@ describe("stream client - mid-session auth health", () => {
 describe("stream client - 429 backoff", () => {
 	// The backend's per-runner request budget answers an over-budget daemon with a 429 carrying a
 	// `Retry-After`. The daemon must park for the server's number instead of returning on its own
-	// schedule: reconnecting sooner spends budget it does not have and recovers no sooner.
+	// automation: reconnecting sooner spends budget it does not have and recovers no sooner.
 	//
 	// Both cooldowns are observed the only way production consumes them - through the injected `sleep`
 	// seam, from inside the real loops `start()` runs (see `reconnectDelays` / `flushDelays`).
@@ -2730,7 +2730,7 @@ describe("stream client - 429 backoff", () => {
 		const http: HttpClient = async (url) => {
 			if (url.endsWith("/connect")) return ok({ runnerId: "u1:d1", wireToken: "wt" });
 			// Cloudflare / a load balancer / nginx / an API gateway can refuse the open in front of the
-			// backend, and none of them speak our `Retry-After`. Falling back to the ordinary schedule here
+			// backend, and none of them speak our `Retry-After`. Falling back to the ordinary automation here
 			// would hammer a closed door, which is exactly the flooding this backoff exists to prevent.
 			if (url.includes("/poll")) return { status: 429, json: async () => ({}) };
 			return ok({});
@@ -2875,7 +2875,7 @@ describe("stream client - a chunk /events will not take", () => {
 
 	it("re-sends the terminal frame of a chunk it gave up on, so the run's slot is released", async () => {
 		// Dropping the batch that happened to carry the terminal frame would strand the run exactly as
-		// replaying forever did: nothing else releases its slot, and nothing else finalizes a schedule.
+		// replaying forever did: nothing else releases its slot, and nothing else finalizes an automation.
 		const { client, calls, hooks } = await clientWithRun((body) =>
 			body.batchId === 0 ? { status: 400, json: async () => ({}) } : ok({ cancel: [] })
 		);
@@ -2961,7 +2961,7 @@ describe("backend http - Retry-After parsing", () => {
 	 * A backend deploy drops every held connection at once, and the reconnect storm exhausts the
 	 * per-runner `/stream` budget. An opener that never read the header sent the daemon to its
 	 * header-less default instead - 90 seconds parked for a backend that asked for 5, with presence
-	 * deleted the whole time, so every schedule firing in that window went to the paid cloud fallback.
+	 * deleted the whole time, so every automation firing in that window went to the paid cloud fallback.
 	 */
 	it("parks the daemon for the window the refused stream named, not the header-less default", async () => {
 		const spy = stubFetch(new Response("", { status: 429, headers: { "retry-after": "5" } }));

@@ -66,7 +66,7 @@ function makeDeps(over: Partial<ExecutorDeps> = {}): ExecutorDeps {
 			cancelAll: () => {}
 		},
 		getConnection: () => conn,
-		getOriginPolicy: () => ({ denySchedule: false, denyDispatch: false }),
+		getOriginPolicy: () => ({ denyAutomation: false, denyDispatch: false }),
 		resolveBinary: () => "/bin/claude",
 		serveTools: async () => ({ spec: { type: "http", url: "x" }, close: async () => {} }),
 		shouldServe: () => false,

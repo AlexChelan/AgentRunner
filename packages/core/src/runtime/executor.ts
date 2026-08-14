@@ -76,7 +76,7 @@ export interface ExecutorDeps {
 	/**
 	 * Returns the device origin policy the run's DERIVED kind is checked against. The daemon resolves ONE
 	 * policy per paired backend (keyed by `backendUrl`), so its implementation ignores `productId`; the
-	 * argument is kept for the seam's shape. A denied `schedule`/`dispatch` run is refused locally before
+	 * argument is kept for the seam's shape. A denied `automation`/`dispatch` run is refused locally before
 	 * any CLI spawn; `chat` is never deniable.
 	 */
 	getOriginPolicy(productId: string): OriginPolicy;
@@ -117,6 +117,29 @@ export interface ExecutorDeps {
 	agentGid?: number;
 }
 
+/** Per-dispatch options for {@link Executor.start}, outside the frozen RunStart wire type. */
+export interface StartRunOpts {
+	/**
+	 * Overrides the work-tree key this ONE run is confined under (`work/<key>/<productId>/`), for the
+	 * local leg's project workspaces. Absent means the constructed `backendKey` - the paired daemon never
+	 * sets it, so its behavior is unchanged.
+	 *
+	 * It moves the FOLDER and nothing else. The run's posture (the capability floor, the local-scope
+	 * raise) keeps reading `deps.backendKey`, so a project workspace never trades the local leg's capability
+	 * for its own folder and a paired backend cannot lift its floor by naming a local-looking key.
+	 */
+	workKey?: string;
+	/**
+	 * Runs this ONE dispatch in the project's CONNECTED folder - a real folder of the user's, outside the
+	 * managed `work/` tree - instead of the work folder. The caller has already re-resolved and re-judged the
+	 * stored grant (`connectedFolderForRun`); the paired daemon never sets it, so its behavior is unchanged.
+	 *
+	 * Like {@link StartRunOpts.workKey} it moves the FOLDER and nothing else, and it is recorded: the audit
+	 * entry names the cwd the run actually executes in.
+	 */
+	connectedFolder?: string;
+}
+
 /** Starts and cancels dispatched runs. */
 export interface Executor {
 	/**
@@ -135,8 +158,11 @@ export interface Executor {
 	 * desktop app's own chats, where the user IS present - a read-only agent that cannot act, and a
 	 * backend-dispatched run is not made safe by this answer either way: its boundary is the capability
 	 * floor `buildRun` applies, which leaves nothing dangerous to approve.
+	 *
+	 * `opts` are per-dispatch overrides the CALLER supplies (never the wire); omitting them leaves the
+	 * dispatch exactly as it was before the seam existed.
 	 */
-	start(start: RunStart, hooks: RunHooks): void;
+	start(start: RunStart, hooks: RunHooks, opts?: StartRunOpts): void;
 	/** Cancels an in-flight run by id. */
 	cancel(runId: string): void;
 	/** The number of runs currently in flight (dispatched, not yet closed); summed for idle-gating. */
@@ -173,15 +199,17 @@ function promptFingerprint(start: RunStart): string {
 
 /** Human labels for the deniable run kinds, used in the refusal error frame surfaced to the backend. */
 const RUN_KIND_LABEL: Record<RunKind, string> = {
-	schedule: "scheduled",
+	automation: "automated",
 	dispatch: "app-dispatched",
 	chat: "chat"
 };
 
 /**
- * The `detail` bag recorded on a `refused` audit entry: the run's attribution (`origin`/`scheduleId`
+ * The `detail` bag recorded on a `refused` audit entry: the run's attribution (`origin`/`automationId`
  * when present, mirroring what the derivation read) plus the fixed `origin_denied` reason. `detail` is
  * a `Record<string, string>`, so absent optionals are omitted rather than serialized as `undefined`.
+ * The automation id arrives on the wire's frozen `scheduleId` and is recorded under the local
+ * `automationId` name.
  *
  * @param start - The refused run descriptor.
  * @returns The audit `detail` for the refusal.
@@ -189,7 +217,7 @@ const RUN_KIND_LABEL: Record<RunKind, string> = {
 function refusalDetail(start: RunStart): Record<string, string> {
 	return {
 		...(start.origin ? { origin: start.origin } : {}),
-		...(start.scheduleId ? { scheduleId: start.scheduleId } : {}),
+		...(start.scheduleId ? { automationId: start.scheduleId } : {}),
 		reason: "origin_denied"
 	};
 }
@@ -206,8 +234,8 @@ function refusalDetail(start: RunStart): Record<string, string> {
  * run's loopback MCP is still being served is honored (the served handle is closed and the run never
  * starts) rather than dropped.
  *
- * Before any of that, each run's kind is DERIVED (schedule | dispatch | chat) from the frozen wire
- * fields and checked against the per-backend device origin policy: a denied `schedule`/`dispatch` run
+ * Before any of that, each run's kind is DERIVED (automation | dispatch | chat) from the frozen wire
+ * fields and checked against the per-backend device origin policy: a denied `automation`/`dispatch` run
  * is refused up front (terminal error frame, CLI never started, audited `refused` and never
  * `dispatched`); a `chat` turn is never deniable.
  *
@@ -225,7 +253,7 @@ function refusalDetail(start: RunStart): Record<string, string> {
  * and is handed no work for the life of the daemon, while the self-updater's idle gate
  * (`totalActiveRuns() === 0`) never opens and the daemon stops updating itself. The guard turns such a
  * throw into the same terminal error frame every other refusal produces, which is also what the
- * callers need: the local schedule runner settles on `onClose`, and the local fallback dispatches its
+ * callers need: the local automation runner settles on `onClose`, and the local fallback dispatches its
  * second CLI on seeing a pre-execution `error`, so a throw that skipped both stranded them too. The
  * frame is emitted BEFORE the close for exactly that reason, and the release sits in a `finally` so a
  * throwing host hook cannot re-open the leak. The wire message is FIXED, so no local path or
@@ -256,7 +284,7 @@ export function createExecutor(deps: ExecutorDeps): Executor {
 	const active = new Set<string>();
 
 	return {
-		start(start, hooks): void {
+		start(start, hooks, opts): void {
 			// Mark this run in flight and route every close path through `finish`, so the active set always
 			// reflects the true lifecycle (start -> onClose) whichever branch closes the run.
 			active.add(start.runId);
@@ -274,7 +302,7 @@ export function createExecutor(deps: ExecutorDeps): Executor {
 			) => void = () => undefined;
 
 			try {
-				// Derive this run's kind (schedule | dispatch | chat) from the frozen wire fields and refuse it
+				// Derive this run's kind (automation | dispatch | chat) from the frozen wire fields and refuse it
 				// locally when this backend's device origin policy denies that kind. This runs BEFORE the
 				// connection lookup, any CLI spawn, and the `dispatched` audit append, so a denied run never
 				// executes and is recorded ONLY as `refused` (never `dispatched`). Chat is never deniable, so a
@@ -337,6 +365,10 @@ export function createExecutor(deps: ExecutorDeps): Executor {
 				const { ctx, req, resolvers, effectivePolicy } = buildRun({
 					appDataRoot: deps.appDataRoot,
 					backendKey: deps.backendKey,
+					...(opts?.workKey !== undefined ? { workKey: opts.workKey } : {}),
+					...(opts?.connectedFolder !== undefined
+						? { connectedFolder: opts.connectedFolder }
+						: {}),
 					start,
 					connection,
 					resolveBinary: deps.resolveBinary,
@@ -363,7 +395,11 @@ export function createExecutor(deps: ExecutorDeps): Executor {
 						toolId: connection.toolId,
 						promptSha256: promptFingerprint(start),
 						policy: effectivePolicy,
-						...(start.origin ? { detail: { origin: start.origin } } : {})
+						// The EFFECTIVE cwd, exactly as `buildRun` resolved it - the project's connected folder
+						// when one is in play, the managed work folder otherwise. A run that edits the user's own
+						// files must not be recorded against the sandbox it did not use; the `terminal` entry has
+						// named its folder since Phase 1 for the same reason.
+						detail: { ...(start.origin ? { origin: start.origin } : {}), cwd: ctx.cwd }
 					});
 				} catch (err) {
 					// Surface the underlying cause (disk-full vs permission) in the LOCAL daemon log so an operator

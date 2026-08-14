@@ -72,8 +72,8 @@ describe('two SaaS logins on one machine', () => {
     expect(h.secrets.get(bearerKey(a))).toBe('tok-a')
     expect(h.secrets.get(bearerKey(b))).toBe('tok-b')
 
-    const folderA = resolveWorkFolder({ appDataRoot: h.root, backendKey: backendKey(a), productId: PRODUCT })
-    const folderB = resolveWorkFolder({ appDataRoot: h.root, backendKey: backendKey(b), productId: PRODUCT })
+    const folderA = resolveWorkFolder({ appDataRoot: h.root, workKey: backendKey(a), productId: PRODUCT })
+    const folderB = resolveWorkFolder({ appDataRoot: h.root, workKey: backendKey(b), productId: PRODUCT })
     expect(folderA).not.toBe(folderB)
 
     // The data-leak assertion: a file user A's agent wrote is not visible to user B's agent.

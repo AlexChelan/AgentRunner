@@ -35,6 +35,25 @@ function seedRetiredCeiling(
 	writeFileSync(file, JSON.stringify(document));
 }
 
+/**
+ * Writes an origin policy the way a build from before the schedules -> automations rename left it:
+ * straight into the document, under whichever spellings the caller names.
+ *
+ * @param dir - The app-data dir the store lives in.
+ * @param scope - The scope the policy was stored under.
+ * @param policy - The raw stored shape, legacy `denySchedule` included.
+ */
+function seedLegacyOriginPolicy(
+	dir: string,
+	scope: string,
+	policy: { denySchedule?: boolean; denyAutomation?: boolean; denyDispatch?: boolean }
+): void {
+	const file = join(dir, `${brand().binary}-state.json`);
+	const document = existsSync(file) ? JSON.parse(readFileSync(file, "utf8")) : {};
+	document.originPolicies = { ...document.originPolicies, [scope]: policy };
+	writeFileSync(file, JSON.stringify(document));
+}
+
 describe("state store", () => {
 	it("generates a stable device id once and reuses it", () => {
 		const store = createStateStore({ cwd: freshDir() });
@@ -130,18 +149,18 @@ describe("state store", () => {
 
 	it("returns the allow-all default origin policy when unset (deny lives in the backend grant)", () => {
 		const store = createStateStore({ cwd: freshDir() });
-		expect(store.getOriginPolicy(BACKEND)).toEqual({ denySchedule: false, denyDispatch: false });
+		expect(store.getOriginPolicy(BACKEND)).toEqual({ denyAutomation: false, denyDispatch: false });
 	});
 
 	it("sets and reads back an origin policy for a paired backend (a fresh read sees it)", () => {
 		const dir = freshDir();
 		const store = createStateStore({ cwd: dir });
 		store.upsertPairedBackend(BACKEND, { backendUrl: BACKEND, deviceId: "d1", userId: "u1" });
-		store.setOriginPolicy(BACKEND, { denySchedule: true, denyDispatch: false });
-		expect(store.getOriginPolicy(BACKEND)).toEqual({ denySchedule: true, denyDispatch: false });
+		store.setOriginPolicy(BACKEND, { denyAutomation: true, denyDispatch: false });
+		expect(store.getOriginPolicy(BACKEND)).toEqual({ denyAutomation: true, denyDispatch: false });
 		// A fresh store re-reads the file, so the daemon's per-run fresh read picks up the new policy.
 		expect(createStateStore({ cwd: dir }).getOriginPolicy(BACKEND)).toEqual({
-			denySchedule: true,
+			denyAutomation: true,
 			denyDispatch: false
 		});
 	});
@@ -149,29 +168,74 @@ describe("state store", () => {
 	it("refuses to set an origin policy for a backend that is not paired", () => {
 		const store = createStateStore({ cwd: freshDir() });
 		expect(() =>
-			store.setOriginPolicy("https://unpaired.example", { denySchedule: true, denyDispatch: true })
+			store.setOriginPolicy("https://unpaired.example", { denyAutomation: true, denyDispatch: true })
 		).toThrow();
 	});
 
 	it("clears a backend origin policy when the backend is removed", () => {
 		const store = createStateStore({ cwd: freshDir() });
 		store.upsertPairedBackend(BACKEND, { backendUrl: BACKEND, deviceId: "d1", userId: "u1" });
-		store.setOriginPolicy(BACKEND, { denySchedule: true, denyDispatch: true });
+		store.setOriginPolicy(BACKEND, { denyAutomation: true, denyDispatch: true });
 		store.removePairedBackend(BACKEND);
 		// Back to the allow-all default (the per-backend record is gone with the pairing).
-		expect(store.getOriginPolicy(BACKEND)).toEqual({ denySchedule: false, denyDispatch: false });
+		expect(store.getOriginPolicy(BACKEND)).toEqual({ denyAutomation: false, denyDispatch: false });
+	});
+
+	// The schedules -> automations rename renamed a key this store PERSISTS, on a published runner. A
+	// record left by an older build spells the automation refusal `denySchedule`, and reading only the
+	// new key would hand back `undefined` - turning a device its owner set to REFUSE unattended runs
+	// back into one that accepts them, silently, on upgrade. These three pin that shut.
+	it("honors a stored denySchedule from before the automations rename, so the refusal survives an upgrade", () => {
+		const dir = freshDir();
+		seedLegacyOriginPolicy(dir, BACKEND, { denySchedule: true, denyDispatch: false });
+		expect(createStateStore({ cwd: dir }).getOriginPolicy(BACKEND)).toEqual({
+			denyAutomation: true,
+			denyDispatch: false
+		});
+	});
+
+	it("lets the current denyAutomation key win when a record carries both spellings", () => {
+		const dir = freshDir();
+		seedLegacyOriginPolicy(dir, BACKEND, {
+			denySchedule: true,
+			denyAutomation: false,
+			denyDispatch: false
+		});
+		expect(createStateStore({ cwd: dir }).getOriginPolicy(BACKEND)).toEqual({
+			denyAutomation: false,
+			denyDispatch: false
+		});
+	});
+
+	it("leaves a record written by this build alone (no legacy key, both halves preserved)", () => {
+		const dir = freshDir();
+		const store = createStateStore({ cwd: dir });
+		store.upsertPairedBackend(BACKEND, { backendUrl: BACKEND, deviceId: "d1", userId: "u1" });
+		store.setOriginPolicy(BACKEND, { denyAutomation: true, denyDispatch: true });
+		expect(createStateStore({ cwd: dir }).getOriginPolicy(BACKEND)).toEqual({
+			denyAutomation: true,
+			denyDispatch: true
+		});
+		// Read-side only: the migration never rewrites, so the document keeps exactly what was set.
+		const document: unknown = JSON.parse(
+			readFileSync(join(dir, `${brand().binary}-state.json`), "utf8")
+		);
+		expect(document).toMatchObject({
+			originPolicies: { [BACKEND]: { denyAutomation: true, denyDispatch: true } }
+		});
+		expect(JSON.stringify(document)).not.toContain("denySchedule");
 	});
 
 	it("carries origin policies through a pairing-substrate snapshot/replace round-trip (migration-safe)", () => {
 		const dir = freshDir();
 		const store = createStateStore({ cwd: dir });
 		store.upsertPairedBackend(BACKEND, { backendUrl: BACKEND, deviceId: "d1", userId: "u1" });
-		store.setOriginPolicy(BACKEND, { denySchedule: false, denyDispatch: true });
+		store.setOriginPolicy(BACKEND, { denyAutomation: false, denyDispatch: true });
 		const snapshot = store.snapshotPairingState();
-		expect(snapshot.originPolicies[BACKEND]).toEqual({ denySchedule: false, denyDispatch: true });
+		expect(snapshot.originPolicies[BACKEND]).toEqual({ denyAutomation: false, denyDispatch: true });
 		// Re-persisting the snapshot (what the canonicalization migration does) keeps the origin policy.
 		store.replacePairingState(snapshot);
-		expect(store.getOriginPolicy(BACKEND)).toEqual({ denySchedule: false, denyDispatch: true });
+		expect(store.getOriginPolicy(BACKEND)).toEqual({ denyAutomation: false, denyDispatch: true });
 	});
 
 	// The terminal approval setting is the ONE permission a user still owns, and a terminal session is
@@ -324,7 +388,7 @@ describe("state store", () => {
 		const store = createStateStore({ cwd: freshDir() });
 		store.upsertPairedBackend(BACKEND, { backendUrl: BACKEND, deviceId: "d1", userId: "u1" });
 		store.upsertConnection(BACKEND, { toolId: "codex", source: "reused", authHealth: "healthy" });
-		store.setOriginPolicy(BACKEND, { denySchedule: true, denyDispatch: true });
+		store.setOriginPolicy(BACKEND, { denyAutomation: true, denyDispatch: true });
 		store.setTerminalApproval(BACKEND, "bypass");
 		store.upsertMcpServer(BACKEND, "linear", { type: "stdio", command: "linear-mcp" });
 		store.removePairedBackend(BACKEND);
@@ -333,7 +397,7 @@ describe("state store", () => {
 		// Unpairing must leave NO residue a re-pair could inherit: the origin policy and the terminal
 		// approvals fall back to their defaults, and the user's local MCP servers for that backend are gone.
 		// A stale `bypass` here would silently spawn the NEXT pairing's sessions with the prompts off.
-		expect(store.getOriginPolicy(BACKEND)).toEqual({ denySchedule: false, denyDispatch: false });
+		expect(store.getOriginPolicy(BACKEND)).toEqual({ denyAutomation: false, denyDispatch: false });
 		expect(store.getTerminalApproval(BACKEND)).toBe("prompt");
 		expect(store.listMcpServers(BACKEND)).toEqual({});
 	});
@@ -404,9 +468,9 @@ describe("state store", () => {
 		// LOCAL mode has no paired backend, yet the local user still configures an origin policy and MCP
 		// servers for their purely-local sessions - so the integrity guard makes an exception for this ONE
 		// key. Every read then sees exactly what was written under the local scope.
-		store.setOriginPolicy(LOCAL_SCOPE, { denySchedule: true, denyDispatch: false });
+		store.setOriginPolicy(LOCAL_SCOPE, { denyAutomation: true, denyDispatch: false });
 		store.upsertMcpServer(LOCAL_SCOPE, "linear", { type: "stdio", command: "linear-mcp" });
-		expect(store.getOriginPolicy(LOCAL_SCOPE)).toEqual({ denySchedule: true, denyDispatch: false });
+		expect(store.getOriginPolicy(LOCAL_SCOPE)).toEqual({ denyAutomation: true, denyDispatch: false });
 		expect(store.listMcpServers(LOCAL_SCOPE)).toEqual({
 			linear: { type: "stdio", command: "linear-mcp" }
 		});
@@ -418,7 +482,7 @@ describe("state store", () => {
 		// The local exception is exactly one key; a real backend URL with no pairing still fails closed so
 		// no orphan config can accumulate under a URL that has no pairing to be read for.
 		expect(() =>
-			store.setOriginPolicy(unpaired, { denySchedule: true, denyDispatch: true })
+			store.setOriginPolicy(unpaired, { denyAutomation: true, denyDispatch: true })
 		).toThrow();
 		expect(() =>
 			store.upsertMcpServer(unpaired, "linear", { type: "stdio", command: "linear-mcp" })

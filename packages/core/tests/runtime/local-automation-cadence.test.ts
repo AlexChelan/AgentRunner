@@ -9,8 +9,8 @@ import {
 	MIN_INTERVAL_MINUTES,
 	nextCronOccurrenceMs,
 	toCadence
-} from "../../src/runtime/local/schedule-cadence";
-import type { ScheduleCadence } from "../../src/runtime/local/schedule-cadence";
+} from "../../src/runtime/local/automation-cadence";
+import type { AutomationCadence } from "../../src/runtime/local/automation-cadence";
 
 const MINUTE = 60_000;
 
@@ -200,30 +200,30 @@ describe("nextCronOccurrenceMs", () => {
 describe("displayNextRunAtMs", () => {
 	const now = Date.parse("2026-06-01T12:00:00.000Z");
 
-	it("shows a never-run interval schedule as due NOW, which is when it really fires", () => {
+	it("shows a never-run interval automation as due NOW, which is when it really fires", () => {
 		// A fresh interval row is due on the next tick (pinned dueness), so projecting one interval out
-		// would display a time the schedule will have already fired well before.
-		const cadence: ScheduleCadence = { intervalMinutes: 30 };
+		// would display a time the automation will have already fired well before.
+		const cadence: AutomationCadence = { intervalMinutes: 30 };
 		expect(displayNextRunAtMs(cadence, {}, now)).toBe(now);
 		expect(displayNextRunAtMs(cadence, { armedNextRunAtMs: now + 5 * MINUTE }, now)).toBe(now);
 	});
 
-	it("projects an interval schedule from its last run, clamped to NOW when overdue", () => {
-		const cadence: ScheduleCadence = { intervalMinutes: 30 };
+	it("projects an interval automation from its last run, clamped to NOW when overdue", () => {
+		const cadence: AutomationCadence = { intervalMinutes: 30 };
 		expect(displayNextRunAtMs(cadence, { lastRunAtMs: now - 10 * MINUTE }, now)).toBe(
 			now + 20 * MINUTE
 		);
 		expect(displayNextRunAtMs(cadence, { lastRunAtMs: now - 300 * MINUTE }, now)).toBe(now);
 	});
 
-	it("uses a cron schedule's ARMED instant when the runner has armed one", () => {
+	it("uses a cron automation's ARMED instant when the runner has armed one", () => {
 		const armed = now + 7 * MINUTE;
 		expect(
 			displayNextRunAtMs({ cron: "0 9 * * *", timezone: "UTC" }, { armedNextRunAtMs: armed }, now)
 		).toBe(armed);
 	});
 
-	it("computes the next occurrence for an UNARMED cron schedule", () => {
+	it("computes the next occurrence for an UNARMED cron automation", () => {
 		expect(displayNextRunAtMs({ cron: "0 9 * * *", timezone: "UTC" }, {}, now)).toBe(
 			Date.parse("2026-06-02T09:00:00.000Z")
 		);

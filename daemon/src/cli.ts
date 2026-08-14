@@ -62,8 +62,8 @@ const USAGE =
   '  status [--json]                              print pairing + per-CLI connection state (--json: machine-readable)\n' +
   '  backends                                     list paired backends (device id, connected CLIs, daemon state)\n' +
   '  log [--url <backend>] [--json] [-n <count>]  print the local audit trail (oldest-first; --json for piping)\n' +
-  '  origin [show] [--url <backend>] [--local]    whether this device accepts scheduled / app-dispatched work\n' +
-  '  origin set (--url <backend> | --local) [--schedule <allow|deny>] [--dispatch <allow|deny>]\n' +
+  '  origin [show] [--url <backend>] [--local]    whether this device accepts automated / app-dispatched work\n' +
+  '  origin set (--url <backend> | --local) [--automation <allow|deny>] [--dispatch <allow|deny>]\n' +
   '                                               refuse (or re-allow) a kind of work on THIS machine;\n' +
   '                                               chat is always allowed and an omitted flag is kept\n' +
   '  approvals [show] [--url <backend>] [--local]  whether a terminal session leaves your CLI its own approval prompts\n' +
@@ -108,7 +108,7 @@ const RETIRED_COMMANDS: Record<string, string> = {
     'The NETWORK half is a real change: `--network off` no longer air-gaps a pairing. A ' +
     'dispatched run that ASKS for egress now gets it (so the CLI keeps its own web tools); one that ' +
     'asks for nothing is still clamped off.\n' +
-    `Use \`${BRAND.binary} origin\` to refuse scheduled or app-dispatched work on this machine outright, ` +
+    `Use \`${BRAND.binary} origin\` to refuse automated or app-dispatched work on this machine outright, ` +
     `and \`${BRAND.binary} status\` to print what a paired app can and cannot do here.`
 }
 

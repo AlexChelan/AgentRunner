@@ -6,10 +6,10 @@ import { dirname } from "node:path";
  * created on demand `chmod 700`, the payload is written to a per-process temp sibling (`<file>.tmp-<pid>`)
  * `chmod 600`, then `renameSync`d into place - a POSIX rename is atomic, so a crash mid-write never leaves
  * a partial or world-readable file at the real path. This is the single write path the daemon-local JSON
- * stores (chat, schedule, task-override) share, so their durability and permission semantics stay
+ * stores (chat, automation, task-override) share, so their durability and permission semantics stay
  * identical rather than drifting between hand-rolled copies. On Linux the app-data root sits under a
  * world-executable `~/.local/share`, so the owner-only dir + file modes are what keep another local user
- * from reading the stored transcripts, schedules, and overrides.
+ * from reading the stored transcripts, automations, and overrides.
  *
  * @param file - The destination path; its parent directory is created if absent. Callers must have already
  *   validated any user-controlled path segment (e.g. `assertSessionKey`) so the path cannot escape the store.

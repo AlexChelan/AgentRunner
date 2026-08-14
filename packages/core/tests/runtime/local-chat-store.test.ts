@@ -184,6 +184,43 @@ describe("createLocalChatStore", () => {
 		expect(store.getConversationId("u", "a")).toBe("conv-keep");
 	});
 
+	it("appendMessages adds to an existing transcript, keeping its title and bumping updatedAt", () => {
+		const store = createLocalChatStore(chatsDir());
+		store.save("u", session({ id: "a", title: "Named", updatedAt: 1, messages: [{ id: "m1" }] }));
+		store.appendMessages("u", "a", [{ id: "m2" }, { id: "m3" }], "ignored fallback");
+		const stored = store.read("u", "a");
+		expect(stored?.messages).toEqual([{ id: "m1" }, { id: "m2" }, { id: "m3" }]);
+		// A conversation that already has a title (derived or renamed) is never relabelled by a salvage.
+		expect(stored?.title).toBe("Named");
+		expect(stored?.updatedAt).toBeGreaterThan(1);
+	});
+
+	it("appendMessages CREATES the session when none exists, adopting the fallback title", () => {
+		const store = createLocalChatStore(chatsDir());
+		// The detached-turn case: the app never saved this session, so the daemon is its first writer.
+		store.appendMessages("u", "fresh", [{ id: "m1" }], "What is the plan");
+		expect(store.read("u", "fresh")).toEqual({
+			id: "fresh",
+			title: "What is the plan",
+			updatedAt: expect.any(Number),
+			modelKey: null,
+			messages: [{ id: "m1" }]
+		});
+	});
+
+	it("appendMessages preserves the resume handle and no-ops on an empty append", () => {
+		const store = createLocalChatStore(chatsDir());
+		store.setConversationId("u", "a", "conv-keep", "codex");
+		store.appendMessages("u", "a", [{ id: "m1" }], "Title");
+		expect(store.getConversationId("u", "a", "codex")).toBe("conv-keep");
+
+		store.appendMessages("u", "a", []);
+		expect(store.read("u", "a")?.messages).toEqual([{ id: "m1" }]);
+		// An empty append must not conjure a record for a session that has none either.
+		store.appendMessages("u", "never", []);
+		expect(store.read("u", "never")).toBeNull();
+	});
+
 	it("refuses every operation whose namespace or id would escape the store", () => {
 		const store = createLocalChatStore(chatsDir());
 		// `..` and `.` PASS the charset (dots are in the class) - only the all-dots rejection stops them, so

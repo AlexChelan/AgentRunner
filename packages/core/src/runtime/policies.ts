@@ -29,7 +29,7 @@ import { isLocalScope } from "./local/scope";
  * `permissionMode: 'read-only'` is the BOTTOM of the ladder, so `clampPolicy` lands every dispatched run
  * there whatever it asked for - and the structural floor removes the filesystem and the shell besides,
  * which no mode expresses. `network: 'on'` is a CEILING, not a grant: `clampPolicy` takes egress from what
- * the run asked for, and both sides must say `on`. In practice the chat and schedule lanes ask on EVERY
+ * the run asked for, and both sides must say `on`. In practice the chat and automation lanes ask on EVERY
  * run - their backend stamps a fixed `network: 'on'` policy onto each dispatch so the CLI's own web tools
  * survive the floor - so those runs resolve to egress-on unconditionally. The unattended `off` default
  * `clampPolicy` applies is reached only by a dispatch that carries no policy at all, which is the
@@ -41,7 +41,7 @@ export const DISPATCHED_POLICY: RunPolicy = { permissionMode: "read-only", netwo
  * The posture every LOCAL surface runs under: the user's own machine, where they are sitting in front of
  * the CLI they themselves signed in. `full` means approval prompts are BYPASSED.
  *
- * It serves the desktop app's own chats and schedules driven through the local leg, and it is the
+ * It serves the desktop app's own chats and automations driven through the local leg, and it is the
  * posture a terminal session records when it runs under {@link TerminalApproval} `bypass`.
  */
 export const LOCAL_TERMINAL_POLICY: RunPolicy = { permissionMode: "full", network: "on" };
@@ -95,14 +95,14 @@ export function defaultTerminalApproval(scope: string): TerminalApproval {
  * unread and unsaid would take a security setting off a user without telling them. So it is SAID.
  *
  * It names the remedy that does exist rather than only the loss, because a notice a user cannot act on
- * is noise. What survives is the ORIGIN policy: this device can refuse a scope's scheduled and
+ * is noise. What survives is the ORIGIN policy: this device can refuse a scope's automated and
  * app-dispatched work outright, which is the stronger control for anyone who set an egress denial
  * because they did not want that backend's unattended runs on their machine.
  *
  * It also states what did NOT change, because the loss reads far worse without it: a dispatched run
  * still cannot touch the filesystem, the shell, or the user's local MCP servers, whatever it asks for.
  * What it does NOT do is soften the egress loss into a conditional. Egress resolves from what the
- * dispatching app requests, and its chat and schedule lanes request it on every run, so for a user who
+ * dispatching app requests, and its chat and automation lanes request it on every run, so for a user who
  * denied this scope the network the honest reading is that these runs reach it.
  *
  * @param scope - The account scope (or the local pseudo-scope) whose retired ceiling denied egress.
@@ -116,9 +116,9 @@ export function retiredEgressNotice(scope: string): string {
 	return (
 		`Network egress was denied for ${scope} by the retired policy command, and this build does not ` +
 		"enforce it. There is no egress setting here: egress follows what the dispatching app requests, and " +
-		"its chat and schedule lanes request it on every run, so assume those runs reach the network. What " +
+		"its chat and automation lanes request it on every run, so assume those runs reach the network. What " +
 		"they still cannot do is read, write or search a file, run a shell, or reach your local MCP servers, " +
 		"whatever they ask for. To refuse this scope's unattended work outright, run " +
-		`'${binary} origin set' with --schedule deny --dispatch deny. ${clearing}\n`
+		`'${binary} origin set' with --automation deny --dispatch deny. ${clearing}\n`
 	);
 }

@@ -17,6 +17,7 @@ import type {
 } from "../../src/runtime/terminal";
 import type { LocalAppConfig } from "../../src/runtime/local/app-config";
 import { LOCAL_SCOPE } from "../../src/runtime/local/scope";
+import { workspaceWorkKey } from "../../src/runtime/local/workspace-scope";
 import type { TerminalApproval } from "../../src/runtime/policies";
 import type { HttpClient } from "../../src/runtime/stream-client";
 import { createRecordingHttp } from "./support/fake-backend";
@@ -339,7 +340,7 @@ describe("terminal session - composing", () => {
 		expect(said).toContain(BACKEND);
 		// It names WHO fixes it (the app), and that nothing else the user relies on is broken.
 		expect(said).toContain("update it");
-		expect(said).toContain("Dispatched runs, schedules, and chat keep working");
+		expect(said).toContain("Dispatched runs, automations, and chat keep working");
 		// Fail-closed: no CLI, no loopback MCP, no audit entry for a session that never opened.
 		expect(spawn.calls).toHaveLength(0);
 		expect(mcp.opened()).toBe(0);
@@ -1067,6 +1068,9 @@ describe("terminal session - process model", () => {
  * credentials live in the environment.
  */
 
+/** A project id in the workspace charset (9 to 64 alphanumerics). */
+const PROJECT = "prj7k2m9x4qz";
+
 /** The on-device product config a local session composes from (the app stages this file). */
 const LOCAL_CONFIG: LocalAppConfig = {
 	productId: "acme",
@@ -1197,6 +1201,79 @@ describe("terminal session - local (no backend at all)", () => {
 	it("runs in the confined work folder of the CONFIG product (shared with the local chat runs)", async () => {
 		const fixture = await run();
 		expect(spawn.calls[0]?.opts.cwd).toBe(join(fixture.appDataRoot, "work", LOCAL_SCOPE, "acme"));
+	});
+
+	it("follows the caller's WORKSPACE work key, so a terminal opens where that workspace's runs do", async () => {
+		// The terminal used to be pinned to the machine-global folder while chats and automations had already
+		// moved: one project's session then edited files another project's runs had written.
+		const workKey = workspaceWorkKey(PROJECT);
+		const fixture = await run({ workKey });
+		expect(spawn.calls[0]?.opts.cwd).toBe(join(fixture.appDataRoot, "work", workKey, "acme"));
+		// ONLY the folder moves. The approval posture, the trust log's scope and the MCP wiring stay
+		// machine-global, so a workspace switch never silently re-asks for permissions already granted.
+		expect(entries(fixture.audit)[0]?.backendUrl).toBe(LOCAL_SCOPE);
+	});
+
+	it("keeps the machine-global folder when no work key is given (the no-project case)", async () => {
+		const fixture = await run({ workKey: workspaceWorkKey(null) });
+		expect(spawn.calls[0]?.opts.cwd).toBe(join(fixture.appDataRoot, "work", LOCAL_SCOPE, "acme"));
+	});
+
+	it("opens in the project's CONNECTED folder by default, and audits THAT folder", async () => {
+		// The terminal is the third consumer of the same grant, so a session opens where that project's chats
+		// and automations already run - in the user's real checkout, not the managed sandbox beside it.
+		const granted = userFolder();
+		const fixture = await run({
+			workKey: workspaceWorkKey(PROJECT),
+			resolveConnectedFolder: () => granted
+		});
+
+		expect(spawn.calls[0]?.opts.cwd).toBe(granted);
+		expect(entries(fixture.audit)[0]?.detail?.cwd).toBe(granted);
+		// Trust stays machine-global: the approval posture and the log's scope do not follow the folder.
+		expect(entries(fixture.audit)[0]?.backendUrl).toBe(LOCAL_SCOPE);
+		expect(host.exits).toEqual([]);
+	});
+
+	it("lets an explicit --cwd win over the project's connected folder", async () => {
+		// The grant says where a session goes when the user did NOT point at a folder. When they did, that
+		// pick is the more specific instruction and it wins outright.
+		const granted = userFolder();
+		const picked = userFolder();
+		await run({
+			workKey: workspaceWorkKey(PROJECT),
+			requestedCwd: picked,
+			resolveConnectedFolder: () => granted
+		});
+
+		expect(spawn.calls[0]?.opts.cwd).toBe(picked);
+	});
+
+	it("falls back to the managed work folder when the project has granted nothing", async () => {
+		const fixture = await run({
+			workKey: workspaceWorkKey(PROJECT),
+			resolveConnectedFolder: () => null
+		});
+		expect(spawn.calls[0]?.opts.cwd).toBe(
+			join(fixture.appDataRoot, "work", workspaceWorkKey(PROJECT), "acme")
+		);
+	});
+
+	it("refuses the session when the grant can no longer be honoured, spawning nothing", async () => {
+		// Never a silent fallback: dropping the user into the managed sandbox when their connected folder has
+		// vanished would look exactly like their project, and they would work in it without noticing.
+		const fixture = await run({
+			workKey: workspaceWorkKey(PROJECT),
+			resolveConnectedFolder: () => {
+				throw new Error("the folder connected to this project cannot be opened: no such folder");
+			}
+		});
+
+		expect(spawn.calls).toHaveLength(0);
+		expect(host.exits).toEqual([1]);
+		expect(fixture.lines.join("")).toContain("no such folder");
+		// And nothing was logged as opened, because nothing opened.
+		expect(entries(fixture.audit)).toEqual([]);
 	});
 
 	it("records the `terminal` event BEFORE the spawn, stamped `local`", async () => {

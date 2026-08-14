@@ -13,9 +13,9 @@
  * capability registry in `@repo/ai` declares them - both must read the same regex.
  */
 
+export { cadenceOf, toCadence } from "./automation-cadence";
+export type { AutomationCadence } from "./automation-cadence";
 export { FALLBACK_MODELS } from "./fallback-models";
 export { curateModels, fetchModelRegistry, MODELS_DEV_URL } from "./model-registry";
-export { cadenceOf, toCadence } from "./schedule-cadence";
-export type { ScheduleCadence } from "./schedule-cadence";
 export { isSafeTerminalToolName, TERMINAL_TOOL_NAME_PATTERN } from "./tool-names";
 export * from "./types";

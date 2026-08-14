@@ -49,7 +49,7 @@ describe('cli routing - log', () => {
       event: 'refused',
       runId: 'r-ref',
       productId: 'p1',
-      detail: { scheduleId: 'sch-1', reason: 'origin_denied' }
+      detail: { automationId: 'sch-1', reason: 'origin_denied' }
     })
     await run(['log'])
     expect(out.stdout).toContain('refused')

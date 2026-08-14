@@ -6,7 +6,7 @@
  * picker resolves a label from it, a BYOK run derives `{ provider, modelId }` from it.
  *
  * Intentionally PURE (zero runtime deps, no `process`/node imports) so it stays
- * importable by `@repo/ui-next` (a browser package). The frontend and the backend
+ * importable by `@repo/ui` (a browser package). The frontend and the backend
  * import these same three symbols, so the key format is identical everywhere.
  */
 

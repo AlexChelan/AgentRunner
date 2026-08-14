@@ -20,7 +20,7 @@ import type { LocalAppConfig } from "./app-config";
 import { composeLocalRun } from "./compose-local-run";
 import { dispatchWithFallback } from "./local-run-fallback";
 import type { FallbackTarget } from "./local-run-fallback";
-import type { LocalScheduleOutcome } from "./schedule-store";
+import type { LocalAutomationOutcome } from "./automation-store";
 import { LOCAL_SCOPE } from "./scope";
 
 /**
@@ -39,13 +39,13 @@ function resolveFallback(config: LocalAppConfig): FallbackTarget | null {
 }
 
 /**
- * The largest scheduled-run output the daemon-local delta collector buffers in memory, in bytes. The
- * schedule store re-caps to the same ceiling on write; this only bounds a runaway CLI's live memory.
+ * The largest automated-run output the daemon-local delta collector buffers in memory, in bytes. The
+ * automation store re-caps to the same ceiling on write; this only bounds a runaway CLI's live memory.
  */
-const MAX_SCHEDULE_OUTPUT_BYTES = 64 * 1024;
+const MAX_AUTOMATION_OUTPUT_BYTES = 64 * 1024;
 
 /** Reused encoder for measuring a delta's UTF-8 byte length against the collector bound. */
-const SCHEDULE_OUTPUT_ENCODER = new TextEncoder();
+const AUTOMATION_OUTPUT_ENCODER = new TextEncoder();
 
 /** A handle to one started local chat run (its dispatch id, matching the frames' `runId`). */
 export interface LocalRunHandle {
@@ -67,15 +67,26 @@ export interface StartLocalChatOpts {
 	conversationId?: string;
 	/** Images attached to a chat turn; refused when the resolved CLI cannot accept images. */
 	images?: RunImage[];
+	/**
+	 * The workspace work-tree key this run is confined under; absent means the LOCAL scope (the
+	 * no-project bucket).
+	 */
+	workKey?: string;
+	/**
+	 * The project's CONNECTED folder, when it has one: this turn runs THERE instead of in the managed work
+	 * folder. The caller re-resolved and re-judged the stored grant before passing it
+	 * ({@link connectedFolderForRun}) - the session neither reads the grant store nor judges a path.
+	 */
+	connectedFolder?: string;
 	/** The executor hooks each run event / conversation id / close flows through. */
 	hooks: RunHooks;
 }
 
-/** Options for {@link LocalSession.startScheduled}. */
-export interface StartScheduledOpts {
-	/** The schedule this fire finalizes; stamped as both `scheduleId` (drives the derived kind) and `origin` (audit attribution). */
-	scheduleId: string;
-	/** The prompt fired for this schedule. */
+/** Options for {@link LocalSession.startAutomated}. */
+export interface StartAutomatedOpts {
+	/** The automation this fire finalizes; stamped as both the wire's `scheduleId` (drives the derived kind) and `origin` (audit attribution). */
+	automationId: string;
+	/** The prompt fired for this automation. */
 	prompt: string;
 	/** The connection/tool id to drive; falls back to the config's `defaultCli`. */
 	cli?: string;
@@ -84,14 +95,25 @@ export interface StartScheduledOpts {
 	/** Optional reasoning effort for this fire; a discovered level may be any advertised string. */
 	effort?: string;
 	/**
+	 * The workspace work-tree key this run is confined under; absent means the LOCAL scope (the
+	 * no-project bucket).
+	 */
+	workKey?: string;
+	/**
+	 * The project's CONNECTED folder, when it has one: this fire runs THERE instead of in the managed work
+	 * folder. The runner re-resolved and re-judged the stored grant before passing it
+	 * ({@link connectedFolderForRun}); a fire whose grant could not be honoured never reaches here.
+	 */
+	connectedFolder?: string;
+	/**
 	 * Settles the fire EXACTLY ONCE with its terminal outcome and the collected assistant text. `outcome`
 	 * is `null` when the run closed without a terminal event (a drain/cancel), meaning the caller should
-	 * leave the schedule's prior run state intact. `completed` with empty text is a valid "ran, no output".
+	 * leave the automation's prior run state intact. `completed` with empty text is a valid "ran, no output".
 	 *
 	 * @param outcome - The classified outcome, or `null` to leave the prior run state.
 	 * @param outputText - The collected assistant delta text (empty when there was none).
 	 */
-	onDone(outcome: LocalScheduleOutcome | null, outputText: string): void;
+	onDone(outcome: LocalAutomationOutcome | null, outputText: string): void;
 }
 
 /** A purely-local run session: composes + drives chats through the executor with NO backend transport. */
@@ -102,23 +124,23 @@ export interface LocalSession {
 	 * a run that terminates through the executor's `Unknown connection` error frame (a handle is returned).
 	 * Returns `{ refused }` ONLY when no CLI can be resolved at all (neither `opts.cli` nor a config default).
 	 *
-	 * @param opts - The prompt, optional CLI/model/effort/conversation overrides, and the run hooks.
+	 * @param opts - The prompt, optional CLI/model/effort/conversation/folder overrides, and the run hooks.
 	 * @returns The started run's handle, or a refusal when no CLI could be resolved.
 	 */
 	startChat(opts: StartLocalChatOpts): LocalRunHandle | { refused: string };
 	/**
-	 * Composes and fires ONE scheduled run through the SAME audited executor chain as {@link startChat},
-	 * stamping `scheduleId` (which drives the derived `schedule` kind, so the LOCAL origin policy's
-	 * `denySchedule` gates it) and `origin` = the scheduleId (folded into the dispatched audit for
+	 * Composes and fires ONE automated run through the SAME audited executor chain as {@link startChat},
+	 * stamping the wire's `scheduleId` (which drives the derived `automation` kind, so the LOCAL origin
+	 * policy's `denyAutomation` gates it) and `origin` = the same id (folded into the dispatched audit for
 	 * attribution). No `conversationId` - each fire is a fresh turn. The assistant `delta` text is
 	 * collected into a bounded buffer and handed to `opts.onDone` on settle, classified against the
-	 * fire-time `denySchedule` read: `done` -> `completed`; an `error` while policy-denied -> `refused`;
+	 * fire-time `denyAutomation` read: `done` -> `completed`; an `error` while policy-denied -> `refused`;
 	 * any other `error` -> `failed`; a close with no terminal event (drain/cancel) -> `null` (leave the
 	 * prior run state). `onDone` fires EXACTLY ONCE, including when no CLI can be resolved (`failed`).
 	 *
-	 * @param opts - The schedule id, prompt, optional CLI/model/effort, and the settle callback.
+	 * @param opts - The automation id, prompt, optional CLI/model/effort/folder overrides, and the settle callback.
 	 */
-	startScheduled(opts: StartScheduledOpts): void;
+	startAutomated(opts: StartAutomatedOpts): void;
 	/**
 	 * Cancels an in-flight local run by id (a no-op for an unknown id).
 	 *
@@ -163,8 +185,10 @@ export interface LocalSessionDeps {
  * user's own local MCP servers) and drives it through the SAME {@link createExecutor}
  * pipeline the paired daemon uses, scoped to the {@link LOCAL_SCOPE} pseudo-backend so its work tree,
  * policy ceiling, origin policy, and audit stamps live in the same per-backend stores under the `local`
- * key. Every dispatched run is audited fail-closed and confined to `work/local/<productId>/` with the
- * daemon's own `secrets/` denied to the CLI, exactly like a dispatched run.
+ * key. Every dispatched run is audited fail-closed and confined to `work/local/<productId>/` - or to
+ * `work/<workKey>/<productId>/` when the caller names a project workspace's work key, or to the project's
+ * CONNECTED folder when the caller passes one, each of which moves the FOLDER only - with the daemon's own
+ * `secrets/` denied to the CLI, exactly like a dispatched run.
  *
  * The retired `policy set --local --network off` wrote its egress denial against this scope too, and it
  * has no successor here either, so building the session states it ({@link retiredEgressNotice}) exactly
@@ -215,13 +239,19 @@ export function createLocalSession(deps: LocalSessionDeps): LocalSession {
 	// the duration of its SYNCHRONOUS request build, then clears them. Used per-dispatch so a fallback
 	// re-dispatch (which reuses the same servers for the same product) still finds them. A local run never
 	// serves web tools (empty manifest), so `executor.start` builds the request in the same synchronous tick.
+	//
+	// The third parameter is load-bearing: a shorter arrow still satisfies `typeof executor.start`, so
+	// dropping it would SILENTLY swallow every per-dispatch option with a green typecheck - running a
+	// project workspace's chat in the no-project work tree (the work key), or in the managed sandbox
+	// instead of the folder the user connected (the connected folder). Both are pinned by tests that assert
+	// the resulting cwd, for the primary AND the fallback dispatch.
 	const withLocalServers = (
 		mcpServers: Record<string, McpServerSpec>
 	): { start: typeof executor.start } => ({
-		start: (start, hooks) => {
+		start: (start, hooks, opts) => {
 			pendingLocalServers.set(start.productId, mcpServers);
 			try {
-				executor.start(start, hooks);
+				executor.start(start, hooks, opts);
 			} finally {
 				pendingLocalServers.delete(start.productId);
 			}
@@ -280,14 +310,20 @@ export function createLocalSession(deps: LocalSessionDeps): LocalSession {
 					? null
 					: fallback;
 			const dispatcher = withLocalServers(composed.mcpServers);
-			dispatchWithFallback(dispatcher, composed.start, opts.hooks, imageSafeFallback);
+			// An absent work key (or connected folder) is passed through as an undefined field rather than an
+			// absent options object: the executor reads `opts?.<field> !== undefined`, so the two are the same
+			// dispatch.
+			dispatchWithFallback(dispatcher, composed.start, opts.hooks, imageSafeFallback, {
+				workKey: opts.workKey,
+				connectedFolder: opts.connectedFolder
+			});
 			return { runId: composed.start.runId };
 		},
-		startScheduled(opts): void {
+		startAutomated(opts): void {
 			const config = deps.config();
 			const cli = opts.cli ?? config.defaultCli;
 			if (!cli) {
-				// No CLI to fire on (misconfiguration): settle failed so the schedule records an honest
+				// No CLI to fire on (misconfiguration): settle failed so the automation records an honest
 				// attempt, without composing or dispatching anything.
 				opts.onDone("failed", "");
 				return;
@@ -310,17 +346,18 @@ export function createLocalSession(deps: LocalSessionDeps): LocalSession {
 				);
 			}
 
-			// Classify deterministically: read the LOCAL origin policy AT FIRE TIME. A denied scheduled run
+			// Classify deterministically: read the LOCAL origin policy AT FIRE TIME. A denied automated run
 			// STILL reaches executor.start (which writes the fail-closed `refused` audit entry), but its
 			// error frame is the DENIAL, not a run failure - so an error while denied settles `refused`.
-			const denied = readState().getOriginPolicy(LOCAL_SCOPE).denySchedule;
+			const denied = readState().getOriginPolicy(LOCAL_SCOPE).denyAutomation;
 
-			// Stamp scheduleId (drives the derived `schedule` kind, which wins over origin) and origin = the
-			// scheduleId (attribution folded into the dispatched audit). composeLocalRun is NOT modified.
+			// Stamp the automation id onto the wire's frozen `scheduleId` (it drives the derived `automation`
+			// kind, which wins over origin) and origin = the same id (attribution folded into the dispatched
+			// audit). composeLocalRun is NOT modified.
 			const start: RunStart = {
 				...composed.start,
-				scheduleId: opts.scheduleId,
-				origin: opts.scheduleId
+				scheduleId: opts.automationId,
+				origin: opts.automationId
 			};
 
 			const chunks: string[] = [];
@@ -334,9 +371,9 @@ export function createLocalSession(deps: LocalSessionDeps): LocalSession {
 					if (event.type === "delta") {
 						// Bounded collector: stop appending past the ceiling so a runaway CLI cannot exhaust memory
 						// (the store re-caps precisely on write). `delta` is the only assistant-text source.
-						if (collectedBytes < MAX_SCHEDULE_OUTPUT_BYTES) {
+						if (collectedBytes < MAX_AUTOMATION_OUTPUT_BYTES) {
 							chunks.push(event.text);
-							collectedBytes += SCHEDULE_OUTPUT_ENCODER.encode(event.text).length;
+							collectedBytes += AUTOMATION_OUTPUT_ENCODER.encode(event.text).length;
 						}
 					} else if (event.type === "done") {
 						terminal = "done";
@@ -349,7 +386,7 @@ export function createLocalSession(deps: LocalSessionDeps): LocalSession {
 				onClose: () => {
 					if (settled) return;
 					settled = true;
-					const outcome: LocalScheduleOutcome | null =
+					const outcome: LocalAutomationOutcome | null =
 						terminal === "done"
 							? "completed"
 							: terminal === "error"
@@ -362,7 +399,10 @@ export function createLocalSession(deps: LocalSessionDeps): LocalSession {
 			};
 
 			const dispatcher = withLocalServers(composed.mcpServers);
-			dispatchWithFallback(dispatcher, start, hooks, resolveFallback(config));
+			dispatchWithFallback(dispatcher, start, hooks, resolveFallback(config), {
+				workKey: opts.workKey,
+				connectedFolder: opts.connectedFolder
+			});
 		},
 		cancel(runId): void {
 			executor.cancel(runId);

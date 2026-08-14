@@ -4,8 +4,8 @@ import { writeJsonFileAtomic } from "./atomic-file";
 import { isRecord } from "./is-record";
 
 /**
- * One persisted chat conversation. Mirrors ui-next's `StoredChatSession` (chat-session-store.ts:45)
- * field-for-field; ui-next is NOT imported (the daemon must not depend on a frontend package), so this
+ * One persisted chat conversation. Mirrors ui's `StoredChatSession` (chat-session-store.ts:45)
+ * field-for-field; ui is NOT imported (the daemon must not depend on a frontend package), so this
  * is a deliberate local mirror. `messages` is intentionally opaque (`unknown[]`): the daemon persists
  * the rendered transcript verbatim and never interprets it.
  */
@@ -35,6 +35,28 @@ export interface LocalChatStore {
 	read(namespace: string, id: string): LocalStoredChatSession | null;
 	/** Persists a session (atomic write), PRESERVING any already-stored `conversationId` sidecar. */
 	save(namespace: string, session: LocalStoredChatSession): void;
+	/**
+	 * Appends transcript messages to a session (atomic write), stamping `updatedAt` to now so the session
+	 * sorts newest-first, and CREATING the session when none exists yet - the daemon is the first writer
+	 * for a turn whose client detached before the app ever saved it. Any stored resume-handle sidecar is
+	 * preserved, and so is a non-empty stored title: `fallbackTitle` names the session ONLY while it has
+	 * none, so a derived or renamed conversation is never relabelled. A no-op when `messages` is empty.
+	 *
+	 * This is the DETACHED-run seam and nothing else. While a client is attached the app owns the
+	 * transcript and persists it with {@link save}, which REPLACES the message list; appending on that
+	 * path would duplicate every turn the user watched arrive.
+	 *
+	 * @param namespace - The owning namespace (user id, or user id + workspace).
+	 * @param id - The session id.
+	 * @param messages - The transcript messages to append, in order (opaque to the daemon, like `save`).
+	 * @param fallbackTitle - A title to adopt when the stored session has none.
+	 */
+	appendMessages(
+		namespace: string,
+		id: string,
+		messages: readonly unknown[],
+		fallbackTitle?: string
+	): void;
 	/** Removes a session (no-op when absent). */
 	delete(namespace: string, id: string): void;
 	/** Renames a session's title (no-op when the id is absent). */
@@ -128,11 +150,14 @@ function isStoredRecord(value: unknown): value is StoredRecord {
  *
  * `maxSessions` enforces the buyer's `maxChatsPerAgent` cap: after each save the namespace's OLDEST
  * sessions beyond the cap are pruned (transcript + resume-handle sidecar together - each is one file),
- * so transcripts never accumulate unbounded. Read fresh per save (the same live-edit posture as the
- * daemon's other config reads), and skipped entirely when it yields no positive integer.
+ * so transcripts never accumulate unbounded. The namespace is now COMPOSITE (`<userId>` for the
+ * no-project bucket, `<userId>-<projectId>` for a project), so the cap is per user PER WORKSPACE:
+ * each of a user's workspaces keeps its own `maxChatsPerAgent` transcripts. Read fresh per save (the
+ * same live-edit posture as the daemon's other config reads), and skipped entirely when it yields no
+ * positive integer.
  *
  * @param dir - The chats root directory.
- * @param maxSessions - Reads the CURRENT per-namespace session cap, or `undefined` for unlimited.
+ * @param maxSessions - Reads the CURRENT per-workspace session cap, or `undefined` for unlimited.
  * @returns A file-backed chat store.
  */
 export function createLocalChatStore(
@@ -202,6 +227,34 @@ export function createLocalChatStore(
 			const existing = readRecord(fileFor(namespace, session.id));
 			writeRecord(namespace, session.id, {
 				session,
+				...(existing?.conversationId !== undefined
+					? { conversationId: existing.conversationId }
+					: {}),
+				...(existing?.conversationCli !== undefined
+					? { conversationCli: existing.conversationCli }
+					: {})
+			});
+			pruneBeyondCap(namespace);
+		},
+		appendMessages(namespace, id, messages, fallbackTitle) {
+			if (messages.length === 0) return;
+			const existing = readRecord(fileFor(namespace, id));
+			// A missing record is the NORMAL first-turn case here: `onConversation`'s sidecar write may not
+			// have fired (a CLI that mints no resume handle), so the append cannot assume a shell exists.
+			const session = existing?.session ?? {
+				id,
+				title: "",
+				updatedAt: 0,
+				modelKey: null,
+				messages: []
+			};
+			writeRecord(namespace, id, {
+				session: {
+					...session,
+					title: session.title.length > 0 ? session.title : (fallbackTitle ?? ""),
+					updatedAt: Date.now(),
+					messages: [...session.messages, ...messages]
+				},
 				...(existing?.conversationId !== undefined
 					? { conversationId: existing.conversationId }
 					: {}),

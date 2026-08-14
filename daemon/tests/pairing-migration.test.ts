@@ -58,14 +58,14 @@ describe('migratePairingKeys', () => {
   it('re-keys a per-backend origin policy under the canonical URL', async () => {
     const { state, secrets } = harness()
     state.upsertPairedBackend(VARIANT_B, { backendUrl: VARIANT_B, deviceId: 'dev-1', userId: 'u1' })
-    state.setOriginPolicy(VARIANT_B, { denySchedule: true, denyDispatch: false })
+    state.setOriginPolicy(VARIANT_B, { denyAutomation: true, denyDispatch: false })
     secrets.set(bearerKey(VARIANT_B), 'ONE_BEARER')
 
     await migratePairingKeys(state, secrets)
 
     // The origin policy follows the state record onto the canonical key (not stranded on the raw key).
-    expect(state.getOriginPolicy(CANONICAL)).toEqual({ denySchedule: true, denyDispatch: false })
-    expect(state.getOriginPolicy(VARIANT_B)).toEqual({ denySchedule: false, denyDispatch: false })
+    expect(state.getOriginPolicy(CANONICAL)).toEqual({ denyAutomation: true, denyDispatch: false })
+    expect(state.getOriginPolicy(VARIANT_B)).toEqual({ denyAutomation: false, denyDispatch: false })
   })
 
   it('re-keys a backend local MCP servers under the canonical URL', async () => {
@@ -125,7 +125,7 @@ describe('migratePairingKeys', () => {
     // this): a connection, an MCP server, and an origin policy.
     state.upsertConnection(LOCAL_SCOPE, { toolId: 'claude-code', source: 'reused', authHealth: 'healthy' })
     state.upsertMcpServer(LOCAL_SCOPE, 'linear', { type: 'stdio', command: 'npx', envKeys: ['LINEAR_KEY'] })
-    state.setOriginPolicy(LOCAL_SCOPE, { denySchedule: true, denyDispatch: false })
+    state.setOriginPolicy(LOCAL_SCOPE, { denyAutomation: true, denyDispatch: false })
     // A local-scope MCP secret that must be left exactly where it is: the migration re-keys secrets only
     // along the raw-backend loop, never the local scope.
     writeMcpEnv(secrets, LOCAL_SCOPE, 'linear', { LINEAR_KEY: 'lin_local_secret' })
@@ -145,7 +145,7 @@ describe('migratePairingKeys', () => {
     expect(state.listMcpServers(LOCAL_SCOPE)).toEqual({
       linear: { type: 'stdio', command: 'npx', envKeys: ['LINEAR_KEY'] }
     })
-    expect(state.getOriginPolicy(LOCAL_SCOPE)).toEqual({ denySchedule: true, denyDispatch: false })
+    expect(state.getOriginPolicy(LOCAL_SCOPE)).toEqual({ denyAutomation: true, denyDispatch: false })
     // The local-scope MCP secret is untouched (never re-keyed or deleted by the migration).
     expect(readMcpEnv(secrets, LOCAL_SCOPE, 'linear')).toEqual({ LINEAR_KEY: 'lin_local_secret' })
   })

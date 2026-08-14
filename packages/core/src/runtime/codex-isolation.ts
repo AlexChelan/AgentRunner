@@ -26,7 +26,7 @@ import { codexHomeDir } from "./paths";
  * per turn over the app-server protocol, not from this file.
  */
 const ISOLATED_CONFIG_TOML =
-	"# Isolated Codex home, managed by the runner for headless chat/schedule runs.\n" +
+	"# Isolated Codex home, managed by the runner for headless chat/automation runs.\n" +
 	"# Intentionally declares no external servers: a run sees only the app tools plus Codex built-ins.\n";
 
 /** The isolated `config.toml`'s mode: readable by every identity that may load it, writable by none. */
@@ -158,7 +158,7 @@ function symlinkTarget(path: string): string | null {
 
 /**
  * Ensures the runner-managed ISOLATED `CODEX_HOME` exists and returns its path, for a headless
- * chat/schedule Codex run. Codex reads its `config.toml` (the user's personal `mcp_servers`, profiles)
+ * chat/automation Codex run. Codex reads its `config.toml` (the user's personal `mcp_servers`, profiles)
  * from `CODEX_HOME` and exposes NO strict-MCP flag, so a run's tool surface is isolated by pointing
  * `CODEX_HOME` at this home, whose `config.toml` declares no personal MCP servers - the run then sees
  * only the app tools plus Codex's built-ins. The interactive terminal never uses this (it keeps the

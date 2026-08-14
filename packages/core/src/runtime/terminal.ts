@@ -400,7 +400,7 @@ export async function runTerminalSession(deps: TerminalSessionDeps): Promise<voi
 			say(`Could not reach ${deps.backendUrl}: ${messageOf(err)}\n`);
 			return null;
 		}
-		// VERSION SKEW (backend older than this daemon). A product ships on ITS schedule and this daemon
+		// VERSION SKEW (backend older than this daemon). A product ships on ITS automation and this daemon
 		// updates on the user's, so a daemon that can open a session will meet backends that never grew the
 		// route. A bare "(404)" would read as a fault in the thing the user just updated; it is neither, and
 		// nothing on this machine can fix it - so the line names what is missing and who ships it.
@@ -408,7 +408,7 @@ export async function runTerminalSession(deps: TerminalSessionDeps): Promise<voi
 			say(
 				`${deps.backendUrl} does not offer terminal sessions yet: POST /runner/terminal-spec answered 404. ` +
 					`The app has to ship that route; nothing on this machine can add it. Ask whoever runs the app to ` +
-					`update it. Dispatched runs, schedules, and chat keep working meanwhile.\n`
+					`update it. Dispatched runs, automations, and chat keep working meanwhile.\n`
 			);
 			return null;
 		}
@@ -487,6 +487,11 @@ interface SessionGroundInput {
 	cli: TerminalCliId;
 	/** A folder the USER asked the session to run in, from local argv only. */
 	requestedCwd?: string;
+	/**
+	 * Resolves the project's CONNECTED folder for this session (see
+	 * {@link LocalTerminalSessionDeps.resolveConnectedFolder}). Absent on every path that serves no grants.
+	 */
+	resolveConnectedFolder?: () => string | null;
 	/** Resolves a CLI binary by bare name. */
 	resolveBinary: (name: string) => string | null;
 	/**
@@ -533,6 +538,10 @@ interface SessionGround {
  * - THE WORK FOLDER STILL RESOLVES FIRST even when a `--cwd` overrides it, because `resolveWorkFolder` is
  *   what refuses a crafted `productId` - and that id rides the audit entry (and, when paired, the wire)
  *   whether or not the session runs in the folder it names.
+ * - THE PRECEDENCE IS FIXED: an explicit `--cwd` first, then the project's CONNECTED folder (re-judged
+ *   here, on this grounding - a stored grant is not evidence about the filesystem as it is now), then the
+ *   confined work folder. A grant that can no longer be honoured REFUSES the session rather than quietly
+ *   dropping the user into the managed sandbox.
  *
  * @param input - The scope, the product + CLI, and the IO seams.
  * @returns Where the session runs, or `null` once it has been refused and the process is exiting.
@@ -555,7 +564,7 @@ function groundSession(input: SessionGroundInput): SessionGround | null {
 	try {
 		cwd = resolveWorkFolder({
 			appDataRoot: input.appDataRoot,
-			backendKey: scope.workKey,
+			workKey: scope.workKey,
 			productId: input.productId
 		});
 	} catch (err) {
@@ -564,17 +573,35 @@ function groundSession(input: SessionGroundInput): SessionGround | null {
 		return null;
 	}
 
-	if (input.requestedCwd === undefined) return { binary, binaryName, cwd };
-
-	let requested: string;
-	try {
-		requested = resolveExistingFolder(input.requestedCwd);
-	} catch (err) {
-		write(`Could not open a terminal in "${input.requestedCwd}": ${messageOf(err)}.\n`);
-		host.exit(1);
-		return null;
+	// An explicit pick WINS OUTRIGHT, over a connected folder as much as over the work folder: the user
+	// pointed at a folder for this one session.
+	if (input.requestedCwd !== undefined) {
+		let requested: string;
+		try {
+			requested = resolveExistingFolder(input.requestedCwd);
+		} catch (err) {
+			write(`Could not open a terminal in "${input.requestedCwd}": ${messageOf(err)}.\n`);
+			host.exit(1);
+			return null;
+		}
+		return { binary, binaryName, cwd: requested };
 	}
-	return { binary, binaryName, cwd: requested };
+
+	if (input.resolveConnectedFolder !== undefined) {
+		let connected: string | null;
+		try {
+			connected = input.resolveConnectedFolder();
+		} catch (err) {
+			// A grant that exists but cannot be honoured REFUSES the session. Opening in the managed work
+			// folder instead would silently put the user in a sandbox that looks like their project.
+			write(`Could not open a terminal in this project's folder: ${messageOf(err)}.\n`);
+			host.exit(1);
+			return null;
+		}
+		if (connected !== null) return { binary, binaryName, cwd: connected };
+	}
+
+	return { binary, binaryName, cwd };
 }
 
 /** The session facts the fail-closed `terminal` audit entry records. */
@@ -922,6 +949,38 @@ export interface LocalTerminalSessionDeps {
 	/** A pinned model id, or `undefined` to let the CLI pick its own default. */
 	modelId?: string;
 	/**
+	 * The work-tree segment this session's confined folder sits under (`work/<workKey>/<productId>`), from
+	 * `workspaceWorkKey`. Absent means {@link LOCAL_SCOPE} - the machine-global folder, byte-identical to the
+	 * pre-workspace path, which is also what the no-project workspace resolves to.
+	 *
+	 * ONLY THE FOLDER MOVES. The approval posture, the trust log's scope, and the MCP wiring all stay keyed
+	 * on {@link LOCAL_SCOPE}: they are facts about this MACHINE and the human at its keyboard, not about the
+	 * workspace being viewed, and re-asking for a permission already granted on a workspace switch would
+	 * train the user to click through it. A `requestedCwd` still wins outright - the user pointed at a
+	 * folder, and this is only where a session goes when they did not.
+	 */
+	workKey?: string;
+	/**
+	 * Resolves the folder this project has CONNECTED - a real folder of the user's - which becomes the
+	 * session's DEFAULT cwd in place of the work folder. Called at grounding time, so the stored grant is
+	 * re-resolved and re-judged against the filesystem as it is NOW ({@link connectedFolderForRun} is the
+	 * daemon's implementation, and it is where the staged `projectsEnabled` gate is read).
+	 *
+	 * `null` means no grant (or the feature is off) - the managed work folder, the ordinary case. A THROW
+	 * REFUSES the session: a grant the daemon cannot honour must not silently become the managed sandbox
+	 * dressed up as the user's project. A {@link LocalTerminalSessionDeps.requestedCwd} still wins over both.
+	 *
+	 * Absent entirely for a host that serves no grants (the runner shell's `terminal --local`), which leaves
+	 * the grounding byte-identical to the pre-grant one.
+	 *
+	 * MACHINE-GLOBAL APPROVALS APPLY INSIDE IT. The approval posture is read under {@link LOCAL_SCOPE} like
+	 * every other trust fact here, so an approval the user granted while the cwd was a managed sandbox
+	 * authorizes the same action in their real folder. That is the trust model this app already has (trust
+	 * is a fact about this machine and the human at its keyboard), stated here because the blast radius is
+	 * bigger now.
+	 */
+	resolveConnectedFolder?: () => string | null;
+	/**
 	 * The user's LOCAL-scope MCP servers (`{binary} mcp add --local`), read from the daemon's own store.
 	 * Nothing else can contribute one: there is no backend on this path at all.
 	 */
@@ -976,7 +1035,9 @@ export interface LocalTerminalSessionDeps {
  * - A `--cwd` IS RESOLVED EXACTLY AS WHEN PAIRED, and authorized no more strictly: the daemon checks only
  *   that the folder exists, and relies on whichever local caller invoked it to have obtained the path
  *   from the user (see {@link groundSession}). That caller is more often the desktop app here than a
- *   human at a shell, which is precisely why the obligation is the caller's and is stated as one.
+ *   human at a shell, which is precisely why the obligation is the caller's and is stated as one. Without
+ *   one, the session opens in the project's CONNECTED folder when it has granted one
+ *   ({@link LocalTerminalSessionDeps.resolveConnectedFolder}) and in the confined work folder otherwise.
  * - AN UNLOGGED SESSION IS IMPOSSIBLE. The `terminal` entry is appended BEFORE the spawn and a refused
  *   append refuses the session; it is stamped `backendUrl: 'local'`, so `{binary} log` shows an on-device
  *   session for exactly what it is.
@@ -1024,13 +1085,22 @@ export async function runLocalTerminalSession(deps: LocalTerminalSessionDeps): P
 			resolveToolBinary(name, { managedDirs: managedCliBinDirs(managedCliDir(deps.appDataRoot)) }));
 
 	const ground = groundSession({
-		scope: LOCAL_SESSION_SCOPE,
+		// The workspace moves the WORK KEY and nothing else: every other field of the scope - the store key
+		// the approval and MCP servers are read under, the remediation flag, the refusal label - stays
+		// machine-global (see `LocalTerminalSessionDeps.workKey`).
+		scope:
+			deps.workKey !== undefined
+				? { ...LOCAL_SESSION_SCOPE, workKey: deps.workKey }
+				: LOCAL_SESSION_SCOPE,
 		appDataRoot: deps.appDataRoot,
 		// The product is the CONFIG's, never a user-typed positional: it is the same id the local chat runs
 		// are composed under, so a terminal session and a chat share one confined work folder.
 		productId: deps.config.productId,
 		cli: deps.cli,
 		...(deps.requestedCwd !== undefined ? { requestedCwd: deps.requestedCwd } : {}),
+		...(deps.resolveConnectedFolder !== undefined
+			? { resolveConnectedFolder: deps.resolveConnectedFolder }
+			: {}),
 		resolveBinary,
 		...(deps.missingBinaryHint !== undefined
 			? { missingBinaryHint: deps.missingBinaryHint }

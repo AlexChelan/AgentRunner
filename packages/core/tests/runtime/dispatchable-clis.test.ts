@@ -12,7 +12,7 @@ const CONNECTED = [connection({ toolId: "claude-code" }), connection()];
 describe("dispatchableConnections", () => {
 	// The backend can only offer what the daemon reports, and a dispatched codex run on these hosts is
 	// refused by the driver every single time - so offering it puts a CLI in the picker whose every turn
-	// fails, and lets a schedule be pointed at it that then fires forever recording the same refusal.
+	// fails, and lets an automation be pointed at it that then fires forever recording the same refusal.
 	it("does not advertise codex where its sandbox is not OS-enforced", () => {
 		expect(dispatchableConnections(CONNECTED, { platform: "win32", hasBubblewrap: () => true })).toEqual(
 			[connection({ toolId: "claude-code" })]

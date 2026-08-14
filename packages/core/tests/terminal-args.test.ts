@@ -18,7 +18,7 @@ function input(overrides: Partial<TerminalArgsInput> = {}): TerminalArgsInput {
 		mcpUrl: "http://127.0.0.1:1234/tok/mcp",
 		instructions: "BASE INSTRUCTIONS",
 		workspaces: ["/ws/main"],
-		localToolNames: ["knowledge_search", "list_schedules"],
+		localToolNames: ["knowledge_search", "list_automations"],
 		mcpServers: {},
 		localServerName: SERVER,
 		...overrides
@@ -64,7 +64,7 @@ describe("claudeTerminalArgs", () => {
 	it("pre-approves ONLY the app-MCP tools, comma-joined in one arg", () => {
 		const args = claudeTerminalArgs(input());
 		expect(args[args.indexOf("--allowedTools") + 1]).toBe(
-			`mcp__${SERVER}__knowledge_search,mcp__${SERVER}__list_schedules`
+			`mcp__${SERVER}__knowledge_search,mcp__${SERVER}__list_automations`
 		);
 	});
 	it("names the CALLER-supplied server everywhere (so a rebranded host is not hardcoded)", () => {
@@ -72,7 +72,7 @@ describe("claudeTerminalArgs", () => {
 		const mcpConfig = JSON.parse(args[args.indexOf("--mcp-config") + 1]);
 		expect(Object.keys(mcpConfig.mcpServers)).toEqual(["otherTools"]);
 		expect(args[args.indexOf("--allowedTools") + 1]).toBe(
-			"mcp__otherTools__knowledge_search,mcp__otherTools__list_schedules"
+			"mcp__otherTools__knowledge_search,mcp__otherTools__list_automations"
 		);
 	});
 	it("omits --allowedTools when there are no local tools", () => {

@@ -1,4 +1,4 @@
-import { mkdtempSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, realpathSync, statSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ConnectionRef } from "../../src/index";
@@ -22,6 +22,16 @@ import type { BuildRunOpts } from "../../src/runtime/run-context-builder";
 
 function appDataRoot(): string {
 	return mkdtempSync(join(tmpdir(), "runner-build-"));
+}
+
+/**
+ * A real folder of the USER'S, outside the app-data root - what a project's connected-folder grant names.
+ * Canonicalized, since that is the shape the dispatch sites' verdict carries.
+ */
+function connectedFolder(): string {
+	const dir = join(realpathSync(mkdtempSync(join(tmpdir(), "runner-granted-"))), "checkout");
+	mkdirSync(dir, { recursive: true });
+	return dir;
 }
 const conn: ConnectionRef = { id: "c1", toolId: "codex", authMode: "subscription" };
 function start(overrides: Partial<RunStart> = {}): RunStart {
@@ -171,6 +181,118 @@ describe("buildRun", () => {
 		expect(local.req.allowedTools).toBeUndefined();
 		expect(paired.req.allowedTools).toEqual([qualified("lookup")]);
 		expect(local.req.permissionMode).not.toBe(paired.req.permissionMode);
+	});
+
+	it("workKey relocates ONLY the work folder: a project workspace keeps the LOCAL leg's posture", () => {
+		// The work key and the trust scope are different questions. `local-<projectId>` is not the LOCAL_SCOPE
+		// string, so a build that fed it to `backendKey` would read as a paired backend and floor the run -
+		// a project workspace's desktop chat would silently become a read-only agent that cannot edit anything.
+		const root = appDataRoot();
+		const project = buildRun(
+			buildOpts({ appDataRoot: root, backendKey: LOCAL_SCOPE, workKey: "local-AbC123xYzQ" })
+		);
+		const noProject = buildRun(buildOpts({ appDataRoot: root, backendKey: LOCAL_SCOPE }));
+
+		// The folder moved...
+		expect(project.req.cwd).toBe(join(root, "work", "local-AbC123xYzQ", "p1"));
+		expect(noProject.req.cwd).toBe(join(root, "work", LOCAL_SCOPE, "p1"));
+		// ...and nothing about the posture did: same un-floored local leg, same raised mode, same tools.
+		expect(project.req.floored).toBeUndefined();
+		expect(project.req.allowedTools).toBeUndefined();
+		expect(project.req.permissionMode).toBe(noProject.req.permissionMode);
+		expect(project.effectivePolicy).toEqual(noProject.effectivePolicy);
+	});
+
+	it("runs in the project's CONNECTED folder, with the work folder still resolved beneath it", () => {
+		// The connected folder replaces the RESULT of the work-folder resolution, never the resolution: that
+		// call is what validates the productId and hardens the leaf, and it has to happen either way.
+		const root = appDataRoot();
+		const granted = connectedFolder();
+		const { ctx, req } = buildRun(
+			buildOpts({ appDataRoot: root, backendKey: LOCAL_SCOPE, connectedFolder: granted })
+		);
+
+		expect(req.cwd).toBe(granted);
+		// The run's IDENTITY carries the effective cwd too - the executor audits `ctx.cwd`, and an entry
+		// naming the managed sandbox for a run in the user's real folder would be a false record.
+		expect(ctx.cwd).toBe(granted);
+		expect(existsSync(join(root, "work", LOCAL_SCOPE, "p1"))).toBe(true);
+	});
+
+	it("still refuses a crafted productId when a connected folder is in play", () => {
+		// The validation lives in `resolveWorkFolder`, so a build that skipped it for granted runs would
+		// stop refusing the one input the wire can shape.
+		expect(() =>
+			buildRun(
+				buildOpts({
+					backendKey: LOCAL_SCOPE,
+					connectedFolder: connectedFolder(),
+					start: start({ productId: "../escape" })
+				})
+			)
+		).toThrow(/confined/);
+	});
+
+	it("refuses a connected folder that is not absolute", () => {
+		// A relative cwd would anchor against whatever directory this daemon happens to hold - a folder
+		// nobody granted. The dispatch sites only ever pass a verdict path; this is the backstop.
+		expect(() =>
+			buildRun(buildOpts({ backendKey: LOCAL_SCOPE, connectedFolder: "relative/checkout" }))
+		).toThrow(/absolute/);
+	});
+
+	it("moves the folder ONLY: a granted run keeps the local leg's posture and read denies", () => {
+		const root = appDataRoot();
+		const granted = connectedFolder();
+		const withGrant = buildRun(
+			buildOpts({ appDataRoot: root, backendKey: LOCAL_SCOPE, connectedFolder: granted })
+		);
+		const managed = buildRun(buildOpts({ appDataRoot: root, backendKey: LOCAL_SCOPE }));
+
+		expect(withGrant.req.floored).toBeUndefined();
+		expect(withGrant.effectivePolicy).toEqual(managed.effectivePolicy);
+		expect(withGrant.req.denyReadPaths).toEqual(managed.req.denyReadPaths);
+	});
+
+	it.skipIf(process.platform === "win32")(
+		"never hands the connected folder to the container agent identity",
+		() => {
+			// The managed work tree is the daemon's own, so sharing it with the unprivileged agent is the
+			// daemon fixing up permissions it owns. The connected folder is the USER'S: chowning its group or
+			// widening its mode would rewrite permissions on a folder the daemon never created, for an
+			// identity that does not exist on the desktop host this feature ships to.
+			//
+			// The REAL share runs here (no seam), targeting this process's own gid so the fchown/fchmod
+			// actually succeed - which is what makes the negative assertion mean something.
+			const root = appDataRoot();
+			const granted = connectedFolder();
+			chmodSync(granted, 0o700);
+			const { req } = buildRun(
+				buildOpts({
+					appDataRoot: root,
+					backendKey: LOCAL_SCOPE,
+					connectedFolder: granted,
+					contained: true,
+					agentUid: process.getuid?.() ?? 0,
+					agentGid: process.getgid?.() ?? 0
+				})
+			);
+
+			// The share machinery really ran (the managed leaf is now agent-writable)...
+			expect(statSync(join(root, "work", LOCAL_SCOPE, "p1")).mode & 0o7777).toBe(0o770);
+			// ...and it did not touch the folder the run is actually in.
+			expect(statSync(granted).mode & 0o7777).toBe(0o700);
+			expect(req.cwd).toBe(granted);
+		}
+	);
+
+	it("workKey does NOT let a paired backend buy its way out of the floor", () => {
+		// The floor is a property of the scope, so naming a local-looking work key must not lift it.
+		const { req } = buildRun(
+			buildOpts({ backendKey: "app-example-1a2b3c4d", workKey: LOCAL_SCOPE })
+		);
+		expect(req.floored).toBe(true);
+		expect(req.permissionMode).toBe("read-only");
 	});
 
 	it("keeps the LOCAL leg able to act: a policy-less local chat still reaches auto-edit", () => {
@@ -335,7 +457,7 @@ describe("buildRun", () => {
 	it("denies the runtime identity home, so a run cannot read the drive bearer token", () => {
 		const r = appDataRoot();
 		// Where the desktop host publishes the runtime's socket + bearer token (`daemonIdentity`). That token
-		// authenticates the WHOLE drive API - BYOK key writes, every stored transcript, schedule edits - so an
+		// authenticates the WHOLE drive API - BYOK key writes, every stored transcript, automation edits - so an
 		// unattended (prompt-injectable) run reading it is the exfiltration this deny list exists to stop.
 		const tokenFile = join(runtimeIdentityDir(r), "runtime.token");
 		// The bare block scopes the loop's bindings so the next case cannot accidentally read them.

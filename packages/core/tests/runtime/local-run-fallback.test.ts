@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import type { RunEvent, RunStart } from "@agentrunner/protocol";
-import type { RunHooks } from "../../src/runtime/executor";
+import type { RunHooks, StartRunOpts } from "../../src/runtime/executor";
 import { dispatchWithFallback } from "../../src/runtime/local/local-run-fallback";
 import type { FallbackTarget, RunDispatcher } from "../../src/runtime/local/local-run-fallback";
 
@@ -21,13 +21,20 @@ function makeStart(overrides: Partial<RunStart> = {}): RunStart {
 	};
 }
 
-/** Records each dispatch so a test can drive its hooks (emit events, close) like the executor would. */
+/**
+ * Records each dispatch so a test can drive its hooks (emit events, close) like the executor would.
+ * The per-dispatch `opts` are recorded as received, `undefined` included, so a test can pin both that
+ * they are forwarded and that a caller who supplies none leaves the dispatch unchanged.
+ */
 function fakeDispatcher(): {
 	dispatcher: RunDispatcher;
-	calls: { start: RunStart; hooks: RunHooks }[];
+	calls: { start: RunStart; hooks: RunHooks; opts: StartRunOpts | undefined }[];
 } {
-	const calls: { start: RunStart; hooks: RunHooks }[] = [];
-	return { dispatcher: { start: (start, hooks) => calls.push({ start, hooks }) }, calls };
+	const calls: { start: RunStart; hooks: RunHooks; opts: StartRunOpts | undefined }[] = [];
+	return {
+		dispatcher: { start: (start, hooks, opts) => calls.push({ start, hooks, opts }) },
+		calls
+	};
 }
 
 /** Emits one run event through a dispatch's hooks, as the executor's event loop would. */
@@ -86,6 +93,37 @@ describe("dispatchWithFallback", () => {
 		calls[1]!.hooks.onClose();
 		expect(caller.events).toEqual([{ type: "delta", text: "hi" }, { type: "done" }]);
 		expect(caller.closes).toBe(1);
+	});
+
+	it("forwards dispatch opts to both the primary and the fallback dispatch", () => {
+		const { dispatcher, calls } = fakeDispatcher();
+		const caller = recordingHooks();
+		dispatchWithFallback(dispatcher, makeStart(), caller.hooks, FALLBACK, {
+			workKey: "local-AbC123xYzQ"
+		});
+
+		// A pre-output error frame: the primary failed to START, so the fallback engages.
+		emit(calls[0]!.hooks, "run-1", { type: "error", message: "primary down" });
+		calls[0]!.hooks.onClose();
+
+		// The fallback is a fresh dispatch, so the work key has to be re-supplied or the retry would land
+		// in a different work tree than the attempt it replaces.
+		const seen: (StartRunOpts | undefined)[] = calls.map((call) => call.opts);
+		expect(seen).toHaveLength(2);
+		expect(seen).toEqual([{ workKey: "local-AbC123xYzQ" }, { workKey: "local-AbC123xYzQ" }]);
+	});
+
+	it("passes no dispatch opts when the caller supplies none (the paired daemon path is unchanged)", () => {
+		const { dispatcher, calls } = fakeDispatcher();
+		const caller = recordingHooks();
+		dispatchWithFallback(dispatcher, makeStart(), caller.hooks, FALLBACK);
+
+		emit(calls[0]!.hooks, "run-1", { type: "error", message: "primary down" });
+		calls[0]!.hooks.onClose();
+
+		// Neither dispatch may invent an opts bag: the paired daemon never sets a work key, so both the
+		// primary and its fallback must reach the executor exactly as they did before the seam existed.
+		expect(calls.map((call) => call.opts)).toEqual([undefined, undefined]);
 	});
 
 	it("does NOT retry after a MID-RUN failure (any output before the error) - no double execution", () => {

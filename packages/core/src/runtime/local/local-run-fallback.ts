@@ -1,5 +1,5 @@
 import type { RunStart } from "@agentrunner/protocol";
-import type { RunHooks } from "../executor";
+import type { RunHooks, StartRunOpts } from "../executor";
 
 /** The fallback CLI/model to try when the primary fails to START. */
 export interface FallbackTarget {
@@ -11,8 +11,11 @@ export interface FallbackTarget {
 
 /** The one executor seam {@link dispatchWithFallback} drives (fakeable in tests). */
 export interface RunDispatcher {
-	/** Dispatches a run; its events, conversation id, and close flow through `hooks`. */
-	start(start: RunStart, hooks: RunHooks): void;
+	/**
+	 * Dispatches a run; its events, conversation id, and close flow through `hooks`. `opts` carries the
+	 * caller's per-dispatch overrides (see {@link StartRunOpts}) and is absent for a plain dispatch.
+	 */
+	start(start: RunStart, hooks: RunHooks, opts?: StartRunOpts): void;
 }
 
 /** Whether the fallback names the SAME target as the primary (retrying it would be pointless). */
@@ -20,7 +23,7 @@ function sameTarget(start: RunStart, fallback: FallbackTarget): boolean {
 	return fallback.cli === start.connectionId && fallback.modelId === start.modelId;
 }
 
-/** Re-points a run's start onto the fallback CLI/model, KEEPING its run id (and scheduleId/origin/prompt/etc.). */
+/** Re-points a run's start onto the fallback CLI/model, KEEPING its run id (and the wire's scheduleId/origin/prompt/etc.). */
 function toFallbackStart(start: RunStart, fallback: FallbackTarget): RunStart {
 	// Drop the primary's model first, then re-add the fallback's only when it pins one, so a fallback that
 	// names only a CLI runs at that CLI's own default rather than inheriting the primary's (possibly unknown) model.
@@ -60,15 +63,19 @@ function toFallbackStart(start: RunStart, fallback: FallbackTarget): RunStart {
  * @param primaryStart - The composed primary run.
  * @param hooks - The caller's run hooks (stream/collector); the terminal + close reach these unchanged.
  * @param fallback - The fallback CLI/model, or `null` for no fallback.
+ * @param opts - Per-dispatch executor overrides, forwarded UNCHANGED to the primary AND the fallback: the
+ *   fallback is a fresh dispatch, so a retry that dropped them would run under different confinement than
+ *   the attempt it replaces. Absent for a caller that supplies none.
  */
 export function dispatchWithFallback(
 	dispatcher: RunDispatcher,
 	primaryStart: RunStart,
 	hooks: RunHooks,
-	fallback: FallbackTarget | null
+	fallback: FallbackTarget | null,
+	opts?: StartRunOpts
 ): void {
 	if (fallback === null || sameTarget(primaryStart, fallback)) {
-		dispatcher.start(primaryStart, hooks);
+		dispatcher.start(primaryStart, hooks, opts);
 		return;
 	}
 
@@ -96,7 +103,7 @@ export function dispatchWithFallback(
 			if (willFallback) {
 				// The primary is out of the active map now (executor deletes the id before onClose), so reusing the
 				// id is safe. The fallback runs with the REAL hooks - one attempt, it can never fall back again.
-				dispatcher.start(toFallbackStart(primaryStart, fallback), hooks);
+				dispatcher.start(toFallbackStart(primaryStart, fallback), hooks, opts);
 				return;
 			}
 			hooks.onClose();
@@ -117,5 +124,5 @@ export function dispatchWithFallback(
 				}
 			: {})
 	};
-	dispatcher.start(primaryStart, wrapped);
+	dispatcher.start(primaryStart, wrapped, opts);
 }

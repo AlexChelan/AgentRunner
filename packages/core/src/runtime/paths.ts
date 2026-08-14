@@ -61,7 +61,7 @@ export function managedCliDir(root: string): string {
 }
 
 /**
- * The isolated `CODEX_HOME` (`<root>/codex-home`) a headless chat/schedule run points Codex at, so
+ * The isolated `CODEX_HOME` (`<root>/codex-home`) a headless chat/automation run points Codex at, so
  * Codex loads a `config.toml` with NO personal MCP servers (Codex has no strict-MCP flag) instead of
  * the user's `~/.codex`. Its `auth.json` is a symlink to the user's real one, so subscription auth is
  * preserved with no credential copied at rest. The interactive terminal never uses it (it keeps the
@@ -97,9 +97,10 @@ export function auditDir(root: string): string {
 
 /**
  * The daemon-owned local data home (`<root>/local`): the single local data plane for the desktop
- * shape, holding the user's chat transcripts and their resume handles. Like `secrets/` it is OFF-LIMITS
- * to any dispatched run (it is added to a run's `denyReadPaths`), so a prompt-injected run can never
- * read sibling conversations.
+ * shape, holding the user's chat transcripts and their resume handles plus the per-workspace
+ * automation stores under `local/automations`. Like `secrets/` it is OFF-LIMITS to any dispatched run
+ * (it is added to a run's `denyReadPaths`, which covers this whole tree and therefore every store
+ * inside it), so a prompt-injected run can never read sibling conversations or automations.
  *
  * @param root - The app-data root from {@link appDataDir}.
  * @returns The absolute local data directory.
@@ -112,7 +113,7 @@ export function localDataDir(root: string): string {
  * The runtime identity home (`<root>/runtime`): where a forked runtime publishes its drive socket, its
  * bearer TOKEN and its pid record. Like `secrets/` it is OFF-LIMITS to any dispatched run (it is added to
  * a run's `denyReadPaths`) - that token authenticates the whole drive API, so a run able to read it could
- * read every stored transcript and create, edit or fire schedules. The token lives here on
+ * read every stored transcript and create, edit or fire automations. The token lives here on
  * every platform, including the case where a long root pushes the SOCKET into a temp directory.
  *
  * @param root - The app-data root from {@link appDataDir}.

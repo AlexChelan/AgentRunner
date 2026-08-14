@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import Conf from "conf";
 import type { AuthHealth, RunPolicy } from "@agentrunner/protocol";
 import { brand } from "../brand";
+import { isRecord } from "../local/is-record";
 import { LOCAL_SCOPE } from "../local/scope";
 import type { LocalMcpSpec } from "../local-mcp-spec";
 import { DEFAULT_ORIGIN_POLICY } from "../origin-policy";
@@ -57,7 +58,11 @@ interface StateSchema {
 	backends: Record<string, PairedBackend>;
 	/** Per-scope CLI connections, keyed `scope -> toolId -> record`. */
 	connections: Record<string, Record<string, CliConnection>>;
-	/** Per-scope device origin policy (the allow-all default when unset). */
+	/**
+	 * Per-scope device origin policy (the allow-all default when unset). A record written before the
+	 * schedules -> automations rename spells the automation refusal `denySchedule`; it is read across
+	 * by {@link readStoredOriginPolicy} and never rewritten.
+	 */
 	originPolicies: Record<string, OriginPolicy>;
 	/**
 	 * Per-scope TERMINAL approval setting: whether an interactive session leaves the user's coding CLI its
@@ -233,7 +238,7 @@ export interface StateStore {
 	 * only exists for a paired scope, so this throws when the scope is not paired - except the {@link import('../local/scope').LOCAL_SCOPE} pseudo-scope,
 	 * which is configurable with no pairing. A live daemon needs no signal - its executor reads the policy
 	 * through a fresh store per run, so the next dispatched run picks the new policy up. `chat` is never
-	 * deniable, so this policy governs only `schedule` and `dispatch`.
+	 * deniable, so this policy governs only `automation` and `dispatch`.
 	 *
 	 * @param scope - The paired account scope (or the local pseudo-scope) the policy applies to.
 	 * @param policy - The new device origin policy.
@@ -315,6 +320,33 @@ export interface StateStoreOpts {
 	cwd: string;
 	/** The config file base name (defaults to the brand-derived `<binary>-state`). */
 	name?: string;
+}
+
+/**
+ * Reads one stored origin policy, honoring the RETIRED `denySchedule` key.
+ *
+ * Builds before the schedules -> automations rename persisted the refusal as `denySchedule`, and the
+ * runner is published, so those records are on real disks. `conf` leaves an unknown on-disk key alone,
+ * which means the record survives an upgrade with only its old spelling - and a plain read would hand
+ * back `denyAutomation: undefined`, so a device its owner had configured to REFUSE unattended
+ * automation runs would silently start accepting them. Every refusal must therefore be read off
+ * either spelling, with the current one winning when both are present.
+ *
+ * Read-side only, like {@link StateStore.getTerminalApproval}'s fall back to the retired
+ * `policyCeilings` map: nothing is rewritten to disk, so the record stays readable by an older build
+ * and the migration is idempotent by construction. Any unusable value (absent record, wrong shape)
+ * falls back to {@link DEFAULT_ORIGIN_POLICY} exactly as before.
+ *
+ * @param stored - The raw record read off the `originPolicies` map.
+ * @returns The policy in its current shape.
+ */
+function readStoredOriginPolicy(stored: unknown): OriginPolicy {
+	if (!isRecord(stored)) return DEFAULT_ORIGIN_POLICY;
+	const denyAutomation =
+		typeof stored.denyAutomation === "boolean"
+			? stored.denyAutomation
+			: stored.denySchedule === true;
+	return { denyAutomation, denyDispatch: stored.denyDispatch === true };
 }
 
 /**
@@ -422,7 +454,8 @@ export function createStateStore(opts: StateStoreOpts): StateStore {
 			return conf.get("policyCeilings")[scope]?.network === "off";
 		},
 		getOriginPolicy(scope) {
-			return conf.get("originPolicies")[scope] ?? DEFAULT_ORIGIN_POLICY;
+			const stored: unknown = conf.get("originPolicies")[scope];
+			return readStoredOriginPolicy(stored);
 		},
 		setOriginPolicy(scope, policy) {
 			if (scope !== LOCAL_SCOPE && !conf.get("backends")[scope]) {

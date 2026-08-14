@@ -42,7 +42,7 @@ export function hostDispatchProfile(contained = false): DispatchHost {
  *
  * The driver refuses a floored codex run on a host without an OS-enforced sandbox (Windows, or Linux
  * without bubblewrap). Advertising codex anyway put a CLI in the web picker whose every chat turn
- * failed, and let a schedule be pointed at it - which then fired forever, recording the same refusal
+ * failed, and let an automation be pointed at it - which then fired forever, recording the same refusal
  * every tick, because the device was ONLINE and no fallback applied. Not advertising it is what keeps
  * the offer honest; the driver refusal stays as defense in depth.
  *

@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import { loadLocalAppConfig } from "../../src/runtime/local/app-config";
-import type { BuiltInScheduleSpec, LocalAppConfig } from "../../src/runtime/local/app-config";
+import type { BuiltInAutomationSpec, LocalAppConfig } from "../../src/runtime/local/app-config";
 
 const dir = mkdtempSync(join(tmpdir(), "runner-app-config-"));
 let seq = 0;
@@ -54,6 +54,24 @@ describe("loadLocalAppConfig", () => {
 		expect(cfg.instructions).toBeUndefined();
 	});
 
+	it("accepts maxChatsPerAgent 0, the documented way to say UNLIMITED", () => {
+		// The buyer docs have always said `0` means no limit, and the chat store already reads it that way
+		// (its prune skips any cap below 1). Only the schema disagreed, refusing the whole document - which
+		// now takes the runtime down with it, since an unreadable config is no longer papered over.
+		expect(loadLocalAppConfig(writeConfig(valid({ maxChatsPerAgent: 0 }))).maxChatsPerAgent).toBe(0);
+		expect(loadLocalAppConfig(writeConfig(valid({ maxChatsPerAgent: 20 }))).maxChatsPerAgent).toBe(20);
+	});
+
+	it("still refuses a NEGATIVE or fractional chat cap", () => {
+		// `0` is a documented sentinel; a negative or fractional cap is a mistake with no meaning.
+		expect(() => loadLocalAppConfig(writeConfig(valid({ maxChatsPerAgent: -1 })))).toThrow(
+			/maxChatsPerAgent/
+		);
+		expect(() => loadLocalAppConfig(writeConfig(valid({ maxChatsPerAgent: 2.5 })))).toThrow(
+			/maxChatsPerAgent/
+		);
+	});
+
 	it("throws naming the field when productId is missing", () => {
 		expect(() => loadLocalAppConfig(writeConfig({ productName: "Acme" }))).toThrow(/productId/);
 	});
@@ -75,6 +93,46 @@ describe("loadLocalAppConfig", () => {
 		expect(() =>
 			loadLocalAppConfig(writeConfig({ productId: "acme-app", productName: "" }))
 		).toThrow(/productName/);
+	});
+
+	it("parses a staged projectScoped flag", () => {
+		expect(loadLocalAppConfig(writeConfig(valid({ projectScoped: true }))).projectScoped).toBe(
+			true
+		);
+		expect(loadLocalAppConfig(writeConfig(valid({ projectScoped: false }))).projectScoped).toBe(
+			false
+		);
+	});
+
+	it("parses a staged projectsEnabled flag independently of projectScoped", () => {
+		// The two are separate questions: a multi-tenant build with the project surfaces off stages
+		// projectScoped true and projectsEnabled false, so one must never be read off the other.
+		const cfg = loadLocalAppConfig(
+			writeConfig(valid({ projectScoped: true, projectsEnabled: false }))
+		);
+		expect(cfg.projectScoped).toBe(true);
+		expect(cfg.projectsEnabled).toBe(false);
+	});
+
+	it("leaves both project flags undefined when the keys are absent, so they read as fail-closed", () => {
+		// An install staged by an older app carries no flag at all; the automation runner must then tick no
+		// project workspace, so absent has to arrive as undefined rather than defaulted to true.
+		const cfg = loadLocalAppConfig(writeConfig(valid()));
+		expect(cfg.projectScoped).toBeUndefined();
+		expect(cfg.projectsEnabled).toBeUndefined();
+	});
+
+	it("refuses a non-boolean projectScoped instead of coercing it", () => {
+		// A truthy string is exactly how a hand-edited config would silently turn project ticking ON.
+		expect(() => loadLocalAppConfig(writeConfig({ ...valid(), projectScoped: "yes" }))).toThrow(
+			/projectScoped/
+		);
+	});
+
+	it("refuses a non-boolean projectsEnabled instead of coercing it", () => {
+		expect(() => loadLocalAppConfig(writeConfig({ ...valid(), projectsEnabled: "yes" }))).toThrow(
+			/projectsEnabled/
+		);
 	});
 
 	it("drops unknown keys (forward-compat)", () => {
@@ -103,10 +161,10 @@ describe("loadLocalAppConfig", () => {
 const LONG_VALID_CRON = `${Array.from({ length: 60 }, (_, minute) => minute).join(",")} * * * *`;
 
 /**
- * A typed built-in schedule spec factory. A `cron` override switches the cadence arm, which the union
+ * A typed built-in automation spec factory. A `cron` override switches the cadence arm, which the union
  * forbids carrying alongside an interval.
  */
-function spec(overrides: Partial<BuiltInScheduleSpec> = {}): BuiltInScheduleSpec {
+function spec(overrides: Partial<BuiltInAutomationSpec> = {}): BuiltInAutomationSpec {
 	const { id = "digest-desktop", name = "Digest", prompt = "Summarize", enabled = false } = overrides;
 	const common = { id, name, prompt, enabled };
 	if (overrides.cron !== undefined) {
@@ -119,12 +177,12 @@ function spec(overrides: Partial<BuiltInScheduleSpec> = {}): BuiltInScheduleSpec
 	return { ...common, intervalMinutes: overrides.intervalMinutes ?? 60 };
 }
 
-describe("loadLocalAppConfig - built-in schedule specs", () => {
-	it("parses a valid schedules array", () => {
+describe("loadLocalAppConfig - built-in automation specs", () => {
+	it("parses a valid automations array", () => {
 		const cfg = loadLocalAppConfig(
-			writeConfig(valid({ schedules: [spec(), spec({ id: "weekly", intervalMinutes: 10 })] }))
+			writeConfig(valid({ automations: [spec(), spec({ id: "weekly", intervalMinutes: 10 })] }))
 		);
-		expect(cfg.schedules).toEqual([
+		expect(cfg.automations).toEqual([
 			{
 				id: "digest-desktop",
 				name: "Digest",
@@ -136,8 +194,8 @@ describe("loadLocalAppConfig - built-in schedule specs", () => {
 		]);
 	});
 
-	it("leaves schedules undefined when the key is absent", () => {
-		expect(loadLocalAppConfig(writeConfig(valid())).schedules).toBeUndefined();
+	it("leaves automations undefined when the key is absent", () => {
+		expect(loadLocalAppConfig(writeConfig(valid())).automations).toBeUndefined();
 	});
 
 	it("dROPS a below-floor intervalMinutes element per-element, keeping the valid siblings", () => {
@@ -145,11 +203,11 @@ describe("loadLocalAppConfig - built-in schedule specs", () => {
 		const cfg = loadLocalAppConfig(
 			writeConfig({
 				...valid(),
-				schedules: [spec({ id: "ok" }), spec({ id: "too-fast", intervalMinutes: 2 })]
+				automations: [spec({ id: "ok" }), spec({ id: "too-fast", intervalMinutes: 2 })]
 			}),
 			log
 		);
-		expect(cfg.schedules?.map((s) => s.id)).toEqual(["ok"]);
+		expect(cfg.automations?.map((s) => s.id)).toEqual(["ok"]);
 		expect(log).toHaveBeenCalled();
 	});
 
@@ -157,10 +215,10 @@ describe("loadLocalAppConfig - built-in schedule specs", () => {
 		const cfg = loadLocalAppConfig(
 			writeConfig({
 				...valid(),
-				schedules: [spec({ id: "ok" }), spec({ id: "a/b" }), spec({ id: ".." })]
+				automations: [spec({ id: "ok" }), spec({ id: "a/b" }), spec({ id: ".." })]
 			})
 		);
-		expect(cfg.schedules?.map((s) => s.id)).toEqual(["ok"]);
+		expect(cfg.automations?.map((s) => s.id)).toEqual(["ok"]);
 	});
 
 	it("a malformed element (missing/wrong-typed fields) does NOT throw the whole parse", () => {
@@ -168,7 +226,7 @@ describe("loadLocalAppConfig - built-in schedule specs", () => {
 			writeConfig({
 				productId: "acme-app",
 				productName: "Acme",
-				schedules: [
+				automations: [
 					{ id: "ok", name: "n", prompt: "p", intervalMinutes: 30, enabled: true },
 					{ id: "broken", enabled: "yes" },
 					42
@@ -177,14 +235,14 @@ describe("loadLocalAppConfig - built-in schedule specs", () => {
 		);
 		// The core config still parses AND the one valid element survives.
 		expect(cfg.productId).toBe("acme-app");
-		expect(cfg.schedules?.map((s) => s.id)).toEqual(["ok"]);
+		expect(cfg.automations?.map((s) => s.id)).toEqual(["ok"]);
 	});
 
-	it("a non-array schedules field does not brick the parse - it yields no built-ins", () => {
+	it("a non-array automations field does not brick the parse - it yields no built-ins", () => {
 		const log = vi.fn();
-		const cfg = loadLocalAppConfig(writeConfig({ ...valid(), schedules: "nope" }), log);
+		const cfg = loadLocalAppConfig(writeConfig({ ...valid(), automations: "nope" }), log);
 		expect(cfg.productId).toBe("acme-app");
-		expect(cfg.schedules).toBeUndefined();
+		expect(cfg.automations).toBeUndefined();
 		expect(log).toHaveBeenCalled();
 	});
 });
@@ -194,11 +252,11 @@ describe("loadLocalAppConfig - built-in cron cadences", () => {
 		const cfg = loadLocalAppConfig(
 			writeConfig(
 				valid({
-					schedules: [spec({ id: "nightly", cron: "0 9 * * *", timezone: "Asia/Tokyo" })]
+					automations: [spec({ id: "nightly", cron: "0 9 * * *", timezone: "Asia/Tokyo" })]
 				})
 			)
 		);
-		expect(cfg.schedules).toEqual([
+		expect(cfg.automations).toEqual([
 			{
 				id: "nightly",
 				name: "Digest",
@@ -212,8 +270,8 @@ describe("loadLocalAppConfig - built-in cron cadences", () => {
 
 	it("parses a cron spec carrying NO timezone key at all (absent, never null)", () => {
 		const [parsed] =
-			loadLocalAppConfig(writeConfig(valid({ schedules: [spec({ cron: "0 9 * * *" })] })))
-				.schedules ?? [];
+			loadLocalAppConfig(writeConfig(valid({ automations: [spec({ cron: "0 9 * * *" })] })))
+				.automations ?? [];
 		expect(parsed).toEqual({
 			id: "digest-desktop",
 			name: "Digest",
@@ -232,7 +290,7 @@ describe("loadLocalAppConfig - built-in cron cadences", () => {
 		const cfg = loadLocalAppConfig(
 			writeConfig({
 				...valid(),
-				schedules: [
+				automations: [
 					{
 						id: "both",
 						name: "n",
@@ -255,7 +313,7 @@ describe("loadLocalAppConfig - built-in cron cadences", () => {
 			}),
 			log
 		);
-		expect(cfg.schedules?.map((s) => s.id)).toEqual(["ok"]);
+		expect(cfg.automations?.map((s) => s.id)).toEqual(["ok"]);
 		expect(log).toHaveBeenCalledTimes(3);
 	});
 
@@ -263,27 +321,27 @@ describe("loadLocalAppConfig - built-in cron cadences", () => {
 		const cfg = loadLocalAppConfig(
 			writeConfig({
 				...valid(),
-				schedules: [
+				automations: [
 					spec({ id: "junk", cron: "not a cron" }),
 					spec({ id: "long", cron: LONG_VALID_CRON }),
 					spec({ id: "ok", cron: "0 9 * * *" })
 				]
 			})
 		);
-		expect(cfg.schedules?.map((s) => s.id)).toEqual(["ok"]);
+		expect(cfg.automations?.map((s) => s.id)).toEqual(["ok"]);
 	});
 
 	it("dROPS a cron spec whose timezone is not a real IANA zone", () => {
 		const cfg = loadLocalAppConfig(
 			writeConfig({
 				...valid(),
-				schedules: [
+				automations: [
 					spec({ id: "bogus", cron: "0 9 * * *", timezone: "Not/AZone" }),
 					spec({ id: "ok", cron: "0 9 * * *" })
 				]
 			})
 		);
-		expect(cfg.schedules?.map((s) => s.id)).toEqual(["ok"]);
+		expect(cfg.automations?.map((s) => s.id)).toEqual(["ok"]);
 	});
 
 	it("keeps an interval spec parsing exactly as before, beside a cron sibling", () => {
@@ -292,11 +350,11 @@ describe("loadLocalAppConfig - built-in cron cadences", () => {
 		const cfg = loadLocalAppConfig(
 			writeConfig(
 				valid({
-					schedules: [spec({ id: "legacy", intervalMinutes: 30 }), spec({ id: "new", cron: "0 9 * * *" })]
+					automations: [spec({ id: "legacy", intervalMinutes: 30 }), spec({ id: "new", cron: "0 9 * * *" })]
 				})
 			)
 		);
-		expect(cfg.schedules).toEqual([
+		expect(cfg.automations).toEqual([
 			{
 				id: "legacy",
 				name: "Digest",

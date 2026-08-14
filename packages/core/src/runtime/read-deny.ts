@@ -4,7 +4,7 @@ import { codexHomeDir } from "./paths";
 
 /**
  * Home-relative credential + secret trees a DISPATCHED run's CLI is denied any read of, ON TOP OF the
- * daemon's own dirs. A dispatched (chat/schedule) run is UNATTENDED and therefore prompt-injectable, so
+ * daemon's own dirs. A dispatched (chat/automation) run is UNATTENDED and therefore prompt-injectable, so
  * these are HARD read boundaries, not policy toggles or approval prompts: a coding CLI confined to the
  * work folder never needs the user's ssh keys, cloud/infra credentials, keychain, or browser cookie
  * stores, and denying them closes the obvious exfiltration targets a prompt-injected run reaches for.

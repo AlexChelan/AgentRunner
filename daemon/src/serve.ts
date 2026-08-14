@@ -142,7 +142,7 @@ function scopeLogLabel(scope: string): string {
  * pairing added or dropped by a SEPARATE process is picked up (or dropped) without restarting `serve`.
  * `filterUrl` pins the daemon to one backend (the `serve --url` path), serving EVERY account paired to it.
  *
- * This is the PAIRED shell only: the local scope (drive server + schedule runner) belongs to a desktop
+ * This is the PAIRED shell only: the local scope (drive server + automation runner) belongs to a desktop
  * app's own forked runtime, which owns its own app-data root and socket, so no daemon co-hosts it.
  *
  * Graceful shutdown drains every session (cancel runs -> flush poll client) and releases the lock. State

@@ -1,5 +1,5 @@
 import { cadenceOf, toCadence } from "@agentrunner/core-types";
-import type { ScheduleCadence } from "@agentrunner/core-types";
+import type { AutomationCadence } from "@agentrunner/core-types";
 import { CronExpressionParser } from "cron-parser";
 
 /**
@@ -10,14 +10,14 @@ import { CronExpressionParser } from "cron-parser";
  * twin rules; agent-core may not import that package.)
  */
 export { cadenceOf, toCadence };
-export type { ScheduleCadence };
+export type { AutomationCadence };
 
-/** The lowest interval a schedule may fire at, in minutes (the cloud model's floor; the daemon refuses below). */
+/** The lowest interval an automation may fire at, in minutes (the cloud model's floor; the daemon refuses below). */
 export const MIN_INTERVAL_MINUTES = 5;
 
 /**
- * The longest cron expression a schedule may carry, in characters - a storage guard mirroring the web's
- * `cronSchema` cap (`packages/api/src/routes/internal/ai/schedules-router.ts`). Real expressions are far
+ * The longest cron expression an automation may carry, in characters - a storage guard mirroring the web's
+ * `cronSchema` cap (`packages/api/src/routes/internal/ai/automations-router.ts`). Real expressions are far
  * shorter; the cap only stops a pathological string being stored.
  */
 export const MAX_CRON_LENGTH = 100;
@@ -62,14 +62,14 @@ export function isValidTimeZone(timeZone: string): boolean {
 }
 
 /**
- * Whether two cadences differ in any field - the re-arm trigger. A cron schedule's armed next-run instant
+ * Whether two cadences differ in any field - the re-arm trigger. A cron automation's armed next-run instant
  * is only valid for the cadence it was computed from, so any difference here must clear it.
  *
  * @param a - The prior cadence.
  * @param b - The new cadence.
  * @returns True when the interval, the cron string, or the timezone moved.
  */
-export function cadenceChanged(a: ScheduleCadence, b: ScheduleCadence): boolean {
+export function cadenceChanged(a: AutomationCadence, b: AutomationCadence): boolean {
 	return a.intervalMinutes !== b.intervalMinutes || a.cron !== b.cron || a.timezone !== b.timezone;
 }
 
@@ -79,7 +79,7 @@ export function cadenceChanged(a: ScheduleCadence, b: ScheduleCadence): boolean 
  * refuses it) - so the LAST newline is always the separator, and two different cadences can never fingerprint
  * alike even though a cron expression itself may carry a newline as whitespace. The runner stores it beside
  * the instant it armed, and
- * {@link import('./schedule-store').computeScheduleWork} compares it against the row's CURRENT cadence -
+ * {@link import('./automation-store').computeAutomationWork} compares it against the row's CURRENT cadence -
  * an armed row whose fingerprint no longer matches counts as UNARMED, so a cadence that changed behind the
  * store's back (a built-in spec edited in the staged app-config, which passes through no store edit path)
  * re-arms on the next tick instead of holding the instant its old cadence produced.
@@ -121,19 +121,19 @@ export function nextCronOccurrenceMs(
 }
 
 /**
- * The next fire instant to SHOW for a schedule, in epoch milliseconds - a read-only list projection that
- * never arms anything. An interval schedule that has NEVER run reads as `nowMs`, because a fresh interval
+ * The next fire instant to SHOW for an automation, in epoch milliseconds - a read-only list projection that
+ * never arms anything. An interval automation that has NEVER run reads as `nowMs`, because a fresh interval
  * row is due on the next tick; one that has run projects from its last run, clamped to now so an overdue
- * schedule reads as due rather than in the past. A cron schedule reports the runner's armed instant when
+ * automation reads as due rather than in the past. A cron automation reports the runner's armed instant when
  * it has one, else the next occurrence from now. Takes primitives so this module never imports the store.
  *
- * @param cadence - The schedule's cadence.
+ * @param cadence - The automation's cadence.
  * @param state - Its last-run and armed-next-run instants, each absent when unset.
  * @param nowMs - The current epoch milliseconds (read ONCE per list response by the caller).
  * @returns The instant to display, or `null` when a cron cadence cannot be projected.
  */
 export function displayNextRunAtMs(
-	cadence: ScheduleCadence,
+	cadence: AutomationCadence,
 	state: { lastRunAtMs?: number; armedNextRunAtMs?: number },
 	nowMs: number
 ): number | null {

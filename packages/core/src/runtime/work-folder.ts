@@ -15,8 +15,13 @@ import { workRoot } from "./paths";
 export interface WorkFolderOpts extends AgentShareSeams {
 	/** The app-data root (its parent holds secrets - the sandbox root is the SUBFOLDER). */
 	appDataRoot: string;
-	/** The paired-backend key (becomes the per-backend folder name); from {@link backendKey}. */
-	backendKey: string;
+	/**
+	 * The work-tree segment this run is confined under (becomes the folder name under `work/`). It is NOT
+	 * always a backend key: three callers supply it, being the LOCAL pseudo-scope for the on-device leg,
+	 * `local-<projectId>` for a project workspace, and a paired backend's key from `backendKey()`. It
+	 * names the FOLDER only and never decides the run's posture, which is read from the scope separately.
+	 */
+	workKey: string;
 	/** The product id (becomes the per-product folder name). */
 	productId: string;
 	/**
@@ -121,17 +126,18 @@ function makeRealDir(dir: string): void {
 }
 
 /**
- * Resolves and creates the confined `work/<backendKey>/<productId>/` folder under the app-data root,
+ * Resolves and creates the confined `work/<workKey>/<productId>/` folder under the app-data root,
  * which becomes the CLI's `cwd` and sandbox root. CRITICAL: the sandbox root is this leaf subfolder,
  * never the app-data parent (which holds the store, config, and secrets). The path is namespaced by
- * `backendKey` so two paired backends can never collide on the same `productId`. BOTH segments are
- * asserted to live STRICTLY inside their parent, so a crafted `backendKey` OR `productId` (`..`, an
- * absolute path, a separator) can never escape to the parent, a sibling, or a nested subdirectory.
+ * `workKey` so two paired backends - and two workspaces of the on-device leg - can never collide on the
+ * same `productId`. BOTH segments are asserted to live STRICTLY inside their parent, so a crafted
+ * `workKey` OR `productId` (`..`, an absolute path, a separator) can never escape to the parent, a
+ * sibling, or a nested subdirectory.
  *
  * An `agent` group-shares the folders it just created with that identity. On a contained host the
  * daemon creates them as root while the CLI child runs as an unprivileged uid, which can traverse a
  * root-owned dir but not WRITE it - and this folder is the run's cwd, so every dispatched run would
- * fail to write its own working directory. The per-backend parent is shared too: it is created by the
+ * fail to write its own working directory. The per-work-key parent is shared too: it is created by the
  * same `mkdir`, and a run that could not reach it could not use its product folder. Ownership
  * deliberately stays with the daemon, which still has to create the NEXT product folder in that parent
  * - see {@link shareWithAgent}. The container entrypoint cannot pre-fix any of this, since the folders
@@ -146,20 +152,20 @@ function makeRealDir(dir: string): void {
  * Sticky does NOT stop a run CREATING an entry, though, so the returned leaf is verified to be a real
  * directory before it is handed back as a cwd - see {@link makeRealDir} for that vector.
  *
- * @param opts - The app-data root, backend key, product id, and optional agent identity.
+ * @param opts - The app-data root, work key, product id, and optional agent identity.
  * @returns The absolute, existing, confined work folder - a real directory, never a symlink.
  * @throws When either segment would escape or nest below its confining root, or when the leaf cannot be
  *   made a real directory.
  */
 export function resolveWorkFolder(opts: WorkFolderOpts): string {
 	const root = workRoot(opts.appDataRoot);
-	const backendDir = confinedChild(root, opts.backendKey);
-	const dir = confinedChild(backendDir, opts.productId);
+	const workKeyDir = confinedChild(root, opts.workKey);
+	const dir = confinedChild(workKeyDir, opts.productId);
 	makeRealDir(dir);
 	const agent = opts.agent;
 	if (agent) {
 		const seams = opts.share ? { share: opts.share } : {};
-		shareWithAgent([backendDir], agent, AGENT_SHARED_PARENT_MODE, seams);
+		shareWithAgent([workKeyDir], agent, AGENT_SHARED_PARENT_MODE, seams);
 		shareWithAgent([dir], agent, AGENT_WRITE_MODE, seams);
 	}
 	return dir;

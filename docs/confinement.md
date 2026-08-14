@@ -19,11 +19,11 @@ system, so an unconfined run is not something a backend can ask for.
 What you DO control is whether this machine accepts a class of work at all, per backend:
 
 ```sh
-agentrunner origin show                                # scheduled / app-dispatched: allowed or refused
-agentrunner origin set --url https://your-saas.example/api --schedule deny --dispatch deny
+agentrunner origin show                                # automation / app-dispatched: allowed or refused
+agentrunner origin set --url https://your-saas.example/api --automation deny --dispatch deny
 ```
 
-A chat turn is your own request and always runs. `--schedule deny` refuses runs a backend fires on a
+A chat turn is your own request and always runs. `--automation deny` refuses runs a backend fires on a
 schedule; `--dispatch deny` refuses runs its product code starts. Both default to allowed, and
 unpairing removes the backend's access entirely.
 

@@ -207,7 +207,7 @@ function isAbortError(error: unknown): boolean {
  * `options.resume` only when `p.resume` is supplied (spike-D resume). The child env
  * is an allowlist with the node dir on PATH, plus the BYOK key when present.
  *
- * Every run this driver starts is a headless chat/schedule run, so it is ISOLATED from the user's
+ * Every run this driver starts is a headless chat/automation run, so it is ISOLATED from the user's
  * personal Claude Code config: `strictMcpConfig` limits MCP to the app-provided servers and
  * `settingSources: []` loads no filesystem settings/CLAUDE.md, so a run sees only the app tools plus
  * Claude Code's built-ins - never the user's personal MCP servers or custom permission grants. The
@@ -312,7 +312,7 @@ function makeClaudeDriver(query: ClaudeQuery, stallTimeoutMs: number): ClaudeDri
 			...(claudeExecutable ? { pathToClaudeCodeExecutable: claudeExecutable } : {}),
 			includePartialMessages: true,
 			abortController: controller,
-			// Isolate this headless chat/schedule run from the user's PERSONAL Claude Code config: use ONLY
+			// Isolate this headless chat/automation run from the user's PERSONAL Claude Code config: use ONLY
 			// the app-provided MCP servers (drop the user's own servers from `~/.claude` and any project
 			// `.mcp.json` - e.g. their personal infra MCP) and load NO filesystem settings (no user/project
 			// settings.json, no CLAUDE.md), so the run sees only the app tools plus Claude Code's built-ins.
@@ -583,7 +583,7 @@ function makeCodexDriver(
 			...privilegeDrop,
 			// Inherit an allowlisted env (PATH, proxy, CA, locale, ...) with the node dir on PATH, then add
 			// the BYOK key as `CODEX_API_KEY`; subscription mode reads the user's `~/.codex` login instead.
-			// When an isolated `codexHome` is supplied (a headless chat/schedule run), point `CODEX_HOME` at
+			// When an isolated `codexHome` is supplied (a headless chat/automation run), point `CODEX_HOME` at
 			// it so codex loads that home's config.toml (NO personal MCP servers) and its seeded auth.json
 			// instead of the user's `~/.codex` - the terminal path passes no `codexHome` and keeps the user's.
 			// A contained host also repoints HOME at the unprivileged user's own home: the child runs as

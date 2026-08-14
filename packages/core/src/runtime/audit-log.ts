@@ -71,8 +71,9 @@ export interface AuditEntry {
 	durationMs?: number;
 	/**
 	 * A small typed-string bag for lifecycle/dispatch attribution, e.g. a pair/unpair `deviceId`, a
-	 * dispatched run's `origin` tag, a `refused` run's `{ origin?, scheduleId?, reason }`, an opened
-	 * `terminal` session's `{ origin: 'terminal', cwd, model? }`, a policy-change old/new pair, or a
+	 * dispatched run's `{ origin?, cwd }` (the cwd it ACTUALLY ran in - its managed work folder, or the
+	 * project's connected folder when one is granted), a `refused` run's `{ origin?, automationId?, reason }`,
+	 * an opened `terminal` session's `{ origin: 'terminal', cwd, model? }`, a policy-change old/new pair, or a
 	 * log-recovery note.
 	 */
 	detail?: Record<string, string>;

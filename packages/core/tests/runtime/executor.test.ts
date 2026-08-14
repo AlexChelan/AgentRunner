@@ -1,8 +1,8 @@
 import { createHash } from "node:crypto";
-import { mkdtempSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, realpathSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { ConnectionRef, RunEvent, ToolSet } from "../../src/index";
+import type { ConnectionRef, RunEvent, RuntimeRunRequest, ToolSet } from "../../src/index";
 import { RunStartSchema } from "@agentrunner/protocol";
 import type { RunStart } from "@agentrunner/protocol";
 import { describe, expect, it, vi } from "vitest";
@@ -10,7 +10,7 @@ import type { AuditEntry, AuditLog } from "../../src/runtime/audit-log";
 import { brand } from "../../src/runtime/brand";
 import { createExecutor } from "../../src/runtime/executor";
 import type { ExecutorDeps } from "../../src/runtime/executor";
-import { codexHomeDir } from "../../src/runtime/paths";
+import { codexHomeDir, workRoot } from "../../src/runtime/paths";
 
 const conn: ConnectionRef = { id: "codex", toolId: "codex", authMode: "subscription" };
 function appDataRoot(): string {
@@ -78,7 +78,7 @@ function makeDeps(over: Partial<ExecutorDeps> = {}): ExecutorDeps {
 		audit: recordingAudit().audit,
 		sessionManager: fakeSession(() => {}).sm,
 		getConnection: () => conn,
-		getOriginPolicy: () => ({ denySchedule: false, denyDispatch: false }),
+		getOriginPolicy: () => ({ denyAutomation: false, denyDispatch: false }),
 		resolveBinary: () => "/bin/codex",
 		serveTools: async () => ({ spec: { type: "http", url: "x" }, close: async () => {} }),
 		shouldServe: () => false,
@@ -272,7 +272,7 @@ describe("executor", () => {
 		}
 	});
 
-	it("auto-APPROVES an unattended permission-request (desktop-scheduled posture) so the CLI can act, off the run.event wire", () => {
+	it("auto-APPROVES an unattended permission-request (desktop-automated posture) so the CLI can act, off the run.event wire", () => {
 		const events: RunEvent[] = [];
 		const { sm, permissionResponses } = fakeSession((onEvent, runId) => {
 			onEvent(
@@ -361,6 +361,91 @@ describe("executor", () => {
 			onClose: () => {}
 		});
 		expect(startedWith[0]?.connection).toBe(scoped);
+	});
+
+	it("start() with opts.workKey confines the run under that key instead of the constructed backendKey", () => {
+		const root = appDataRoot();
+		// One entry per dispatch, in order: the cwd (the confined work folder) the run was handed.
+		const cwds: string[] = [];
+		const { sm } = fakeSession(() => {});
+		const smSpy = {
+			...sm,
+			startRun: (
+				req: { cwd: string },
+				ctx: { runId: string },
+				_r: unknown,
+				onEvent: (e: RunEvent, id: string) => void
+			) => {
+				cwds.push(req.cwd);
+				onEvent({ type: "done" }, ctx.runId);
+				return ctx.runId;
+			}
+		};
+		const exec = createExecutor(
+			makeDeps({ appDataRoot: root, backendKey: "be1", sessionManager: smSpy })
+		);
+		const hooks = {
+			onEvent: () => {},
+			onToolCall: async () => undefined,
+			onClose: () => {}
+		};
+
+		exec.start(start({ runId: "no-opts" }), hooks);
+		exec.start(start({ runId: "with-work-key" }), hooks, { workKey: "local-AbC123xYz" });
+
+		// Omitting opts leaves the dispatch exactly where it was: under the daemon's constructed backend key.
+		expect(cwds[0]).toBe(join(workRoot(root), "be1", "p1"));
+		// The override moves THIS run's work tree to the given key, and the folder is really created there.
+		expect(cwds[1]).toBe(join(workRoot(root), "local-AbC123xYz", "p1"));
+		expect(existsSync(join(workRoot(root), "local-AbC123xYz", "p1"))).toBe(true);
+		// It is per-run, not sticky: the backend-key tree the first run used is untouched by the second.
+		expect(existsSync(join(workRoot(root), "be1", "p1"))).toBe(true);
+	});
+
+	it("a project workspace's LOCAL run relocates its work folder WITHOUT losing the local posture", () => {
+		// The work key and the trust scope are different questions, and `local-<projectId>` is not the LOCAL
+		// pseudo-scope string. A work key that also drove the scope would floor this run: the desktop app's
+		// own chat, with the user sitting in front of it, would become a read-only agent that cannot edit.
+		const root = appDataRoot();
+		// Typed as the REAL request the executor emits, not a local literal: a literal with optional
+		// `floored`/`permissionMode` keys would keep compiling after either is renamed, and the
+		// `toBeUndefined` posture assertion below would then pass on a property that no longer exists.
+		const reqs: RuntimeRunRequest[] = [];
+		const { sm } = fakeSession(() => {});
+		const smSpy = {
+			...sm,
+			startRun: (
+				req: RuntimeRunRequest,
+				ctx: { runId: string },
+				_r: unknown,
+				onEvent: (e: RunEvent, id: string) => void
+			) => {
+				reqs.push(req);
+				onEvent({ type: "done" }, ctx.runId);
+				return ctx.runId;
+			}
+		};
+		// A LOCAL executor: the on-device leg the desktop app's own chats run through.
+		const exec = createExecutor(
+			makeDeps({ appDataRoot: root, backendKey: "local", sessionManager: smSpy })
+		);
+		const hooks = {
+			onEvent: () => {},
+			onToolCall: async () => undefined,
+			onClose: () => {}
+		};
+
+		exec.start(start({ runId: "no-project" }), hooks);
+		exec.start(start({ runId: "project" }), hooks, { workKey: "local-AbC123xYzQ" });
+
+		// The project run's work tree moved out of the no-project one...
+		expect(reqs[0]?.cwd).toBe(join(workRoot(root), "local", "p1"));
+		expect(reqs[1]?.cwd).toBe(join(workRoot(root), "local-AbC123xYzQ", "p1"));
+		// ...and its posture is the no-project run's, untouched: still the un-floored local leg, still raised
+		// to auto-edit. `floored: true` with a `read-only` mode here would be the regression.
+		expect(reqs[1]?.floored).toBeUndefined();
+		expect(reqs[1]?.permissionMode).toBe("auto-edit");
+		expect(reqs[1]?.permissionMode).toBe(reqs[0]?.permissionMode);
 	});
 
 	it("emits an error event when the connection is unknown", () => {
@@ -606,7 +691,7 @@ describe("executor", () => {
 		expect(exec.activeRunCount()).toBe(0);
 		expect(closed).toHaveBeenCalledOnce();
 		// The caller learns the run is over, and BEFORE the close so a settle path reading the terminal
-		// event (the local schedule runner, the local fallback) still sees it.
+		// event (the local automation runner, the local fallback) still sees it.
 		expect(events.at(-1)?.type).toBe("error");
 	});
 
@@ -662,9 +747,10 @@ describe("executor audit", () => {
 	});
 
 	it("records a run's origin tag in the dispatched audit entry", () => {
+		const root = appDataRoot();
 		const { sm } = fakeSession((onEvent, runId) => onEvent({ type: "done" }, runId));
 		const { audit, appends } = recordingAudit();
-		const exec = createExecutor(makeDeps({ sessionManager: sm, audit }));
+		const exec = createExecutor(makeDeps({ appDataRoot: root, sessionManager: sm, audit }));
 		// The file's factory is start(overrides) - name the local differently to avoid shadowing it.
 		const originStart = start({ origin: "site-audit" });
 		exec.start(originStart, {
@@ -673,13 +759,17 @@ describe("executor audit", () => {
 			onClose: () => {}
 		});
 		const dispatched = appends.find((e) => e.event === "dispatched");
-		expect(dispatched?.detail).toEqual({ origin: "site-audit" });
+		expect(dispatched?.detail).toEqual({
+			origin: "site-audit",
+			cwd: join(workRoot(root), "be1", "p1")
+		});
 	});
 
-	it("omits detail on a dispatched entry when the run has no origin", () => {
+	it("records the folder the run ran in even when it has no origin", () => {
+		const root = appDataRoot();
 		const { sm } = fakeSession((onEvent, runId) => onEvent({ type: "done" }, runId));
 		const { audit, appends } = recordingAudit();
-		const exec = createExecutor(makeDeps({ sessionManager: sm, audit }));
+		const exec = createExecutor(makeDeps({ appDataRoot: root, sessionManager: sm, audit }));
 		const plainStart = start();
 		exec.start(plainStart, {
 			onEvent: () => {},
@@ -687,7 +777,44 @@ describe("executor audit", () => {
 			onClose: () => {}
 		});
 		const dispatched = appends.find((e) => e.event === "dispatched");
-		expect(dispatched?.detail).toBeUndefined();
+		expect(dispatched?.detail).toEqual({ cwd: join(workRoot(root), "be1", "p1") });
+	});
+
+	it("audits the EFFECTIVE cwd: a run in a connected folder is not recorded against the managed one", () => {
+		// The trust log answers "where has my agent been". A granted run recorded against the sandbox it did
+		// not use would be a false entry - the terminal path has named its real folder since Phase 1.
+		const root = appDataRoot();
+		const granted = join(realpathSync(mkdtempSync(join(tmpdir(), "runner-granted-"))), "checkout");
+		mkdirSync(granted, { recursive: true });
+		const reqs: RuntimeRunRequest[] = [];
+		const { sm } = fakeSession(() => {});
+		const smSpy = {
+			...sm,
+			startRun: (
+				req: RuntimeRunRequest,
+				ctx: { runId: string },
+				_r: unknown,
+				onEvent: (e: RunEvent, id: string) => void
+			) => {
+				reqs.push(req);
+				onEvent({ type: "done" }, ctx.runId);
+				return ctx.runId;
+			}
+		};
+		const { audit, appends } = recordingAudit();
+		const exec = createExecutor(
+			makeDeps({ appDataRoot: root, backendKey: "local", sessionManager: smSpy, audit })
+		);
+		exec.start(
+			start(),
+			{ onEvent: () => {}, onToolCall: async () => undefined, onClose: () => {} },
+			{ workKey: "local-AbC123xYzQ", connectedFolder: granted }
+		);
+
+		expect(reqs[0]?.cwd).toBe(granted);
+		expect(appends.find((e) => e.event === "dispatched")?.detail).toEqual({ cwd: granted });
+		// The managed folder still resolved beneath it (that is what validates the productId).
+		expect(existsSync(join(workRoot(root), "local-AbC123xYzQ", "p1"))).toBe(true);
 	});
 
 	it("fingerprints the prompt as sha256 of the canonical {systemPrompt,input} JSON (never logs the prompt text)", () => {
@@ -886,7 +1013,7 @@ describe("executor audit", () => {
 		expect(onClose).toHaveBeenCalledOnce();
 	});
 
-	it("refuses a SCHEDULE run (scheduleId derived) when the origin policy denies schedule: refused audited, never dispatched, CLI never started", () => {
+	it("refuses an AUTOMATION run (derived from the wire's scheduleId) when the origin policy denies automation: refused audited, never dispatched, CLI never started", () => {
 		const events: RunEvent[] = [];
 		const { sm, startedWith } = fakeSession((onEvent, runId) => onEvent({ type: "done" }, runId));
 		const { audit, appends } = recordingAudit();
@@ -895,7 +1022,7 @@ describe("executor audit", () => {
 			makeDeps({
 				sessionManager: sm,
 				audit,
-				getOriginPolicy: () => ({ denySchedule: true, denyDispatch: false })
+				getOriginPolicy: () => ({ denyAutomation: true, denyDispatch: false })
 			})
 		);
 		exec.start(start({ runId: "r-sched", scheduleId: "sch-1" }), {
@@ -907,11 +1034,11 @@ describe("executor audit", () => {
 		expect(startedWith).toHaveLength(0);
 		expect(appends.map((e) => e.event)).toEqual(["refused"]);
 		expect(appends.map((e) => e.event)).not.toContain("dispatched");
-		// The refused entry carries the scheduleId attribution and the origin_denied reason.
+		// The refused entry carries the automationId attribution and the origin_denied reason.
 		expect(appends[0]).toMatchObject({
 			event: "refused",
 			runId: "r-sched",
-			detail: { scheduleId: "sch-1", reason: "origin_denied" }
+			detail: { automationId: "sch-1", reason: "origin_denied" }
 		});
 		// The backend sees a terminal error frame over the existing run.event channel.
 		expect(events).toHaveLength(1);
@@ -929,7 +1056,7 @@ describe("executor audit", () => {
 			makeDeps({
 				sessionManager: sm,
 				audit,
-				getOriginPolicy: () => ({ denySchedule: false, denyDispatch: true })
+				getOriginPolicy: () => ({ denyAutomation: false, denyDispatch: true })
 			})
 		);
 		exec.start(start({ runId: "r-disp", origin: "site-audit" }), {
@@ -946,14 +1073,14 @@ describe("executor audit", () => {
 		});
 	});
 
-	it("nEVER refuses a chat run (neither scheduleId nor origin) even under a deny-both policy: it dispatches normally", () => {
+	it("nEVER refuses a chat run (neither automationId nor origin) even under a deny-both policy: it dispatches normally", () => {
 		const { sm, startedWith } = fakeSession((onEvent, runId) => onEvent({ type: "done" }, runId));
 		const { audit, appends } = recordingAudit();
 		const exec = createExecutor(
 			makeDeps({
 				sessionManager: sm,
 				audit,
-				getOriginPolicy: () => ({ denySchedule: true, denyDispatch: true })
+				getOriginPolicy: () => ({ denyAutomation: true, denyDispatch: true })
 			})
 		);
 		exec.start(start({ runId: "r-chat" }), {
@@ -978,7 +1105,7 @@ describe("executor audit", () => {
 			makeDeps({
 				sessionManager: sm,
 				audit,
-				getOriginPolicy: () => ({ denySchedule: true, denyDispatch: false })
+				getOriginPolicy: () => ({ denyAutomation: true, denyDispatch: false })
 			})
 		);
 		exec.start(start({ runId: "r-order-refused", scheduleId: "sch-2" }), {

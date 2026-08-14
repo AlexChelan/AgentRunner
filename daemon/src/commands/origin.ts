@@ -12,14 +12,14 @@ import { flagValue, openAuditLog, openStores, positionalArg, resolveCommandScope
  * unpairing are the only refusal levers a device owner has. The limit that remains is real: a backend
  * that omits `origin` on a product dispatch is wire-indistinguishable from a chat turn, and chat is
  * never deniable, so the dispatch deny refuses only a backend that voluntarily stamped the tag. The
- * schedule deny has no such hole.
+ * automation deny has no such hole.
  *
  * An earlier version of this text promised "the backend-side per-device grant (default deny)" as the
  * real gate. That grant was deleted, and a stale promise about a security control is worse than no
  * promise - it is the reason someone leaves this deny off.
  */
 const ORIGIN_NOTE =
-  'Chat runs are always allowed and can never be refused here. A backend that omits origin on a product dispatch is wire-indistinguishable from chat, so the app-dispatched deny refuses only a backend that tags its own dispatches honestly; the scheduled deny has no such gap. Pairing is what authorized this machine in the first place, so this deny and unpairing the backend are the two levers you have over it. The daemon re-reads this every run, so a change applies to the next one - no restart.'
+  'Chat runs are always allowed and can never be refused here. A backend that omits origin on a product dispatch is wire-indistinguishable from chat, so the app-dispatched deny refuses only a backend that tags its own dispatches honestly; the automated deny has no such gap. Pairing is what authorized this machine in the first place, so this deny and unpairing the backend are the two levers you have over it. The daemon re-reads this every run, so a change applies to the next one - no restart.'
 
 /**
  * What this command is NOT, stated where a reader will look for it.
@@ -28,7 +28,7 @@ const ORIGIN_NOTE =
  * answers "what can a dispatched run touch", and its answer is permanently "nothing" - there is no
  * setting for that and never will be. This answers "will this device accept that kind of work at all",
  * which is about the user's own machine time and their own subscription quota. Someone perfectly happy
- * with the containment may still not want their laptop running scheduled work at 3am.
+ * with the containment may still not want their laptop running automated work at 3am.
  */
 const FLOOR_NOTE =
   'This is about whether work runs at all, not what it may touch. A dispatched run can never read, write or search a file, run a shell, or reach your local MCP servers - that is fixed and is not affected by anything here.'
@@ -52,7 +52,7 @@ function parseDenyFlag(value: string): boolean | undefined {
 }
 
 /**
- * Runs `origin show [--url <backend>] [--local]`: prints whether this device accepts scheduled and
+ * Runs `origin show [--url <backend>] [--local]`: prints whether this device accepts automated and
  * app-dispatched work for a scope, plus the fixed {@link ORIGIN_NOTE} and {@link FLOOR_NOTE} footers.
  * Read-only.
  *
@@ -65,7 +65,7 @@ async function cmdOriginShow(argv: string[]): Promise<void> {
   if (scope === undefined) return
   const policy = state.getOriginPolicy(scope)
   const body = [
-    `scheduled runs: ${originLabel(policy.denySchedule)}`,
+    `automated runs: ${originLabel(policy.denyAutomation)}`,
     `app-dispatched runs: ${originLabel(policy.denyDispatch)}`,
     'chat runs: always allowed',
     '',
@@ -78,7 +78,7 @@ async function cmdOriginShow(argv: string[]): Promise<void> {
 }
 
 /**
- * Runs `origin set (--url <backend> | --local) [--schedule allow|deny] [--dispatch allow|deny]`.
+ * Runs `origin set (--url <backend> | --local) [--automation allow|deny] [--dispatch allow|deny]`.
  *
  * At least one flag is required, and an omitted field KEEPS its current value rather than resetting it,
  * so setting one kind never silently re-allows the other. The change is audited as a `policy-change`
@@ -93,27 +93,27 @@ async function cmdOriginSet(argv: string[]): Promise<void> {
   const scope = await resolveCommandScope(argv, state)
   if (scope === undefined) return
 
-  const rawSchedule = flagValue(argv, '--schedule')
+  const rawAutomation = flagValue(argv, '--automation')
   const rawDispatch = flagValue(argv, '--dispatch')
-  if (rawSchedule === undefined && rawDispatch === undefined) {
-    ui.p.log.error('Pass at least one of --schedule <allow|deny> or --dispatch <allow|deny>.')
+  if (rawAutomation === undefined && rawDispatch === undefined) {
+    ui.p.log.error('Pass at least one of --automation <allow|deny> or --dispatch <allow|deny>.')
     ui.outro('Nothing changed.')
     process.exit(1)
   }
-  const denySchedule = rawSchedule === undefined ? undefined : parseDenyFlag(rawSchedule)
+  const denyAutomation = rawAutomation === undefined ? undefined : parseDenyFlag(rawAutomation)
   const denyDispatch = rawDispatch === undefined ? undefined : parseDenyFlag(rawDispatch)
   if (
-    (rawSchedule !== undefined && denySchedule === undefined) ||
+    (rawAutomation !== undefined && denyAutomation === undefined) ||
     (rawDispatch !== undefined && denyDispatch === undefined)
   ) {
-    ui.p.log.error('--schedule and --dispatch take exactly "allow" or "deny".')
+    ui.p.log.error('--automation and --dispatch take exactly "allow" or "deny".')
     ui.outro('Nothing changed.')
     process.exit(1)
   }
 
   const before = state.getOriginPolicy(scope)
   const next: OriginPolicy = {
-    denySchedule: denySchedule ?? before.denySchedule,
+    denyAutomation: denyAutomation ?? before.denyAutomation,
     denyDispatch: denyDispatch ?? before.denyDispatch
   }
   state.setOriginPolicy(scope, next)
@@ -125,7 +125,7 @@ async function cmdOriginSet(argv: string[]): Promise<void> {
     detail: { from: JSON.stringify(before), to: JSON.stringify(next) }
   })
   ui.p.log.success(
-    `Origin policy for ${scope}: scheduled ${originLabel(next.denySchedule)}, ` +
+    `Origin policy for ${scope}: automated ${originLabel(next.denyAutomation)}, ` +
       `app-dispatched ${originLabel(next.denyDispatch)}.`
   )
   ui.outro(`${BRAND.name} origin.`)
@@ -133,7 +133,7 @@ async function cmdOriginSet(argv: string[]): Promise<void> {
 }
 
 /**
- * Runs the `origin <show|set>` command group: whether THIS DEVICE accepts scheduled and app-dispatched
+ * Runs the `origin <show|set>` command group: whether THIS DEVICE accepts automated and app-dispatched
  * work from a paired app, independent of anything the app can do - and, with unpairing, the whole of
  * what a device owner can refuse, since pairing is the authorization on the backend end. An unknown or
  * missing subcommand prints the group usage and exits non-zero.

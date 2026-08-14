@@ -55,17 +55,23 @@ function sanitizeOverride(value: unknown): LocalTaskOverride | null {
 
 /**
  * Creates a file-backed {@link LocalTaskOverrideStore} rooted at `dir` (`localDataDir(root)`). The map
- * persists as one JSON file at `<dir>/task-overrides.json`. Writes are atomic - a temp file
- * (`task-overrides.json.tmp-<pid>`) is written then `renameSync`d into place - so a crash mid-write
+ * persists as one JSON file at `<dir>/<fileName>`. Writes are atomic - a temp file
+ * (`<fileName>.tmp-<pid>`) is written then `renameSync`d into place - so a crash mid-write
  * never leaves a partial file at the real path. A missing, corrupt, or wrong-shape file reads as `{}`,
  * matching the chat store's swallow posture. The dir is created on demand `chmod 700` and the file
  * `chmod 600`, the same owner-only reasoning as the chat and secret stores.
  *
  * @param dir - The local data directory the document lives in.
+ * @param fileName - The document's file name; defaults to the legacy `task-overrides.json`, so a caller
+ *   that omits it keeps today's exact path. `createWorkspaceTaskOverrideStores` passes `<projectId>.json`
+ *   to give each project workspace its own document under a `task-overrides/` subdirectory.
  * @returns A file-backed task-override store.
  */
-export function createLocalTaskOverrideStore(dir: string): LocalTaskOverrideStore {
-	const file = join(dir, "task-overrides.json");
+export function createLocalTaskOverrideStore(
+	dir: string,
+	fileName = "task-overrides.json"
+): LocalTaskOverrideStore {
+	const file = join(dir, fileName);
 
 	return {
 		read() {

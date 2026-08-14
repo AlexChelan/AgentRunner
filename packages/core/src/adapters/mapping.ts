@@ -502,7 +502,7 @@ export function codexAppServerItemToMessage(
 				: null;
 		case "mcpToolCall": {
 			// App-MCP tool calls (e.g. the capability tools served over the local MCP): surface them as
-			// tool chips just like Codex's native tools, so a Codex run shows `list_schedules` etc.
+			// tool chips just like Codex's native tools, so a Codex run shows `list_automations` etc.
 			const error =
 				isRecord(item.error) && typeof item.error.message === "string"
 					? item.error.message

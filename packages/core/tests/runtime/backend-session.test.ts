@@ -541,7 +541,7 @@ describe("createBackendSession (what it advertises)", () => {
 
 	// The backend can only offer what the daemon reports. A dispatched codex run is REFUSED on a host
 	// whose sandbox is not OS-enforced, so advertising it there put a CLI in the web picker whose every
-	// turn failed - and a schedule pointed at it fired forever, recording the same refusal every tick.
+	// turn failed - and an automation pointed at it fired forever, recording the same refusal every tick.
 	it("withholds codex from the backend where its sandbox is not OS-enforced", async () => {
 		const fixture = fixtures();
 		const state = fixture.readState();

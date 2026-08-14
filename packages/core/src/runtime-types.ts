@@ -65,7 +65,7 @@ export type RuntimeRunRequest = RunRequest & {
 	 */
 	denyReadPaths?: string[];
 	/**
-	 * An ISOLATED `CODEX_HOME` for a headless chat/schedule run (consumed only by the Codex adapter).
+	 * An ISOLATED `CODEX_HOME` for a headless chat/automation run (consumed only by the Codex adapter).
 	 * Codex reads its `config.toml` (the user's personal `mcp_servers`, profiles) from `CODEX_HOME` and
 	 * offers no strict-MCP flag, so the runner isolates a run by pointing `CODEX_HOME` at a
 	 * runner-managed home whose `config.toml` declares NO personal MCP servers - the run then sees

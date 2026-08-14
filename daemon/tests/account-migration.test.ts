@@ -86,18 +86,18 @@ describe('migrateAccountScopes', () => {
     const { state, secrets } = harness()
     seedLegacy(state, secrets, LEGACY, 'tok-a')
     state.upsertConnection(LEGACY, { toolId: 'claude-code', source: 'reused', authHealth: 'healthy' })
-    state.setOriginPolicy(LEGACY, { denySchedule: true, denyDispatch: false })
+    state.setOriginPolicy(LEGACY, { denyAutomation: true, denyDispatch: false })
     state.upsertMcpServer(LEGACY, 'linear', { type: 'stdio', command: 'linear-mcp' })
 
     await migrateAccountScopes(state, secrets, sessionFetchFor('user-a'))
 
     const scope = accountScope(LEGACY, 'user-a')
     expect(state.listConnections(scope)).toHaveLength(1)
-    expect(state.getOriginPolicy(scope)).toEqual({ denySchedule: true, denyDispatch: false })
+    expect(state.getOriginPolicy(scope)).toEqual({ denyAutomation: true, denyDispatch: false })
     expect(state.listMcpServers(scope)).toEqual({ linear: { type: 'stdio', command: 'linear-mcp' } })
     // Nothing was left stranded on the legacy key.
     expect(state.listConnections(LEGACY)).toHaveLength(0)
-    expect(state.getOriginPolicy(LEGACY)).toEqual({ denySchedule: false, denyDispatch: false })
+    expect(state.getOriginPolicy(LEGACY)).toEqual({ denyAutomation: false, denyDispatch: false })
     expect(state.listMcpServers(LEGACY)).toEqual({})
   })
 
@@ -182,7 +182,7 @@ describe('migrateAccountScopes', () => {
     // rebuild that visited only paired keys would DELETE the desktop app's entire local configuration.
     // A ceiling that differs from the local scope's OWN default (`full` / network on): asserting the
     // default back would pass even if the write-back had deleted the record.
-    state.setOriginPolicy(LOCAL_SCOPE, { denySchedule: true, denyDispatch: false })
+    state.setOriginPolicy(LOCAL_SCOPE, { denyAutomation: true, denyDispatch: false })
     state.upsertConnection(LOCAL_SCOPE, { toolId: 'codex', source: 'installed', authHealth: 'healthy' })
     state.upsertMcpServer(LOCAL_SCOPE, 'linear', { type: 'stdio', command: 'npx', envKeys: ['LINEAR_KEY'] })
     writeMcpEnv(secrets, LOCAL_SCOPE, 'linear', { LINEAR_KEY: 'lin_local_secret' })
@@ -192,7 +192,7 @@ describe('migrateAccountScopes', () => {
     await migrateAccountScopes(state, secrets, sessionFetchFor('user-a'))
 
     expect(state.getPairedBackend(accountScope(LEGACY, 'user-a'))).not.toBeNull()
-    expect(state.getOriginPolicy(LOCAL_SCOPE)).toEqual({ denySchedule: true, denyDispatch: false })
+    expect(state.getOriginPolicy(LOCAL_SCOPE)).toEqual({ denyAutomation: true, denyDispatch: false })
     expect(state.getConnection(LOCAL_SCOPE, 'codex')?.source).toBe('installed')
     expect(state.listMcpServers(LOCAL_SCOPE)).toEqual({
       linear: { type: 'stdio', command: 'npx', envKeys: ['LINEAR_KEY'] }

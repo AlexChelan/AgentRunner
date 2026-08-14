@@ -199,7 +199,7 @@ describe("claudeDriver", () => {
 	});
 
 	it("isolates the run from the user personal config (strict MCP + no filesystem settings)", async () => {
-		// A headless chat/schedule run must see ONLY the app-provided MCP servers and Claude Code's
+		// A headless chat/automation run must see ONLY the app-provided MCP servers and Claude Code's
 		// built-ins, never the user's personal MCP servers (dokploy, etc.) or custom settings. The Agent
 		// SDK enforces that with `strictMcpConfig` (ignore ~/.claude + project .mcp.json servers) and
 		// `settingSources: []` (load no user/project settings or CLAUDE.md). Auth is unaffected - neither

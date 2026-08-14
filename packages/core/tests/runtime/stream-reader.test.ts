@@ -188,7 +188,7 @@ describe("reconnectDelayMs", () => {
 	});
 
 	it("backs off exponentially as attempts mount", () => {
-		// Pinned with the top of the window (random -> 1) so this asserts the schedule, not a sample. The
+		// Pinned with the top of the window (random -> 1) so this asserts the automation, not a sample. The
 		// first window is already twice the floor, which is what leaves attempt 1 something to jitter over.
 		const top = (attempt: number) => reconnectDelayMs(attempt, () => 1);
 		expect(top(1)).toBe(2_000);

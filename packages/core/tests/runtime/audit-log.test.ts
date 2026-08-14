@@ -45,12 +45,12 @@ describe("createAuditLog append", () => {
 			event: "refused",
 			runId: "r-ref",
 			productId: "p1",
-			detail: { scheduleId: "sch-1", reason: "origin_denied" }
+			detail: { automationId: "sch-1", reason: "origin_denied" }
 		});
 		const [entry] = log.read();
 		// The closed event set now admits `refused`, so a persisted refusal survives re-parse (not skipped).
 		expect(entry?.event).toBe("refused");
-		expect(entry?.detail).toEqual({ scheduleId: "sch-1", reason: "origin_denied" });
+		expect(entry?.detail).toEqual({ automationId: "sch-1", reason: "origin_denied" });
 	});
 
 	it('round-trips a "login" session event with its status detail', () => {

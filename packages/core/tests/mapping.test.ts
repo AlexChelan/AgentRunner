@@ -350,28 +350,28 @@ describe("codexAppServerItemToMessage", () => {
 		).toBeNull();
 	});
 
-	it("surfaces an mcpToolCall as a tool chip so runner app-MCP tools (e.g. list_schedules) stream", () => {
+	it("surfaces an mcpToolCall as a tool chip so runner app-MCP tools (e.g. list_automations) stream", () => {
 		const running = {
 			id: "6",
 			type: "mcpToolCall",
 			server: "runner",
-			tool: "list_schedules",
+			tool: "list_automations",
 			status: "inProgress"
 		};
 		expect(codexAppServerItemToMessage(running, false)).toEqual({
 			kind: "tool",
-			name: "list_schedules",
+			name: "list_automations",
 			status: "started"
 		});
 		expect(codexAppServerItemToMessage({ ...running, status: "completed" }, true)).toEqual({
 			kind: "tool",
-			name: "list_schedules",
+			name: "list_automations",
 			status: "completed"
 		});
 		const failed = { ...running, status: "failed", error: { message: "boom" } };
 		expect(codexAppServerItemToMessage(failed, true)).toEqual({
 			kind: "tool",
-			name: "list_schedules",
+			name: "list_automations",
 			status: "failed",
 			detail: "boom"
 		});
@@ -764,13 +764,13 @@ describe("codexAppServerNotificationToMessages", () => {
 					id: "m",
 					type: "mcpToolCall",
 					server: "runner",
-					tool: "list_schedules",
+					tool: "list_automations",
 					status: "completed"
 				}
 			},
 			state
 		);
-		expect(out.messages).toEqual([{ kind: "tool", name: "list_schedules", status: "completed" }]);
+		expect(out.messages).toEqual([{ kind: "tool", name: "list_automations", status: "completed" }]);
 	});
 });
 

@@ -14,7 +14,7 @@ import { describe, expect, it } from "vitest";
 import type { AuditEntry, AuditLog } from "../../src/runtime/audit-log";
 import type { RunHooks } from "../../src/runtime/executor";
 import { createLocalSession } from "../../src/runtime/local/local-session";
-import type { LocalScheduleOutcome } from "../../src/runtime/local/schedule-store";
+import type { LocalAutomationOutcome } from "../../src/runtime/local/automation-store";
 import { LOCAL_SCOPE } from "../../src/runtime/local/scope";
 import { localDataDir, runtimeIdentityDir, secretsDir, workRoot } from "../../src/runtime/paths";
 import { sensitiveHomeReadDenyPaths } from "../../src/runtime/read-deny";
@@ -633,6 +633,102 @@ describe("createLocalSession", () => {
 		expect(req?.modelId).toBe("gpt-5-codex");
 	});
 
+	it("confines a workKey chat to work/<workKey>/<productId>, leaving a keyless chat where it was", () => {
+		const { appDataRoot, readState, secrets } = fixtures();
+		connect(readState, "codex");
+		const { registry, runReqs } = recordingRegistry("codex", (_req, emit) =>
+			emit({ type: "done" })
+		);
+		const { audit } = recordingAudit();
+		const session = createLocalSession({
+			appDataRoot,
+			registry,
+			readState,
+			secrets,
+			audit,
+			config: () => ({ productId: "demo", productName: "Demo" }),
+			write: () => {}
+		});
+		session.startChat({ prompt: "go", cli: "codex", hooks: noopHooks() });
+		session.startChat({
+			prompt: "go",
+			cli: "codex",
+			workKey: "local-AbC123xYzQ",
+			hooks: noopHooks()
+		});
+		// The chat with no project stays under the LOCAL scope's own tree...
+		expect(runReqs[0]?.cwd).toBe(join(workRoot(appDataRoot), LOCAL_SCOPE, "demo"));
+		// ...and the keyed chat's work tree moved, which only happens if the key survived the per-dispatch
+		// MCP-server wrapper and reached the EXECUTOR (a wrapper that drops the opts leaves this at `local`).
+		expect(runReqs[1]?.cwd).toBe(join(workRoot(appDataRoot), "local-AbC123xYzQ", "demo"));
+		// The key moves the folder and nothing else: the local leg's un-floored posture is untouched.
+		expect(runReqs[1]?.floored).toBeUndefined();
+	});
+
+	it("runs a chat in the project's CONNECTED folder instead of the managed work tree", () => {
+		const { appDataRoot, readState, secrets } = fixtures();
+		connect(readState, "codex");
+		const { registry, runReqs } = recordingRegistry("codex", (_req, emit) =>
+			emit({ type: "done" })
+		);
+		const { audit } = recordingAudit();
+		const granted = mkdtempSync(join(tmpdir(), "runner-granted-"));
+		const session = createLocalSession({
+			appDataRoot,
+			registry,
+			readState,
+			secrets,
+			audit,
+			config: () => ({ productId: "demo", productName: "Demo" }),
+			write: () => {}
+		});
+		session.startChat({
+			prompt: "go",
+			cli: "codex",
+			workKey: "local-AbC123xYzQ",
+			connectedFolder: granted,
+			hooks: noopHooks()
+		});
+		// The per-dispatch MCP-server wrapper's third parameter is the whole hazard: a shorter arrow still
+		// satisfies `typeof executor.start` and would swallow this option with a green typecheck, running the
+		// user's assistant in the managed sandbox while the UI says it is in their folder.
+		expect(runReqs[0]?.cwd).toBe(granted);
+	});
+
+	it("keeps the connected folder on the FALLBACK dispatch, which is a fresh start of its own", () => {
+		// The fallback is a second `start` with the same opts object. A retry that dropped it would run under
+		// different confinement than the attempt it replaces - in the sandbox, not the user's folder.
+		const { appDataRoot, readState, secrets } = fixtures();
+		// Only the FALLBACK's CLI is connected, so the primary fails to start and the fallback fires.
+		connect(readState, "claude-code");
+		const { registry, runReqs } = twoAdapterRegistry(
+			{ toolId: "codex", onRun: () => undefined },
+			{ toolId: "claude-code", onRun: (_req, emit) => emit({ type: "done" }) }
+		);
+		const { audit } = recordingAudit();
+		const granted = mkdtempSync(join(tmpdir(), "runner-granted-"));
+		const session = createLocalSession({
+			appDataRoot,
+			registry,
+			readState,
+			secrets,
+			audit,
+			config: () => ({ productId: "demo", productName: "Demo", fallbackCli: "claude-code" }),
+			write: () => {}
+		});
+		session.startChat({
+			prompt: "go",
+			cli: "codex",
+			workKey: "local-AbC123xYzQ",
+			connectedFolder: granted,
+			hooks: noopHooks()
+		});
+
+		expect(runReqs).toHaveLength(1);
+		expect(runReqs[0]?.connectionId).toBe("claude-code");
+		expect(runReqs[0]?.cwd).toBe(granted);
+	});
+
 	it("prefers the call cli/modelId over the config defaults", () => {
 		const { appDataRoot, readState, secrets } = fixtures();
 		connect(readState, "codex");
@@ -661,17 +757,17 @@ describe("createLocalSession", () => {
 	});
 });
 
-describe("createLocalSession.startScheduled", () => {
+describe("createLocalSession.startAutomated", () => {
 	/** Captures the settle callback's (outcome, output) tuples. */
 	function collector(): {
-		onDone: (outcome: LocalScheduleOutcome | null, text: string) => void;
-		calls: Array<[LocalScheduleOutcome | null, string]>;
+		onDone: (outcome: LocalAutomationOutcome | null, text: string) => void;
+		calls: Array<[LocalAutomationOutcome | null, string]>;
 	} {
-		const calls: Array<[LocalScheduleOutcome | null, string]> = [];
+		const calls: Array<[LocalAutomationOutcome | null, string]> = [];
 		return { onDone: (outcome, text) => calls.push([outcome, text]), calls };
 	}
 
-	it("stamps origin = scheduleId on the dispatched audit and starts the CLI after auditing", () => {
+	it("stamps origin = automationId on the dispatched audit and starts the CLI after auditing", () => {
 		const { appDataRoot, readState, secrets } = fixtures();
 		connect(readState, "codex");
 		const order: string[] = [];
@@ -690,23 +786,95 @@ describe("createLocalSession.startScheduled", () => {
 			write: () => {}
 		});
 		const done = collector();
-		session.startScheduled({
-			scheduleId: "sched-1",
+		session.startAutomated({
+			automationId: "sched-1",
 			prompt: "go",
 			cli: "codex",
 			onDone: done.onDone
 		});
-		// scheduleId is folded into the dispatched audit as origin (executor attribution), auditing first.
+		// automationId is folded into the dispatched audit as origin (executor attribution), auditing first.
 		expect(order.indexOf("audit:dispatched")).toBeLessThan(order.indexOf("run"));
 		const dispatched = appends.find((entry) => entry.event === "dispatched");
 		expect(dispatched?.detail?.origin).toBe("sched-1");
 		expect(done.calls).toEqual([["completed", ""]]);
 	});
 
-	it("classifies a policy-denied scheduled run as refused (scheduleId drives the derived kind)", () => {
+	it("confines a workKey fire to work/<workKey>/<productId>, leaving a keyless fire where it was", () => {
 		const { appDataRoot, readState, secrets } = fixtures();
 		connect(readState, "codex");
-		readState().setOriginPolicy(LOCAL_SCOPE, { denySchedule: true, denyDispatch: false });
+		const { registry, runReqs } = recordingRegistry("codex", (_req, emit) =>
+			emit({ type: "done" })
+		);
+		const { audit } = recordingAudit();
+		const session = createLocalSession({
+			appDataRoot,
+			registry,
+			readState,
+			secrets,
+			audit,
+			config: () => ({ productId: "demo", productName: "Demo" }),
+			write: () => {}
+		});
+		const done = collector();
+		session.startAutomated({
+			automationId: "sched-1",
+			prompt: "go",
+			cli: "codex",
+			onDone: done.onDone
+		});
+		session.startAutomated({
+			automationId: "sched-2",
+			prompt: "go",
+			cli: "codex",
+			workKey: "local-AbC123xYzQ",
+			onDone: done.onDone
+		});
+		// An automation fires through the same wrapper as a chat, so it needs its own proof the key survives it.
+		expect(runReqs[0]?.cwd).toBe(join(workRoot(appDataRoot), LOCAL_SCOPE, "demo"));
+		expect(runReqs[1]?.cwd).toBe(join(workRoot(appDataRoot), "local-AbC123xYzQ", "demo"));
+		expect(done.calls).toEqual([
+			["completed", ""],
+			["completed", ""]
+		]);
+	});
+
+	it("fires an automation in the project's CONNECTED folder, through the same wrapper", () => {
+		// An automation is the unattended half of the same seam, so it needs its own proof the option
+		// survives the per-dispatch MCP wrapper - this is the run nobody is watching.
+		const { appDataRoot, readState, secrets } = fixtures();
+		connect(readState, "codex");
+		const { registry, runReqs } = recordingRegistry("codex", (_req, emit) =>
+			emit({ type: "done" })
+		);
+		const { audit } = recordingAudit();
+		const granted = mkdtempSync(join(tmpdir(), "runner-granted-"));
+		const session = createLocalSession({
+			appDataRoot,
+			registry,
+			readState,
+			secrets,
+			audit,
+			config: () => ({ productId: "demo", productName: "Demo" }),
+			write: () => {}
+		});
+		const done = collector();
+		session.startAutomated({
+			automationId: "sched-1",
+			prompt: "go",
+			cli: "codex",
+			workKey: "local-AbC123xYzQ",
+			connectedFolder: granted,
+			onDone: done.onDone
+		});
+
+		expect(runReqs[0]?.cwd).toBe(granted);
+		expect(done.calls).toEqual([["completed", ""]]);
+	});
+
+	it("classifies a policy-denied automated run as refused (automationId drives the derived kind)", () => {
+		const { appDataRoot, readState, secrets } = fixtures();
+		connect(readState, "codex");
+		readState().setOriginPolicy(LOCAL_SCOPE, { denyAutomation: true, denyDispatch: false });
 		const { registry, runReqs } = recordingRegistry("codex", (_req, emit) =>
 			emit({ type: "done" })
 		);
@@ -721,17 +889,17 @@ describe("createLocalSession.startScheduled", () => {
 			write: () => {}
 		});
 		const done = collector();
-		session.startScheduled({
-			scheduleId: "sched-1",
+		session.startAutomated({
+			automationId: "sched-1",
 			prompt: "go",
 			cli: "codex",
 			onDone: done.onDone
 		});
-		// The CLI never ran; the executor wrote a fail-closed refused entry attributing the schedule.
+		// The CLI never ran; the executor wrote a fail-closed refused entry attributing the automation.
 		expect(runReqs).toHaveLength(0);
 		const refused = appends.find((entry) => entry.event === "refused");
 		expect(refused?.detail).toMatchObject({
-			scheduleId: "sched-1",
+			automationId: "sched-1",
 			origin: "sched-1",
 			reason: "origin_denied"
 		});
@@ -758,8 +926,8 @@ describe("createLocalSession.startScheduled", () => {
 			write: () => {}
 		});
 		const done = collector();
-		session.startScheduled({
-			scheduleId: "sched-1",
+		session.startAutomated({
+			automationId: "sched-1",
 			prompt: "go",
 			cli: "codex",
 			onDone: done.onDone
@@ -782,8 +950,8 @@ describe("createLocalSession.startScheduled", () => {
 			write: () => {}
 		});
 		const done = collector();
-		session.startScheduled({
-			scheduleId: "sched-1",
+		session.startAutomated({
+			automationId: "sched-1",
 			prompt: "go",
 			cli: "codex",
 			onDone: done.onDone
@@ -808,8 +976,8 @@ describe("createLocalSession.startScheduled", () => {
 			write: () => {}
 		});
 		const done = collector();
-		session.startScheduled({
-			scheduleId: "sched-1",
+		session.startAutomated({
+			automationId: "sched-1",
 			prompt: "go",
 			cli: "codex",
 			onDone: done.onDone
@@ -832,8 +1000,8 @@ describe("createLocalSession.startScheduled", () => {
 			write: () => {}
 		});
 		const done = collector();
-		session.startScheduled({
-			scheduleId: "sched-1",
+		session.startAutomated({
+			automationId: "sched-1",
 			prompt: "go",
 			cli: "claude-code",
 			onDone: done.onDone
@@ -855,7 +1023,7 @@ describe("createLocalSession.startScheduled", () => {
 			write: () => {}
 		});
 		const done = collector();
-		session.startScheduled({ scheduleId: "sched-1", prompt: "go", onDone: done.onDone });
+		session.startAutomated({ automationId: "sched-1", prompt: "go", onDone: done.onDone });
 		expect(done.calls).toEqual([["failed", ""]]);
 		expect(appends).toHaveLength(0);
 	});
@@ -876,8 +1044,8 @@ describe("createLocalSession.startScheduled", () => {
 			write: () => {}
 		});
 		const done = collector();
-		session.startScheduled({
-			scheduleId: "sched-1",
+		session.startAutomated({
+			automationId: "sched-1",
 			prompt: "go",
 			cli: "codex",
 			onDone: done.onDone

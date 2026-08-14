@@ -177,7 +177,7 @@ export interface AgenticCliDriverParams {
 	/**
 	 * Only the CODEX driver consumes this: an ISOLATED `CODEX_HOME` for the run. Codex reads its
 	 * `config.toml` (personal `mcp_servers`, profiles) AND its file-based `auth.json` from `CODEX_HOME`,
-	 * and offers no strict-MCP flag or separate auth path, so a headless chat/schedule run is isolated
+	 * and offers no strict-MCP flag or separate auth path, so a headless chat/automation run is isolated
 	 * by pointing `CODEX_HOME` at a runner-managed home whose `config.toml` declares NO personal MCP
 	 * servers. Subscription auth is preserved because that home's `auth.json` is a SYMLINK to the user's
 	 * real one (so no credential is copied at rest, and a keyring-auth platform - which has no auth.json -

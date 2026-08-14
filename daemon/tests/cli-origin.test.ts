@@ -12,7 +12,7 @@ describe('cli routing - origin show / set', () => {
   it('"origin show --local" reports both kinds allowed by default', async () => {
     tempAppData('originshow')
     await run(['origin', 'show', '--local'])
-    expect(out.stdout).toContain('scheduled runs: allowed')
+    expect(out.stdout).toContain('automated runs: allowed')
     expect(out.stdout).toContain('app-dispatched runs: allowed')
     expect(out.stdout).toContain('chat runs: always allowed')
   })
@@ -36,28 +36,28 @@ describe('cli routing - origin show / set', () => {
   it('"origin" with no subcommand shows the current stance', async () => {
     tempAppData('originbare')
     await run(['origin', '--local'])
-    expect(out.stdout).toContain('scheduled runs: allowed')
+    expect(out.stdout).toContain('automated runs: allowed')
   })
 
-  it('"origin set --local --schedule deny" persists, and a fresh read sees it', async () => {
+  it('"origin set --local --automation deny" persists, and a fresh read sees it', async () => {
     const solo = tempAppData('originset')
-    await run(['origin', 'set', '--local', '--schedule', 'deny'])
+    await run(['origin', 'set', '--local', '--automation', 'deny'])
     expect(out.exitCode).toBe(0)
     // A fresh store re-reads the file, matching the executor's per-run fresh read.
     expect(createStateStore({ cwd: solo }).getOriginPolicy('local')).toEqual({
-      denySchedule: true,
+      denyAutomation: true,
       denyDispatch: false
     })
   })
 
   it('an omitted flag KEEPS its current value rather than resetting it', async () => {
-    // The regression this guards: denying dispatch must not silently re-allow schedules the user had
+    // The regression this guards: denying dispatch must not silently re-allow automations the user had
     // already refused, which a naive whole-object write would do.
     const solo = tempAppData('originkeep')
-    await run(['origin', 'set', '--local', '--schedule', 'deny'])
+    await run(['origin', 'set', '--local', '--automation', 'deny'])
     await run(['origin', 'set', '--local', '--dispatch', 'deny'])
     expect(createStateStore({ cwd: solo }).getOriginPolicy('local')).toEqual({
-      denySchedule: true,
+      denyAutomation: true,
       denyDispatch: true
     })
   })
@@ -67,17 +67,17 @@ describe('cli routing - origin show / set', () => {
     await run(['origin', 'set', '--local'])
     expect(out.exitCode).toBe(1)
     expect(createStateStore({ cwd: solo }).getOriginPolicy('local')).toEqual({
-      denySchedule: false,
+      denyAutomation: false,
       denyDispatch: false
     })
   })
 
   it('a value that is neither allow nor deny is refused, never read as the permissive one', async () => {
     const solo = tempAppData('originbadval')
-    await run(['origin', 'set', '--local', '--schedule', 'maybe'])
+    await run(['origin', 'set', '--local', '--automation', 'maybe'])
     expect(out.exitCode).toBe(1)
     expect(createStateStore({ cwd: solo }).getOriginPolicy('local')).toEqual({
-      denySchedule: false,
+      denyAutomation: false,
       denyDispatch: false
     })
   })
@@ -90,17 +90,17 @@ describe('cli routing - origin show / set', () => {
     const entry = createAuditLog({ dir: auditDir(solo) })
       .read({ backendUrl: 'local' })
       .find((e) => e.event === 'policy-change')
-    expect(entry?.detail?.from).toBe('{"denySchedule":false,"denyDispatch":false}')
-    expect(entry?.detail?.to).toBe('{"denySchedule":false,"denyDispatch":true}')
+    expect(entry?.detail?.from).toBe('{"denyAutomation":false,"denyDispatch":false}')
+    expect(entry?.detail?.to).toBe('{"denyAutomation":false,"denyDispatch":true}')
   })
 
   it('sets a PAIRED backend stance, keyed by its scope', async () => {
     const solo = tempAppData('originpaired')
     const url = 'https://origin.example'
     pairBackend(solo, { backendUrl: url, deviceId: 'do' })
-    await run(['origin', 'set', '--url', url, '--schedule', 'deny'])
+    await run(['origin', 'set', '--url', url, '--automation', 'deny'])
     expect(out.exitCode).toBe(0)
-    expect(createStateStore({ cwd: solo }).getOriginPolicy(url).denySchedule).toBe(true)
+    expect(createStateStore({ cwd: solo }).getOriginPolicy(url).denyAutomation).toBe(true)
   })
 
   it('"origin" with an unknown subcommand prints the group usage', async () => {

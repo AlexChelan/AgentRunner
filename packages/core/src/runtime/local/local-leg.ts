@@ -9,13 +9,21 @@ import type { SecretStore } from "../storage/secret-store";
 import type { StateStore } from "../storage/state-store";
 import type { LocalAppConfig } from "./app-config";
 import { createLocalChatStore } from "./chat-store";
-import { createLocalTaskOverrideStore } from "./task-overrides";
+import { canonicalConnectedFolderPath } from "./connected-folder-deny";
+import { connectedFolderForRun } from "./connected-folder-run";
+import {
+	createConnectedFolderStore,
+	resolveConnectedFolderDenyDeps
+} from "./connected-folders";
 import { startLocalDriveServer } from "./drive-server";
 import { createLocalSession } from "./local-session";
 import type { LocalSession } from "./local-session";
-import { createScheduleRunner } from "./schedule-runner";
-import { createLocalScheduleStore } from "./schedule-store";
+import { createAutomationRunner } from "./automation-runner";
 import { LOCAL_SCOPE } from "./scope";
+import {
+	createWorkspaceAutomationStores,
+	createWorkspaceTaskOverrideStores
+} from "./workspace-stores";
 
 /** Everything the local scope serves, bootable by any daemon entry that has an app config. */
 export interface LocalLeg {
@@ -29,7 +37,7 @@ export interface LocalLeg {
 	 * and it NEVER rides the ready line on stdout.
 	 */
 	token: string;
-	/** Total local runs in flight (chat + scheduled). */
+	/** Total local runs in flight (chat + automated). */
 	activeRunCount(): number;
 	/** Drains the leg: close drive server (unlinking its socket), stop runner, cancel in-flight local runs. Idempotent. */
 	stop(): Promise<void>;
@@ -44,7 +52,7 @@ export interface LocalLegDeps {
 	readState: () => StateStore;
 	secrets: SecretStore;
 	audit: AuditLog;
-	/** Process-wide in-flight run count for the schedule runner's cap gate (defaults to the leg's own count). */
+	/** Process-wide in-flight run count for the automation runner's cap gate (defaults to the leg's own count). */
 	totalActiveRuns?: () => number;
 	/**
 	 * Service-unit probe for the /v1/health `lifecycle` field. Required rather than defaulted: whether an
@@ -52,6 +60,12 @@ export interface LocalLegDeps {
 	 * supplies it instead of the engine reaching back for it.
 	 */
 	serviceUnitPresent: () => boolean;
+	/**
+	 * The product identity this runtime was LAUNCHED with, which `/v1/health` falls back to when the
+	 * on-device config cannot be read. Health is the host's adoption probe, so it has to be able to name
+	 * the runtime without the config; every other route still fails closed on one it cannot read.
+	 */
+	launchIdentity: { productId: string; productName: string };
 	/** The daemon build version reported on /v1/health. Supplied by the host, which owns its own versioning. */
 	version: string;
 	/**
@@ -64,10 +78,10 @@ export interface LocalLegDeps {
 
 /**
  * Boots the local executor leg: a {@link createLocalSession} wired into a {@link startLocalDriveServer}
- * (the socket drive for local-origin runs) plus a {@link createScheduleRunner} that fires due schedules
+ * (the socket drive for local-origin runs) plus a {@link createAutomationRunner} that fires due automations
  * through that SAME audited session as chat. It prints the machine-readable ready line
  * `{"event":"local-serve.ready","socketPath":"<path>"}` - the SOCKET ONLY, the token NEVER rides stdout
- * (the host learns it over its own private channel). The schedule runner starts only AFTER the drive
+ * (the host learns it over its own private channel). The automation runner starts only AFTER the drive
  * server has bound.
  *
  * The leg is scope-agnostic: any daemon entry that can supply an app config plus a socket path boots the
@@ -92,7 +106,7 @@ export async function startLocalLeg(deps: LocalLegDeps): Promise<LocalLeg> {
 		config,
 		write
 	});
-	// The in-flight run count the schedule runner's cap gate consults: the process-wide total when the
+	// The in-flight run count the automation runner's cap gate consults: the process-wide total when the
 	// caller co-hosts another leg, else this leg's own local session count.
 	const totalActiveRuns = deps.totalActiveRuns ?? ((): number => session.activeRunCount());
 	// The chat cap is fresh-read per save (like every other config read here) so a live edit applies
@@ -101,18 +115,39 @@ export async function startLocalLeg(deps: LocalLegDeps): Promise<LocalLeg> {
 		join(localDataDir(appDataRoot), "chats"),
 		() => config().maxChatsPerAgent
 	);
-	const taskOverrides = createLocalTaskOverrideStore(localDataDir(appDataRoot));
-	const schedules = createLocalScheduleStore(join(localDataDir(appDataRoot), "schedules"));
-	// The runner fires due schedules through the SAME audited local session as chat. Constructed here
-	// (session -> store -> runner) and started AFTER the drive server binds; stopped in the drain BEFORE
+	// Per-WORKSPACE stores: the no-project bucket keeps the legacy root documents byte-for-byte (which
+	// is why an unscoped install gains no file from this), and each project workspace gets its own, created
+	// lazily on first write.
+	const taskOverrides = createWorkspaceTaskOverrideStores(localDataDir(appDataRoot));
+	const automations = createWorkspaceAutomationStores(join(localDataDir(appDataRoot), "automations"));
+	// The per-project connected-folder grants, and the deny predicate's roots resolved ONCE here from THIS
+	// process's environment. This is the seam the daemon owns: every site the daemon judges a folder at (the
+	// drive PUT, and the dispatch/terminal sites that re-validate a stored grant) shares this one dep set, so
+	// they provably compute one protected set - and a disagreement with the Electron main dialog, which
+	// resolves its own, fails at the PUT rather than silently letting main's answer stand.
+	const connectedFolderDeny = resolveConnectedFolderDenyDeps(appDataRoot);
+	// The store's canonicality assertion is the PREDICATE'S canonicalizer, built from the dep set above -
+	// so the folder the PUT judged and the folder the store persists are one function's output, and no
+	// legitimate grant can be refused by the two disagreeing about a Win32 device namespace or an
+	// injected resolver.
+	const connectedFolders = createConnectedFolderStore(localDataDir(appDataRoot), {
+		canonicalize: (path) => canonicalConnectedFolderPath(path, connectedFolderDeny)
+	});
+	// The runner fires due automations through the SAME audited local session as chat. Constructed here
+	// (session -> stores -> runner) and started AFTER the drive server binds; stopped in the drain BEFORE
 	// the session so no new fire starts while in-flight runs are being cancelled. The cap is fresh-read
 	// per fire (like the poll client's ceiling) so a live `limits` change applies without a restart.
-	const scheduleRunner = createScheduleRunner({
-		store: schedules,
+	const automationRunner = createAutomationRunner({
+		stores: automations,
 		session,
 		config,
 		getMaxConcurrentRuns: () => readState().getMaxConcurrentRuns(),
 		totalActiveRuns,
+		// The SAME store and the SAME protected set the drive PUT judges with, so an unattended fire cannot
+		// end up in a folder the authority would have refused. Bound here rather than resolved inside the
+		// runner: one resolution per daemon, one answer.
+		connectedFolder: (projectId) =>
+			connectedFolderForRun(projectId, { connectedFolders, connectedFolderDeny, config }),
 		write
 	});
 
@@ -120,8 +155,10 @@ export async function startLocalLeg(deps: LocalLegDeps): Promise<LocalLeg> {
 		session,
 		chats,
 		taskOverrides,
-		schedules,
-		scheduleRunner,
+		automations,
+		connectedFolders,
+		connectedFolderDeny,
+		automationRunner,
 		config,
 		// Project the LOCAL-scope CLI connections down to the wire subset the drive server serves, reading a
 		// FRESH store each call so a separate `connect --local` propagates without restarting the daemon.
@@ -231,7 +268,7 @@ export async function startLocalLeg(deps: LocalLegDeps): Promise<LocalLeg> {
 		// "Default" entry) rather than failing.
 		listToolModels: (toolId) => listAdapterModels(registry.getAdapter(toolId)),
 		// Fresh-read the supervision lifecycle per `/v1/health` request from the OS service state: `background`
-		// when this machine's always-on service supervises the daemon (schedules fire with the app closed),
+		// when this machine's always-on service supervises the daemon (automations fire with the app closed),
 		// else `app-scoped`. Uses the CHEAP unit-file existence probe (never spawns launchctl/systemctl per
 		// request). A probe throw degrades to `app-scoped` - the honest default that never falsely promises the
 		// daemon outlives the app.
@@ -242,14 +279,15 @@ export async function startLocalLeg(deps: LocalLegDeps): Promise<LocalLeg> {
 				return "app-scoped";
 			}
 		},
+		launchIdentity: deps.launchIdentity,
 		version: deps.version,
 		socketPath: deps.socketPath
 	});
 
 	write(`${JSON.stringify({ event: "local-serve.ready", socketPath: handle.socketPath })}\n`);
 
-	// Start the tick loop only after the drive server has bound (schedules run while the app is open).
-	scheduleRunner.start();
+	// Start the tick loop only after the drive server has bound (automations run while the app is open).
+	automationRunner.start();
 
 	return {
 		session,
@@ -260,7 +298,7 @@ export async function startLocalLeg(deps: LocalLegDeps): Promise<LocalLeg> {
 		// session (cancel in-flight runs). The close unlinks the socket, so no dead inode survives the drain.
 		stop: async () => {
 			await handle.close();
-			scheduleRunner.stop();
+			automationRunner.stop();
 			await session.stop();
 		}
 	};

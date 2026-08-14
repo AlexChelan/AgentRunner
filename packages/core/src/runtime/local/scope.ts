@@ -1,15 +1,10 @@
 import { parseAccountScope } from "../account-scope";
 import { backendKey } from "../backend-key";
+import { LOCAL_SCOPE } from "./local-scope";
 
-/**
- * The pseudo backend key scoping every LOCAL-mode record (connections, MCP servers, policy,
- * folder grants, the work tree, audit stamps) in the same per-backend stores the paired daemon
- * uses. It can never collide with a real {@link import('../backend-key').backendKey} output
- * (those are always `<host>-<8 hex digest>`), it is not a valid URL so it is never paired and
- * never enters the pairing canonicalization migration (which iterates only paired-backend keys),
- * and it is a safe single path segment for the `work/<key>/<productId>/` tree.
- */
-export const LOCAL_SCOPE = "local";
+// Re-exported from its own leaf module (which the browser-safe ./workspace-scope imports) so this
+// module stays the ONE place the rest of the daemon reads the local scope from.
+export { LOCAL_SCOPE };
 
 /**
  * True when a scope string is the LOCAL pseudo-scope rather than a paired backend URL.

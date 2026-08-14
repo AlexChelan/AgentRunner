@@ -105,6 +105,20 @@ describe("createLocalTaskOverrideStore", () => {
 		expect(readdirSync(dir)).toEqual(["task-overrides.json"]);
 	});
 
+	it("honours a custom file name, leaving the default document untouched", () => {
+		const dir = dataDir();
+		const custom = createLocalTaskOverrideStore(dir, "custom.json");
+		custom.write({ a: { modelKey: "k-custom" } });
+		expect(readdirSync(dir)).toEqual(["custom.json"]);
+		expect(custom.read()).toEqual({ a: { modelKey: "k-custom" } });
+
+		const fallback = createLocalTaskOverrideStore(dir);
+		expect(fallback.read()).toEqual({});
+		fallback.write({ a: { modelKey: "k-default" } });
+		expect(readdirSync(dir).sort()).toEqual(["custom.json", "task-overrides.json"]);
+		expect(custom.read()).toEqual({ a: { modelKey: "k-custom" } });
+	});
+
 	it("a later read after an external empty-object write returns {}", () => {
 		const dir = dataDir();
 		mkdirSync(dir, { recursive: true });

@@ -15,7 +15,7 @@ import { composeLocalSystemPrompt } from "./system-prompt";
  * `crypto.randomUUID()` is the only nondeterminism.
  */
 
-/** The agent id every local run carries; with no scheduleId/origin, `deriveRunKind` reads it as `chat`. */
+/** The agent id every local run carries; with no `scheduleId`/`origin` on the wire, `deriveRunKind` reads it as `chat`. */
 const LOCAL_AGENT_ID = "chat";
 
 /** The user sentinel for a run with no paired backend or subscription owner. */

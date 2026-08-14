@@ -7,16 +7,21 @@ import { realpathDeepest } from "../index";
  *
  * A dispatched run is always pinned to `work/<backendKey>/<productId>/`, and so is a `terminal` session
  * that names no folder. But a terminal exists to work on the user's OWN project, so `terminal --cwd
- * <path>` is honored for any folder the caller names, and there is no stored grant list behind it.
+ * <path>` is honored for any folder the caller names.
  *
  * NOTHING REMOTE CAN NAME ONE: the terminal spec a backend answers with is parsed fail-closed against a
  * four-key schema that strips every unknown key, so no backend can send a path, ask for one, or smuggle
  * one. A `--cwd` therefore only ever reaches here from a LOCAL caller - and each local caller owns the
- * consent for the folder it names. There are two, and they establish it differently: the shell user TYPES
- * the path, which is itself the consent; the desktop app takes it from its own native folder dialog and
- * lets its renderer name that pick by an opaque handle only, never by a path the webview composed. A
- * local caller that can be driven by untrusted input and does NEITHER would be handing this function a
- * folder nobody chose, which this function has no way to detect.
+ * consent for the folder it names. There are three, and they establish it differently. The shell user
+ * TYPES the path, which is itself the consent. The desktop app takes it from its own native folder dialog
+ * and lets its renderer name that pick by an opaque handle only, never by a path the webview composed -
+ * per-process consent for one session. The third is the connected-folder GRANT
+ * (`local/connected-folders.ts`), which is recorded consent for a STANDING binding: the user consents once
+ * in that same native dialog and the folder then grounds every chat, automation and default-cwd terminal
+ * for that project, across restarts, until they revoke it - which is why a grant is judged against a
+ * protected set (`local/connected-folder-deny.ts`) before it is stored, and re-resolved through this
+ * function at every use. A local caller that can be driven by untrusted input and does NONE of the three
+ * would be handing this function a folder nobody chose, which this function has no way to detect.
  */
 
 /**

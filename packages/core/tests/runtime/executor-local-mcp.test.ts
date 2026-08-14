@@ -61,7 +61,7 @@ function makeDeps(sm: SessionManager, over: Partial<ExecutorDeps> = {}): Executo
 		audit,
 		sessionManager: sm,
 		getConnection: () => conn,
-		getOriginPolicy: () => ({ denySchedule: false, denyDispatch: false }),
+		getOriginPolicy: () => ({ denyAutomation: false, denyDispatch: false }),
 		resolveBinary: () => "/bin/codex",
 		serveTools: async () => ({ spec: { type: "http", url: "x" }, close: async () => {} }),
 		shouldServe: () => false,
