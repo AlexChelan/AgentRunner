@@ -129,7 +129,24 @@ if (isWin) {
   const launcher = join(distDir, brand.binary)
   writeFileSync(
     launcher,
-    '#!/bin/sh\nDIR="$(cd "$(dirname "$0")" && pwd)"\nexec "$DIR/node" "$DIR/daemon/cli.js" "$@"\n'
+    [
+      '#!/bin/sh',
+      '# Follow $0 through symlinks so DIR is the real payload dir, not wherever a symlink',
+      '# onto PATH lives - the container image symlinks this launcher into /usr/local/bin,',
+      '# and a bare `dirname "$0"` would then look for node/daemon there and fail. POSIX',
+      '# readlink loop, mirroring install.sh - no `readlink -f`, which BSD/macOS lack.',
+      'self="$0"',
+      'while [ -L "$self" ]; do',
+      '  target="$(readlink "$self")"',
+      '  case "$target" in',
+      '    /*) self="$target" ;;',
+      '    *) self="$(dirname "$self")/$target" ;;',
+      '  esac',
+      'done',
+      'DIR="$(CDPATH= cd -- "$(dirname -- "$self")" && pwd)"',
+      'exec "$DIR/node" "$DIR/daemon/cli.js" "$@"',
+      ''
+    ].join('\n')
   )
   chmodSync(launcher, 0o755)
 }
