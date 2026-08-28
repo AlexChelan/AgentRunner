@@ -2,7 +2,7 @@ import { Buffer } from "node:buffer";
 import { existsSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { request } from "node:http";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { delimiter, join } from "node:path";
 import type {
 	AdapterCapabilities,
 	AgentRuntimeRegistry,
@@ -13,13 +13,14 @@ import type {
 	RuntimeRunRequest,
 	RuntimeToolAdapter
 } from "../../src/index";
+import { DESKTOP_CLI_IDS } from "@agentrunner/core-types";
 import { afterEach, describe, expect, it } from "vitest";
 import { createAuditLog } from "../../src/runtime/audit-log";
 import { DRIVE_HOST } from "../../src/runtime/local/drive-server";
 import { loadLocalAppConfig } from "../../src/runtime/local/app-config";
 import { startLocalLeg } from "../../src/runtime/local/local-leg";
 import type { LocalLeg } from "../../src/runtime/local/local-leg";
-import { auditDir, localDataDir } from "../../src/runtime/paths";
+import { auditDir, localDataDir, managedCliDir } from "../../src/runtime/paths";
 import { createFileSecretStore } from "../../src/runtime/storage/secret-store";
 import { createStateStore } from "../../src/runtime/storage/state-store";
 import type { StateStore } from "../../src/runtime/storage/state-store";
@@ -253,6 +254,38 @@ describe("startLocalLeg (composable local executor leg)", () => {
 		expect((await drive(leg, "GET", "/v1/health")).status).toBe(200);
 	});
 
+	it("refuses to install over a CLI the USER already has, and touches nothing", async () => {
+		// The app installs FOR a user who has no install of their own. A CLI on the user's PATH is theirs to
+		// update, and binary resolution prefers it over the managed copy anyway - so installing a second
+		// copy would download a tree nothing ever runs, on top of an install the app does not own.
+		//
+		// This case also FENCES the suite: `installCli` would otherwise reach the real npm registry, so a
+		// regression in this check turns a unit test into a live network install.
+		const d = deps();
+		const binDir = mkdtempSync(join(tmpdir(), "runner-user-cli-"));
+		const userBinary = join(binDir, "grok");
+		writeFileSync(userBinary, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+		const originalPath = process.env.PATH;
+		process.env.PATH = `${binDir}${delimiter}${originalPath ?? ""}`;
+		try {
+			const leg = await startLocalLeg(d);
+			running.push(leg);
+
+			const res = await drive(leg, "POST", "/v1/tools/grok/install");
+
+			expect(res.status).toBe(200);
+			expect(res.text.trim().split("\n").map((line) => JSON.parse(line))).toEqual([
+				{ type: "install.result", result: { status: "user-managed", path: userBinary } }
+			]);
+			// Nothing was fetched, written, or even prepared: `installCli` creates the tool's managed dir
+			// before it does anything else, so its absence proves the install never started.
+			expect(existsSync(join(managedCliDir(d.appDataRoot), "clis", "grok"))).toBe(false);
+		} finally {
+			if (originalPath === undefined) delete process.env.PATH;
+			else process.env.PATH = originalPath;
+		}
+	});
+
 	it("serves the runtime adapter model catalog over GET /v1/tools/<toolId>/models (picker wire shape)", async () => {
 		// The desktop picker's per-CLI lists come from THIS leg (a desktop-only product has no backend
 		// catalog route), projected to the shared { id, name, recommended? } wire shape: label falls back
@@ -298,7 +331,14 @@ describe("startLocalLeg (composable local executor leg)", () => {
 		expect(body.status).toBe(200);
 		expect(JSON.parse(body.text)).toEqual({
 			models: [
-				{ id: "claude-fable-5", name: "Claude Fable 5", recommended: true },
+				// The window rides along: the desktop composer's meter divides its reported token counts by
+				// it, and a model whose catalog publishes none carries none.
+				{
+					id: "claude-fable-5",
+					name: "Claude Fable 5",
+					recommended: true,
+					contextWindow: 500_000
+				},
 				{ id: "claude-opus-4-8", name: "claude-opus-4-8" }
 			]
 		});
@@ -461,7 +501,7 @@ describe("startLocalLeg (composable local executor leg)", () => {
 });
 
 describe("startLocalLeg - CLI catalog + in-app connect", () => {
-	it("gET /v1/tools/catalog reports each connectable CLI live install/auth/connected state", async () => {
+	it("gET /v1/tools/catalog reports each desktop CLI live install/auth/connected state", async () => {
 		const d = deps();
 		// claude-code already connected locally; codex installed + signed in but NOT connected here (the exact
 		// shape a CLI signed in for a paired backend but never connected locally lands in - the invisible case).
@@ -480,17 +520,39 @@ describe("startLocalLeg - CLI catalog + in-app connect", () => {
 		const res = await drive(leg, "GET", "/v1/tools/catalog");
 		expect(res.status).toBe(200);
 		const { tools } = JSON.parse(res.text) as {
-			tools: { toolId: string; installed: boolean; authenticated: boolean; connected: boolean }[];
+			tools: {
+				toolId: string;
+				displayName: string;
+				installed: boolean;
+				authenticated: boolean;
+				connected: boolean;
+				images: boolean;
+				documents: boolean;
+			}[];
 		};
 		const byTool = Object.fromEntries(tools.map((tool) => [tool.toolId, tool]));
-		// The WHOLE connectable catalog is present, installed or not.
-		expect(Object.keys(byTool).sort()).toEqual(["claude-code", "codex"]);
+		// The catalog site is the DESKTOP set, not the narrower cloud-dispatch allowlist: the Models screen
+		// offers every CLI this machine may drive, so a desktop-only CLI is never invisible there.
+		expect(Object.keys(byTool).sort()).toEqual([...DESKTOP_CLI_IDS].sort());
 		expect(byTool["claude-code"]).toMatchObject({
 			installed: true,
 			authenticated: true,
 			connected: true
 		});
 		expect(byTool.codex).toMatchObject({ installed: true, authenticated: true, connected: false });
+		// A desktop CLI the registry has no adapter for degrades to a not-installed row (id as its label)
+		// rather than dropping out of the catalog or failing the whole probe.
+		for (const toolId of ["grok", "opencode"]) {
+			expect(byTool[toolId]).toEqual({
+				toolId,
+				displayName: toolId,
+				installed: false,
+				authenticated: false,
+				connected: false,
+				images: false,
+				documents: false
+			});
+		}
 	});
 
 	it("pOST /v1/tools/<id>/connect records a local connection so /v1/tools then lists it", async () => {
@@ -511,8 +573,31 @@ describe("startLocalLeg - CLI catalog + in-app connect", () => {
 
 		// ...so the picker's connection list now surfaces it - the fix for the invisible-CLI regression.
 		expect(JSON.parse((await drive(leg, "GET", "/v1/tools")).text)).toEqual({
-			tools: [{ toolId: "codex", authHealth: "healthy", images: false }]
+			tools: [{ toolId: "codex", authHealth: "healthy", images: false, documents: false }]
 		});
+	});
+
+	it("answers a desktop-only CLI the registry has no adapter for cleanly, never a throw or a 500", async () => {
+		// grok/opencode reach the connect and models routes (the desktop gate is the host catalog) before
+		// their runtime adapters exist. Both must degrade to an informational answer the picker can render:
+		// a 200 status body and an empty catalog, with nothing recorded as connected.
+		const d = deps();
+		d.registry = registryOf({ codex: fakeAdapter("codex", { installed: true, authenticated: true }) });
+		const leg = await startLocalLeg(d);
+		running.push(leg);
+
+		const connectRes = await drive(leg, "POST", "/v1/tools/grok/connect");
+		expect(connectRes.status).toBe(200);
+		expect(JSON.parse(connectRes.text)).toEqual({
+			status: "failed",
+			reason: "no runtime adapter for this tool"
+		});
+
+		const modelsRes = await drive(leg, "GET", "/v1/tools/grok/models");
+		expect(modelsRes.status).toBe(200);
+		expect(JSON.parse(modelsRes.text)).toEqual({ models: [] });
+
+		expect(JSON.parse((await drive(leg, "GET", "/v1/tools")).text)).toEqual({ tools: [] });
 	});
 
 	it("pOST /v1/tools/<id>/connect reports needs-login for an installed-but-signed-out CLI, recording nothing", async () => {

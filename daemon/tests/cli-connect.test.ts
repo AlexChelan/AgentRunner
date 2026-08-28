@@ -1,3 +1,6 @@
+import { readdirSync, readFileSync, statSync } from 'node:fs'
+import { join } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import { describe, expect, it } from 'vitest'
 import {
   APP_DATA,
@@ -125,5 +128,78 @@ describe('cli routing - connect / disconnect', () => {
     expect(out.exitCode).toBe(0)
     expect(out.stdout).toContain('Disconnected codex')
     expect(createStateStore({ cwd: solo }).getConnection(LOCAL_SCOPE, 'codex')).toBeNull()
+  })
+})
+
+/**
+ * The daemon's registry must stay DISPATCH-ONLY, and this is the assertion that keeps it there.
+ *
+ * `buildRunnerRegistry(baseDir, run?, opts?, cliIds?)` defaults `cliIds` to `CONNECTABLE_TOOL_IDS`, and
+ * every call in this app takes that default. It is the TRUE backstop behind the connection-write checks
+ * in `recordConnection`: even a connection that somehow reached a backend scope naming a desktop-only CLI
+ * resolves no adapter here, so the run fails closed with "no runtime adapter for this tool" rather than
+ * dispatching to a CLI that can enforce no capability floor.
+ *
+ * Passing a FOURTH argument anywhere in `apps/runner` is what would silently undo that, which no
+ * behavioural test in this app would notice - the widened id only matters once a matching connection
+ * exists. So the argument list is asserted directly, at the source.
+ */
+const RUNNER_SRC = fileURLToPath(new URL('../src', import.meta.url))
+
+/** Every `.ts` file under a directory, recursively. */
+function tsFiles(dir: string): string[] {
+  return readdirSync(dir).flatMap((entry) => {
+    const path = join(dir, entry)
+    if (statSync(path).isDirectory()) return tsFiles(path)
+    return entry.endsWith('.ts') ? [path] : []
+  })
+}
+
+/**
+ * The top-level argument count of every `buildRunnerRegistry(...)` CALL in a source file, bracket-matched
+ * so a nested call or object never ends the list early. Import and JSDoc mentions carry no `(` and are
+ * skipped by construction.
+ */
+function registryCallArities(source: string): number[] {
+  const arities: number[] = []
+  const needle = 'buildRunnerRegistry('
+  for (let at = source.indexOf(needle); at >= 0; at = source.indexOf(needle, at + 1)) {
+    let depth = 0
+    let args = 0
+    for (let i = at + needle.length - 1; i < source.length; i++) {
+      const char = source[i]
+      if (char === '(' || char === '[' || char === '{') depth++
+      else if (char === ')' || char === ']' || char === '}') {
+        depth--
+        if (depth === 0) {
+          // An empty list is zero args; otherwise the separators counted one fewer than the arguments.
+          arities.push(source.slice(at + needle.length, i).trim() === '' ? 0 : args + 1)
+          break
+        }
+      } else if (char === ',' && depth === 1) args++
+    }
+  }
+  return arities
+}
+
+describe('the daemon registry stays scoped to the cloud-dispatch CLIs', () => {
+  it('never passes a cliIds argument to buildRunnerRegistry', () => {
+    const offenders = tsFiles(RUNNER_SRC).flatMap((file) =>
+      registryCallArities(readFileSync(file, 'utf-8'))
+        .filter((arity) => arity > 3)
+        .map((arity) => `${file}: ${arity} args`)
+    )
+    expect(offenders).toEqual([])
+  })
+
+  it('still finds the real calls, so the check above cannot pass by matching nothing', () => {
+    const found = tsFiles(RUNNER_SRC).flatMap((file) =>
+      registryCallArities(readFileSync(file, 'utf-8'))
+    )
+    expect(found.length).toBeGreaterThan(0)
+    // The arity counter itself, proved on a call shaped like the widening this test exists to catch.
+    expect(registryCallArities('buildRunnerRegistry(dir, undefined, opts, DESKTOP_CLI_IDS)')).toEqual([4])
+    expect(registryCallArities('buildRunnerRegistry(dir, undefined, { contained: true })')).toEqual([3])
+    expect(registryCallArities('buildRunnerRegistry(dir)')).toEqual([1])
   })
 })

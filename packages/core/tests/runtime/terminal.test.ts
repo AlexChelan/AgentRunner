@@ -1,6 +1,15 @@
-import { existsSync, mkdirSync, mkdtempSync, realpathSync, symlinkSync } from "node:fs";
+import {
+	existsSync,
+	mkdirSync,
+	mkdtempSync,
+	readFileSync,
+	realpathSync,
+	symlinkSync,
+	writeFileSync
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { TERMINAL_CLI_IDS } from "../../src/terminal-args";
 import type { LocalMcpHandle, ToolSet } from "../../src/index";
 import type { RunPolicy } from "@agentrunner/protocol";
 import { beforeEach, describe, expect, it, vi } from "vitest";
@@ -313,6 +322,21 @@ describe("terminal session - composing", () => {
 		// not sent at all - the daemon tells the backend only what the backend actually reads.
 		expect(body.productId).toBeUndefined();
 		expect(spawn.calls).toHaveLength(1);
+	});
+
+	it("names the project on the spec body when the caller passed one, and omits it otherwise", async () => {
+		// The backend scopes the composed spec's integration tools by this field; a daemon that stops
+		// sending it regresses a project's terminal to org-only tools with the route still answering
+		// 200. Asserted from the client side because the field is optional on the wire.
+		const backend = fakeBackend();
+		await run({ http: backend.http, projectId: "proj-9" });
+		const spec = JSON.parse(backend.calls[1]?.body ?? "{}") as Record<string, unknown>;
+		expect(spec.projectId).toBe("proj-9");
+
+		const bare = fakeBackend();
+		await run({ http: bare.http });
+		const bareSpec = JSON.parse(bare.calls[1]?.body ?? "{}") as Record<string, unknown>;
+		expect("projectId" in bareSpec).toBe(false);
 	});
 
 	it("refuses a malformed spec (fail-closed parse) without spawning", async () => {
@@ -679,7 +703,7 @@ describe("terminal session - tool calls", () => {
 	): Promise<unknown> {
 		const tool = tools[name];
 		if (!tool?.execute) throw new Error(`tool ${name} is not executable`);
-		return tool.execute(args, { toolCallId: "local-mcp", messages: [] });
+		return tool.execute(args, { toolCallId: "local-mcp", messages: [], context: undefined });
 	}
 
 	it("proxies a served tool call to /tool-call with runId = sessionId and the wire token", async () => {
@@ -1156,7 +1180,40 @@ describe("terminal session - local (no backend at all)", () => {
 
 		const args = spawn.calls[0]?.args ?? [];
 		const prompt = claudeSystemPrompt(args) ?? "";
+		// The identity line leads unconditionally, then the buyer instructions follow.
+		expect(prompt).toContain("You are the AI assistant inside Acme");
 		expect(prompt).toContain("You are wired into Acme.");
+	});
+
+	it("grounds the session in the product's identity even when the config has NO instructions", async () => {
+		// The staged desktop config carries no `instructions` today, so without the unconditional
+		// identity line the CLI ran on an EMPTY prompt - it listed the work folder to guess what
+		// "my credits" meant, in an anonymous directory, for a product it could not name.
+		const bare = fakeSpawn();
+		const fixture = localDeps({
+			config: { productId: "acme", productName: "Acme" },
+			spawn: bare.spawn,
+			host: fakeHost().host,
+			serveTools: fakeServed().serveTools
+		});
+		await runLocalTerminalSession(fixture.deps);
+		const prompt = claudeSystemPrompt(bare.calls[0]?.args ?? []) ?? "";
+		expect(prompt).toContain("You are the AI assistant inside Acme");
+	});
+
+	it("appends the host's instructions suffix after the composed prompt, and nothing without one", async () => {
+		// The desktop passes the product-tools nudge here when it mounted the app's loopback MCP server on
+		// the session; the composed config cannot know about that mount, so the seam is the host's.
+		await run({ instructionsSuffix: "The mounted MCP tools ARE the app." });
+		const withSuffix = claudeSystemPrompt(spawn.calls[0]?.args ?? []) ?? "";
+		expect(withSuffix.endsWith("You are wired into Acme.\n\nThe mounted MCP tools ARE the app.")).toBe(
+			true
+		);
+
+		spawn = fakeSpawn();
+		await run();
+		const bare = claudeSystemPrompt(spawn.calls[0]?.args ?? []) ?? "";
+		expect(bare.endsWith("You are wired into Acme.")).toBe(true);
 	});
 
 	it("serves an EMPTY tool set: there are no app tools on this device, and no wire token to reach them", async () => {
@@ -1406,4 +1463,274 @@ describe("terminal session - local (no backend at all)", () => {
 		await run({ spawn: bare.spawn });
 		expect(bare.calls[0]?.args).not.toContain("--model");
 	});
+});
+
+/**
+ * THE MANUAL PER-CLI CHECK, AUTOMATED. The live defect this pins: "claude code and codex give me the
+ * balance correctly, grok doesn't, opencode same" - the MCP seam is asymmetric by CLI design (claude
+ * and codex take servers inline on argv; grok and opencode read them only from CONFIG, and their
+ * parsers reject or silently ignore an invented flag), so a session that wires the app's server onto
+ * argv alone leaves half the allowlist toolless while every argv-level suite stays green.
+ */
+describe("terminal session - the app MCP server reaches EVERY terminal CLI", () => {
+	/** The app-tools server a desktop session merges in (the main process's product-tools loopback). */
+	const APP_TOOLS_URL = "http://127.0.0.1:7777/app-tools-token/mcp";
+
+	let spawn: ReturnType<typeof fakeSpawn>;
+	let host: ReturnType<typeof fakeHost>;
+	let mcp: ReturnType<typeof fakeServed>;
+
+	beforeEach(() => {
+		spawn = fakeSpawn();
+		host = fakeHost();
+		mcp = fakeServed();
+		// A hermetic "real" grok home: auth seeding must never touch this machine's ~/.grok in a test.
+		vi.stubEnv("GROK_HOME", mkdtempSync(join(tmpdir(), "grok-real-home-")));
+	});
+
+	/** Runs a local session for `cli` with the app-tools server merged in, like the desktop composes it. */
+	async function runWithAppTools(cli: (typeof TERMINAL_CLI_IDS)[number]) {
+		const fixture = localDeps({
+			cli,
+			spawn: spawn.spawn,
+			host: host.host,
+			serveTools: mcp.serveTools,
+			localMcpServers: { "acme-app": { type: "http", url: APP_TOOLS_URL } }
+		});
+		await runLocalTerminalSession(fixture.deps);
+		return fixture;
+	}
+
+	/**
+	 * Every channel a CLI can read configuration from: its argv, its spawn environment, a config home
+	 * the environment points it at, and an instructions file the config names. A CLI reached through
+	 * NONE of them has no app tools (or no instructions), whatever the argv-level suites say.
+	 */
+	function allChannels(call: (typeof spawn.calls)[number]): string[] {
+		const surfaces = [call.args.join(" "), JSON.stringify(call.opts.env)];
+		const grokHome = call.opts.env.GROK_HOME;
+		if (grokHome !== undefined && existsSync(join(grokHome, "config.toml"))) {
+			surfaces.push(readFileSync(join(grokHome, "config.toml"), "utf8"));
+		}
+		const opencodeConfig = call.opts.env.OPENCODE_CONFIG_CONTENT;
+		if (opencodeConfig !== undefined) {
+			const parsed = JSON.parse(opencodeConfig) as { instructions?: string[] };
+			const path = parsed.instructions?.[0];
+			if (path !== undefined && existsSync(path)) surfaces.push(readFileSync(path, "utf8"));
+		}
+		return surfaces;
+	}
+
+	it.each([...TERMINAL_CLI_IDS])(
+		"wires the app MCP server into %s through SOME channel (argv, config home, or environment)",
+		async (cli) => {
+			await runWithAppTools(cli);
+			expect(allChannels(spawn.calls[0]!).some((s) => s.includes(APP_TOOLS_URL))).toBe(true);
+		}
+	);
+
+	it.each([...TERMINAL_CLI_IDS])(
+		"delivers the composed instructions - the product's identity first - into %s",
+		async (cli) => {
+			// The other half of "every CLI gets everything": a session whose tools arrive but whose
+			// instructions do not answers as a bare coding agent that cannot name the product it serves.
+			await runWithAppTools(cli);
+			const channels = allChannels(spawn.calls[0]!);
+			expect(channels.some((s) => s.includes("You are the AI assistant inside Acme"))).toBe(true);
+		}
+	);
+
+	it("grok: a seeded terminal home under the app root, servers in, discovery NOT closed", async () => {
+		const fixture = await runWithAppTools("grok");
+		const grokHome = spawn.calls[0]!.opts.env.GROK_HOME!;
+		expect(grokHome).toBe(join(fixture.appDataRoot, "grok-terminal-home"));
+		const config = readFileSync(join(grokHome, "config.toml"), "utf8");
+		expect(config).toContain("[mcp_servers.acme-app]");
+		expect(config).toContain(APP_TOOLS_URL);
+		// The session's own loopback rides beside it, under the same name the argv builders pin.
+		expect(config).toContain(`${brand().binary}-tools`);
+		// NO compat cells: this is the user's own interactive session, not a headless dispatch - their
+		// Claude/Cursor discovery must keep working exactly as in their own shell.
+		expect(config).not.toContain("[compat.");
+	});
+
+	it("opencode: OPENCODE_CONFIG_CONTENT carries the servers and NOTHING that would clamp the user", async () => {
+		await runWithAppTools("opencode");
+		const env = spawn.calls[0]!.opts.env;
+		const parsed = JSON.parse(env.OPENCODE_CONFIG_CONTENT!) as Record<string, unknown>;
+		expect(parsed.mcp).toMatchObject({
+			"acme-app": { type: "remote", url: APP_TOOLS_URL, enabled: true }
+		});
+		// The content merges LAST, on top of the user's own config - so it must carry ONLY the mcp
+		// table. A permission table here would clamp the user's interactive prompts; the share and
+		// autoupdate pins belong to headless runs; an XDG repoint would drop their whole global config.
+		expect(parsed.permission).toBeUndefined();
+		expect(parsed.share).toBeUndefined();
+		expect(parsed.autoupdate).toBeUndefined();
+		// UNCHANGED from the host, not absent: the session passes the user's own shell through by
+		// design, and CI machines legitimately export XDG_CONFIG_HOME (ubuntu runners set it) -
+		// what must never happen is the COMPOSITION repointing it (v3.3.0's runner publish failed
+		// on exactly this conflation).
+		expect(env.XDG_CONFIG_HOME).toBe(process.env.XDG_CONFIG_HOME);
+		expect(env.OPENCODE_DISABLE_CLAUDE_CODE).toBeUndefined();
+	});
+
+	it("opencode: the composed instructions ride a file the config names (its only channel)", async () => {
+		// opencode's TUI has no system-prompt flag and an interactive session has no prompt to prepend
+		// to, so without this file an opencode terminal knew neither the product it serves nor that the
+		// mounted tools ARE that product.
+		await runWithAppTools("opencode");
+		const parsed = JSON.parse(
+			spawn.calls[0]!.opts.env.OPENCODE_CONFIG_CONTENT!
+		) as { instructions?: string[] };
+		const path = parsed.instructions?.[0];
+		expect(path).toBeDefined();
+		const written = readFileSync(path!, "utf8");
+		expect(written).toContain("You are the AI assistant inside Acme");
+	});
+
+	it("claude and codex still carry the servers inline on argv, with no config-home overlay", async () => {
+		for (const cli of ["claude-code", "codex"] as const) {
+			const local = fakeSpawn();
+			const fixture = localDeps({
+				cli,
+				spawn: local.spawn,
+				host: fakeHost().host,
+				serveTools: fakeServed().serveTools,
+				localMcpServers: { "acme-app": { type: "http", url: APP_TOOLS_URL } }
+			});
+			await runLocalTerminalSession(fixture.deps);
+			const call = local.calls[0]!;
+			expect(call.args.join(" ")).toContain(APP_TOOLS_URL);
+			expect(call.opts.env.OPENCODE_CONFIG_CONTENT).toBeUndefined();
+			expect(call.opts.env.GROK_HOME).toBe(process.env.GROK_HOME);
+			expect(existsSync(join(fixture.appDataRoot, "grok-terminal-home"))).toBe(false);
+		}
+	});
+
+	/**
+	 * Runs a local session for `cli` after `plant` has staged the app-data root, so a case can compose a
+	 * seeding failure the way a disk composes one - an entry already sitting where the config directory
+	 * has to go. A regular file there is the deterministic member of that class (`EEXIST` on the `mkdir`,
+	 * for any user); an unwritable root and a full disk arrive at the same `catch`.
+	 */
+	async function runWithSeedFault(
+		cli: (typeof TERMINAL_CLI_IDS)[number],
+		plant: (appDataRoot: string) => void
+	): Promise<ReturnType<typeof localDeps>> {
+		const fixture = localDeps({
+			cli,
+			spawn: spawn.spawn,
+			host: host.host,
+			serveTools: mcp.serveTools,
+			localMcpServers: { "acme-app": { type: "http", url: APP_TOOLS_URL } }
+		});
+		plant(fixture.appDataRoot);
+		await runLocalTerminalSession(fixture.deps);
+		return fixture;
+	}
+
+	/** The diagnostic lines a degraded seed writes to the terminal, isolated from the rest of the output. */
+	function degradeLines(lines: string[]): string[] {
+		return lines.filter((line) => line.includes("Could not wire the app's MCP servers"));
+	}
+
+	it("grok: a config home that cannot be seeded degrades the session instead of half-wiring it", async () => {
+		// The config home is grok's ONLY server channel, so a failed seed is total capability loss: the
+		// session still opens, one line names what it lost, and GROK_HOME must stay the user's own rather
+		// than point at a home nothing wrote (a CLI told to read an empty home has no servers AND no auth).
+		const fixture = await runWithSeedFault("grok", (root) =>
+			writeFileSync(join(root, "grok-terminal-home"), "not a directory")
+		);
+
+		expect(spawn.calls).toHaveLength(1);
+		expect(host.exits).toEqual([]);
+		expect(degradeLines(fixture.lines)).toHaveLength(1);
+		expect(degradeLines(fixture.lines)[0]).toContain("into grok");
+		expect(spawn.calls[0]!.opts.env.GROK_HOME).toBe(process.env.GROK_HOME);
+		expect(allChannels(spawn.calls[0]!).some((s) => s.includes(APP_TOOLS_URL))).toBe(false);
+	});
+
+	it("opencode: an instructions write that fails degrades the session, config content and all", async () => {
+		// Same shape on the other config-carried CLI, and the failure is upstream of the config VALUE: the
+		// instructions file is written first, so a session that emitted OPENCODE_CONFIG_CONTENT here would
+		// be naming an instructions path that does not exist.
+		const fixture = await runWithSeedFault("opencode", (root) =>
+			writeFileSync(join(root, "opencode-terminal"), "not a directory")
+		);
+
+		expect(spawn.calls).toHaveLength(1);
+		expect(host.exits).toEqual([]);
+		expect(degradeLines(fixture.lines)).toHaveLength(1);
+		expect(degradeLines(fixture.lines)[0]).toContain("into opencode");
+		expect(spawn.calls[0]!.opts.env.OPENCODE_CONFIG_CONTENT).toBeUndefined();
+		expect(allChannels(spawn.calls[0]!).some((s) => s.includes(APP_TOOLS_URL))).toBe(false);
+	});
+
+	it("claude and codex are UNAFFECTED by the same fault (their servers ride argv)", async () => {
+		// The parity half of the degradation: the fault that silences grok and opencode must not cost the
+		// argv-carried CLIs anything, and must not write a line pretending it did.
+		for (const cli of ["claude-code", "codex"] as const) {
+			const local = fakeSpawn();
+			const fixture = localDeps({
+				cli,
+				spawn: local.spawn,
+				host: fakeHost().host,
+				serveTools: fakeServed().serveTools,
+				localMcpServers: { "acme-app": { type: "http", url: APP_TOOLS_URL } }
+			});
+			writeFileSync(join(fixture.appDataRoot, "grok-terminal-home"), "not a directory");
+			writeFileSync(join(fixture.appDataRoot, "opencode-terminal"), "not a directory");
+			await runLocalTerminalSession(fixture.deps);
+
+			expect(local.calls[0]!.args.join(" ")).toContain(APP_TOOLS_URL);
+			expect(degradeLines(fixture.lines)).toEqual([]);
+		}
+	});
+
+	/** The loopback url the fake listener serves the session's own tools on (every CLI must reach it). */
+	const LOOPBACK_URL = "http://127.0.0.1:5511/mcp-path-token/mcp";
+
+	/**
+	 * Every FILE a CLI's environment overlay tells it to read: the seeded config home's `config.toml` and
+	 * each instructions file the opencode config names. A path named but never written is a half-formed
+	 * config - the CLI starts, reads nothing, and has neither servers nor instructions.
+	 */
+	function namedPaths(call: (typeof spawn.calls)[number]): string[] {
+		const paths: string[] = [];
+		const grokHome = call.opts.env.GROK_HOME;
+		// Only a home this session SEEDED is ours to judge; the inherited one is the user's own.
+		if (grokHome !== undefined && grokHome !== process.env.GROK_HOME) {
+			paths.push(join(grokHome, "config.toml"));
+		}
+		const opencodeConfig = call.opts.env.OPENCODE_CONFIG_CONTENT;
+		if (opencodeConfig !== undefined) {
+			const parsed = JSON.parse(opencodeConfig) as { instructions?: string[] };
+			paths.push(...(parsed.instructions ?? []));
+		}
+		return paths;
+	}
+
+	it.each([...TERMINAL_CLI_IDS])(
+		"reaches %s with the session's OWN tools server even when the app merges no servers, through a config that names no missing file",
+		async (cli) => {
+			// The parity rule is about the CHANNEL, not about the desktop's extra server: a fifth id added
+			// to TERMINAL_CLI_IDS falls through `terminalCliEnv`'s grok/opencode cases to `{}`, and unless
+			// its argv builder carries servers it ships a terminal with no app tools while every suite here
+			// stays green. The dangling-path half is the other way a channel can exist and carry nothing.
+			const fixture = localDeps({
+				cli,
+				spawn: spawn.spawn,
+				host: host.host,
+				serveTools: mcp.serveTools
+			});
+			await runLocalTerminalSession(fixture.deps);
+
+			const channels = allChannels(spawn.calls[0]!);
+			expect(channels.some((s) => s.includes(LOOPBACK_URL))).toBe(true);
+			expect(channels.some((s) => s.includes(`${brand().binary}-tools`))).toBe(true);
+			expect(namedPaths(spawn.calls[0]!).filter((path) => !existsSync(path))).toEqual([]);
+			expect(degradeLines(fixture.lines)).toEqual([]);
+		}
+	);
 });

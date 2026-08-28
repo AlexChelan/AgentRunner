@@ -7,9 +7,10 @@ import type { RunStart } from "@agentrunner/protocol";
  * belongs to, stamped by the automation-dispatch path) and the OPTIONAL freeform `origin` tag
  * (stamped only by a product-code dispatch). A run carrying neither is a chat turn.
  *
- * HONEST LIMIT, AND IT IS THE WHOLE STORY NOW: a backend that omits `origin` on a product dispatch is
- * wire-indistinguishable from chat, so the daemon-side `dispatch` deny only refuses a backend that
- * VOLUNTARILY stamped the tag. There is no backend-side per-device dispatch grant behind it - pairing
+ * HONEST LIMIT: a backend that STRIPS `origin` from a product dispatch is wire-indistinguishable from
+ * chat, so the daemon-side `dispatch` deny only refuses a backend that stamps the tag. This backend's
+ * dispatch seam now defaults it, so the FORGETTING case is closed and only a deliberate lie remains.
+ * There is no backend-side per-device dispatch grant behind it - pairing
  * is the authorization on that end, so this deny (plus unpairing) is the only refusal lever a device
  * owner has left. A trusted wire-level surface field is future post-freeze work. The `automation` deny
  * has no such hole: `scheduleId` is stamped by the automation-dispatch path itself.
@@ -39,8 +40,10 @@ export const DEFAULT_ORIGIN_POLICY: OriginPolicy = { denyAutomation: false, deny
 
 /**
  * Derives a dispatched run's kind from the frozen wire fields, never from a trusted surface field (none
- * exists) and never by matching the freeform `origin` string against "automation"/"dispatch" (those
- * values never appear there). `scheduleId` present -> `automation`; else `origin` present -> `dispatch`;
+ * exists) and never by MATCHING the freeform `origin` string against "automation"/"dispatch" - PRESENCE
+ * is the whole signal, which is why the literal value `"dispatch"` now appearing there (the backend's
+ * dispatch seam defaults it, so a product run is tagged whether or not buyer code remembered to) changes
+ * nothing here. `scheduleId` present -> `automation`; else `origin` present -> `dispatch`;
  * else -> `chat`. `scheduleId` wins over a co-present `origin` because an automation dispatch IS an
  * automation regardless of any attribution tag riding along.
  *

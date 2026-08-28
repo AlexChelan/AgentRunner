@@ -40,6 +40,9 @@ const CAPABILITIES: AdapterCapabilities = {
 	// The Agent SDK's `query` takes a streamed user message with base64 image content blocks, so a chat
 	// turn can carry attached photos to Claude Code natively.
 	images: true,
+	// The same streamed user message takes base64 `document` content blocks, which is Anthropic's own
+	// PDF channel - so a PDF reaches the model as a document rather than as a path it has to go open.
+	documents: true,
 	// The floor for a machine whose CLI has not answered yet: the SDK's own `EffortLevel` union.
 	// `canDisable` is TRUE because `thinking: { type: 'disabled' }` genuinely turns extended thinking
 	// off - unlike Codex, "off" here is not a lie. Per-model discovery narrows this to the subset a
@@ -130,6 +133,7 @@ export function createClaudeCodeAdapter(deps: ClaudeAdapterDeps): RuntimeToolAda
 						mcpServers: req.mcpServers,
 						// Attached photos ride the turn as native image content blocks; absent on a text-only turn.
 						...(req.images && req.images.length > 0 ? { images: req.images } : {}),
+						...(req.documents && req.documents.length > 0 ? { documents: req.documents } : {}),
 						// Paths the run may NOT read (the daemon's own `secrets/`), plus the network posture the
 						// resulting OS sandbox has to reopen for a network-on run. Claude has no cwd confinement
 						// on reads, so without this an unattended run reads any absolute path.

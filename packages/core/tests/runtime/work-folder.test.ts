@@ -19,6 +19,19 @@ function root(): string {
 	return realpathSync(mkdtempSync(join(tmpdir(), "runner-work-")));
 }
 
+/** Whether this platform has the POSIX ownership and mode bits the share cases assert on. */
+const posix = process.platform !== "win32";
+
+/**
+ * Registers a case only on a platform with POSIX ownership and mode bits.
+ *
+ * @param name - The case title.
+ * @param body - The case body.
+ */
+function itPosix(name: string, body: () => Promise<void> | void): void {
+	if (posix) it(name, body);
+}
+
 describe("resolveWorkFolder (confined)", () => {
 	it("creates work/<workKey>/<productId>/ under the app-data root", () => {
 		const appDataRoot = root();
@@ -114,7 +127,7 @@ describe("resolveWorkFolder (container agent share)", () => {
 		expect((leaf?.[1] ?? 0) & 0o1000).toBe(0);
 	});
 
-	it.skipIf(process.platform === "win32")(
+	itPosix(
 		"lets the daemon still create a SIBLING product folder after the share",
 		() => {
 			// The REAL share (no seam), so this exercises the no-follow open + fchown/fchmod. A hand-over
@@ -132,7 +145,7 @@ describe("resolveWorkFolder (container agent share)", () => {
 		}
 	);
 
-	it.skipIf(process.platform === "win32")(
+	itPosix(
 		"negative: a symlink planted where the product folder was never reaches its target",
 		() => {
 			// The C1 vector end to end: the run's own folder is replaced by a link to the secrets dir, and
@@ -155,7 +168,7 @@ describe("resolveWorkFolder (container agent share)", () => {
 		}
 	);
 
-	it.skipIf(process.platform === "win32")(
+	itPosix(
 		"negative: a symlink pre-planted as a FUTURE run's cwd is replaced, never returned",
 		() => {
 			// Sticky stops the agent UNLINKING an existing product folder; it does not stop it CREATING an
@@ -179,7 +192,7 @@ describe("resolveWorkFolder (container agent share)", () => {
 		}
 	);
 
-	it.skipIf(process.platform === "win32")("refuses a leaf that is a plain FILE", () => {
+	itPosix("refuses a leaf that is a plain FILE", () => {
 		const appDataRoot = root();
 		mkdirSync(join(appDataRoot, "work", "be1"), { recursive: true });
 		writeFileSync(join(appDataRoot, "work", "be1", "p1"), "not a directory");

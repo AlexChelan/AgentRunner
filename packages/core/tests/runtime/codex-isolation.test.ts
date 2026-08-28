@@ -19,6 +19,29 @@ import {
 } from "../../src/runtime/codex-isolation";
 import { codexHomeDir } from "../../src/runtime/paths";
 
+/** Whether this platform has the POSIX ownership and mode bits the isolation cases assert on. */
+const posix = process.platform !== "win32";
+
+/**
+ * Registers a case only on a platform with POSIX ownership and mode bits.
+ *
+ * @param name - The case title.
+ * @param body - The case body.
+ */
+function itPosix(name: string, body: () => Promise<void> | void): void {
+	if (posix) it(name, body);
+}
+
+/**
+ * Registers a suite only on a platform with POSIX ownership and mode bits.
+ *
+ * @param name - The suite title.
+ * @param body - The suite body.
+ */
+function describePosix(name: string, body: () => void): void {
+	if (posix) describe(name, body);
+}
+
 /**
  * Drives {@link ensureIsolatedCodexHome} with `CODEX_HOME` pointed at a throwaway "real" home, so the
  * seeding is exercised without touching the developer's actual `~/.codex`.
@@ -111,7 +134,7 @@ describe("ensureIsolatedCodexHome", () => {
 			expect(shares).toEqual([[home, SELF_UID, 1000, 0o770]]);
 		});
 
-		it.skipIf(process.platform === "win32")(
+		itPosix(
 			"leaves the seeded home writable by the daemon that must re-seed it",
 			() => {
 				// The REAL share (no seam), so the no-follow open + fchown/fchmod actually run. The very
@@ -124,7 +147,7 @@ describe("ensureIsolatedCodexHome", () => {
 			}
 		);
 
-		it.skipIf(process.platform === "win32")(
+		itPosix(
 			"keeps config.toml readable by the agent that has to load it",
 			() => {
 				// An unreadable config.toml is a Codex run that loads no isolation at all, which is the
@@ -153,7 +176,7 @@ describe("ensureIsolatedCodexHome", () => {
 			expect(shares).not.toContain(join(home, "auth.json"));
 		});
 
-		it.skipIf(process.platform === "win32")(
+		itPosix(
 			"seeds auth.json as a group-readable COPY so the agent-uid run child can read it",
 			() => {
 				// The credential chain on a contained host: the login child is the DAEMON, so the real
@@ -171,7 +194,7 @@ describe("ensureIsolatedCodexHome", () => {
 			}
 		);
 
-		it.skipIf(process.platform === "win32")(
+		itPosix(
 			"re-copies auth.json every call, replacing a file the run renamed over it",
 			() => {
 				// Codex refreshes its token by renaming a temp file over auth.json inside the home it owns.
@@ -188,7 +211,7 @@ describe("ensureIsolatedCodexHome", () => {
 			}
 		);
 
-		it.skipIf(process.platform === "win32")(
+		itPosix(
 			"replaces an auth.json SYMLINK left by a non-contained run, never writing through it",
 			() => {
 				// The C2 shape aimed at the credential: a run points auth.json at the master key and lets the
@@ -264,7 +287,7 @@ describe("ensureIsolatedCodexHome", () => {
 			expect(config).toContain("Isolated Codex home");
 		});
 
-		it.skipIf(process.platform === "win32")(
+		itPosix(
 			"never writes THROUGH a config.toml symlink when re-seeding either",
 			() => {
 				const secretFile = join(root, "master.key");
@@ -281,7 +304,7 @@ describe("ensureIsolatedCodexHome", () => {
 		);
 	});
 
-	describe.skipIf(process.platform === "win32")(
+	describePosix(
 		"negative: hostile entries in the shared home",
 		() => {
 			it("never writes THROUGH a config.toml symlink - it replaces the link", () => {

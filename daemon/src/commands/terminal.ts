@@ -1,6 +1,8 @@
 import { hostname } from 'node:os'
 import { isTerminalCliId, TERMINAL_CLI_IDS  } from '@agentrunner/core'
 import type {TerminalCliId} from '@agentrunner/core';
+import { isConnectableToolId } from '@agentrunner/protocol'
+import type { ConnectableToolId } from '@agentrunner/protocol'
 import { BRAND } from '../brand'
 import { isContained } from '../container'
 import { loadLocalAppConfig  } from '@agentrunner/core/runtime/local/app-config'
@@ -8,6 +10,7 @@ import type {LocalAppConfig} from '@agentrunner/core/runtime/local/app-config';
 import { scopeBackendUrl } from '@agentrunner/core/runtime/account-scope'
 import { dispatchableConnections, hostDispatchProfile } from '@agentrunner/core/runtime/dispatchable-clis'
 import { LOCAL_SCOPE, scopeFlag } from '@agentrunner/core/runtime/local/scope'
+import { isValidProjectId } from '@agentrunner/core/runtime/local/workspace-scope'
 import { collectMcpEnv } from '@agentrunner/core/runtime/mcp-secrets'
 import { readBearer } from '@agentrunner/core/runtime/pair'
 import type { StateStore } from '@agentrunner/core/runtime/storage/state-store'
@@ -25,8 +28,32 @@ import { flagValue, openAuditLog, openStores, positionalArg, resolveCommandScope
  */
 const DEFAULT_PRODUCT_ID = 'runner'
 
+/** A CLI the DAEMON's terminal may drive: terminal-capable AND connectable by this process. */
+type DaemonTerminalCliId = TerminalCliId & ConnectableToolId
+
 /**
- * Resolves which CLI the session drives: an explicit `--cli` (validated against the terminal-capable
+ * The CLIs the daemon's terminal offers, as the INTERSECTION of the terminal-capable set with the ids
+ * the daemon can actually connect and dispatch. `grok` and `opencode` are terminal-capable but
+ * desktop-only, so a daemon that named them would advertise sessions it can never open and print a
+ * `connect` line it would then refuse. Derived rather than hand-written, so widening either list moves
+ * this one in lockstep.
+ */
+const DAEMON_TERMINAL_CLI_IDS: readonly DaemonTerminalCliId[] = TERMINAL_CLI_IDS.filter(isConnectableToolId)
+
+/**
+ * True when `value` is a CLI the daemon's terminal may drive (see {@link DAEMON_TERMINAL_CLI_IDS}).
+ * Composes both guards rather than re-listing the ids, so a desktop-only terminal CLI can never leak
+ * into the daemon's allowlist.
+ *
+ * @param value - The candidate tool id.
+ * @returns Whether the daemon may open a terminal session on it.
+ */
+function isDaemonTerminalCliId(value: string): value is DaemonTerminalCliId {
+  return isTerminalCliId(value) && isConnectableToolId(value)
+}
+
+/**
+ * Resolves which CLI the session drives: an explicit `--cli` (validated against the daemon's terminal
  * allowlist AND the scope's connected CLIs), or - when the flag is absent - the sole connected one.
  * Anything ambiguous or unconnected exits with the command that fixes it, rather than guessing. A CLI is
  * connected PER SCOPE, so the local session sees exactly what `connect --local` recorded, and every
@@ -42,12 +69,12 @@ function resolveTerminalCli(argv: string[], state: StateStore, scope: string): T
   const connected = state
     .listConnections(scope)
     .map((conn) => conn.toolId)
-    .filter(isTerminalCliId)
+    .filter(isDaemonTerminalCliId)
   const requested = flagValue(argv, '--cli')
 
   if (requested !== undefined) {
-    if (!isTerminalCliId(requested)) {
-      ui.p.cancel(`--cli must be one of ${TERMINAL_CLI_IDS.join(', ')}.`)
+    if (!isDaemonTerminalCliId(requested)) {
+      ui.p.cancel(`--cli must be one of ${DAEMON_TERMINAL_CLI_IDS.join(', ')}.`)
       process.exit(1)
       return undefined
     }
@@ -62,7 +89,7 @@ function resolveTerminalCli(argv: string[], state: StateStore, scope: string): T
   if (only === undefined) {
     // One copy-pasteable command per CLI: connect takes exactly one positional id, so a single
     // quoted command listing every id would fail verbatim.
-    const commands = TERMINAL_CLI_IDS.map((id) => `'${BRAND.binary} connect ${flag} ${id}'`).join(' or ')
+    const commands = DAEMON_TERMINAL_CLI_IDS.map((id) => `'${BRAND.binary} connect ${flag} ${id}'`).join(' or ')
     ui.p.cancel(`No terminal-capable CLI connected. Run ${commands} first.`)
     process.exit(1)
     return undefined
@@ -136,7 +163,8 @@ async function cmdLocalTerminal(argv: string[], stores: ReturnType<typeof openSt
 
 /**
  * Runs `terminal [<productId>] [--url <backend>] [--user <id>] [--cli claude-code|codex] [--model <id>]
- * [--cwd <path>]`, or - with `--local` - the on-device session ({@link cmdLocalTerminal}).
+ * [--cwd <path>] [--project <id>]`, or - with `--local` - the on-device session
+ * ({@link cmdLocalTerminal}).
  *
  * The PAIRED form opens the user's own coding CLI as an interactive session wired to their product: the
  * product's tools on the CLI's MCP surface, the user's OWN local MCP servers (`mcp add`) beside them, the
@@ -145,7 +173,9 @@ async function cmdLocalTerminal(argv: string[], stores: ReturnType<typeof openSt
  * product); `--url` picks the backend when several are paired and `--user` picks the account when one
  * backend carries two SaaS logins; `--cli` picks the CLI when several are
  * connected; `--model` pins the model; `--cwd` runs the session in any folder the user names - the
- * typing is the consent, and no backend can contribute a path (see `runTerminalSession`).
+ * typing is the consent, and no backend can contribute a path (see `runTerminalSession`);
+ * `--project` names the workspace whose shared integrations the composed session's tools include
+ * (the backend authorizes membership itself, so a wrong id costs tools, never leaks them).
  *
  * Whether the CLI keeps its own approval prompts is the SCOPE's setting, read fresh here so an
  * `approvals set` between sessions applies with no restart. A paired scope keeps them unless the user
@@ -178,6 +208,12 @@ export async function cmdTerminal(argv: string[]): Promise<void> {
   const machineName = hostname().trim().slice(0, 253)
   const modelId = flagValue(argv, '--model')
   const requestedCwd = flagValue(argv, '--cwd')
+  const projectId = flagValue(argv, '--project')
+  if (projectId !== undefined && !isValidProjectId(projectId)) {
+    ui.p.cancel(`terminal --project must be a valid project id: ${projectId}`)
+    process.exit(1)
+    return
+  }
   // The user's OWN local MCP servers for this backend, read fresh from the store: an `mcp add` between
   // sessions is picked up with no restart. This map is write-only-by-the-local-user, which is what makes
   // an MCP server on the CLI's surface something the user typed, never something a backend sent. Its
@@ -199,6 +235,7 @@ export async function cmdTerminal(argv: string[]): Promise<void> {
     mcpEnv: collectMcpEnv(secrets, scope, localMcpServers),
     write: ui.line,
     ...(requestedCwd ? { requestedCwd } : {}),
+    ...(projectId ? { projectId } : {}),
     // This POSTs `/connect`, which UPSERTS the durable device record - so an unfiltered snapshot here
     // would re-advertise a CLI the daemon withholds and reopen an offer every dispatched run refuses.
     // Same profile as the daemon's own reporting path, so one session can never contradict the other.

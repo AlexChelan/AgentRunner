@@ -1,0 +1,8 @@
+{
+	"id": "claude-sonnet-4-6",
+	"name": "Claude Sonnet 4.6",
+	"recommended": true,
+	"effortLevels": ["low", "medium", "high"],
+	"defaultEffort": "medium",
+	"contextWindow": 200000
+}

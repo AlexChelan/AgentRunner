@@ -75,6 +75,81 @@ export function codexHomeDir(root: string): string {
 }
 
 /**
+ * The runner-managed Grok STATE tree (`<root>/grok-home`) that headless chat/automation runs share:
+ * grok's session store, its bundled scaffold, its caches - everything a run must keep across turns.
+ * It is NOT itself a `GROK_HOME` any run is pointed at; each run gets its own home under
+ * {@link grokRunHomesDir}, because grok's headless `-p` has NO inline MCP flag and a single shared
+ * `config.toml` is therefore a value two concurrent runs would fight over. The interactive terminal
+ * uses neither (it keeps the user's own `~/.grok`).
+ *
+ * DENY-ROOT: this whole tree is what a NON-grok run is denied any read of, and the per-run homes -
+ * whose `auth.json` is a symlink to the user's real login, or a COPY on a contained host - are nested
+ * inside it precisely so one deny entry covers every one of them.
+ *
+ * Repointing `GROK_HOME` is NOT by itself a boundary: grok also discovers the user's Claude/Cursor
+ * config and their Claude PLUGINS out of `$HOME`. The seeded config closes the first group and cannot
+ * close the second - see `ensureIsolatedGrokHome` for exactly what is and is not covered.
+ *
+ * @param root - The app-data root from {@link appDataDir}.
+ * @returns The absolute shared Grok state directory.
+ */
+export function grokHomeDir(root: string): string {
+	return join(root, "grok-home");
+}
+
+/**
+ * The parent of the PER-RUN isolated Grok homes (`<root>/grok-home/runs`). One child per run id, each
+ * a real `config.toml` plus symlinks into the shared state tree - see `ensureIsolatedGrokHome`.
+ *
+ * Nested under {@link grokHomeDir} deliberately: every existing credential deny entry names that tree,
+ * so a per-run home cannot be born outside the boundary that already protects the grok login.
+ *
+ * @param root - The app-data root from {@link appDataDir}.
+ * @returns The absolute per-run Grok home parent.
+ */
+export function grokRunHomesDir(root: string): string {
+	return join(grokHomeDir(root), "runs");
+}
+
+/**
+ * The `GROK_HOME` (`<root>/grok-terminal-home`) an INTERACTIVE terminal session points Grok at. It
+ * exists because Grok's TUI has no inline MCP flag either: a config home is the only seam through
+ * which the app's tools can reach the session. It is deliberately NOT the headless isolated home -
+ * that one closes Grok's foreign-harness discovery and strips the user's world down to the run's
+ * servers, which is right for an unattended dispatch and wrong for a human driving their own CLI.
+ * This home carries the session's servers and the user's own login, and closes nothing - see
+ * `ensureGrokTerminalHome`.
+ *
+ * @param root - The app-data root from {@link appDataDir}.
+ * @returns The absolute terminal Grok home directory.
+ */
+export function grokTerminalHomeDir(root: string): string {
+	return join(root, "grok-terminal-home");
+}
+
+/**
+ * The isolated `XDG_CONFIG_HOME` (`<root>/opencode-config`) a headless chat/automation run points
+ * opencode at, so it loads a GLOBAL config the runner wrote instead of the user's
+ * `~/.config/opencode` (their personal `mcp` servers, model default, instructions and global
+ * plugins). opencode resolves its config directory as `$XDG_CONFIG_HOME/opencode`, so the seeded
+ * file lands one level down - see `ensureIsolatedOpencodeConfigHome`.
+ *
+ * Only the CONFIG base is repointed. The data/state/cache bases stay the user's own, which is what
+ * keeps `auth.json` (the provider logins) and the session store working with NO credential copied
+ * anywhere - a strictly smaller footprint than the Codex/Grok isolated homes need.
+ *
+ * Repointing this env var is not by itself the whole boundary: opencode also loads external
+ * plugins, the user's `~/.claude` + `~/.agents` skills, and the WORKSPACE's own `opencode.json`.
+ * See `ensureIsolatedOpencodeConfigHome` for exactly what each lever covers and what is left.
+ *
+ * @param root - The app-data root from {@link appDataDir}.
+ * @returns The absolute isolated opencode config base directory.
+ */
+export function opencodeConfigHomeDir(root: string): string {
+	return join(root, "opencode-config");
+}
+
+/**
  * The work root that holds every per-product confined folder (`work/<productId>/`).
  *
  * @param root - The app-data root from {@link appDataDir}.

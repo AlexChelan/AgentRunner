@@ -1,10 +1,14 @@
 import { spawn as nodeSpawn } from "node:child_process";
 import { createHash } from "node:crypto";
+import { mkdirSync } from "node:fs";
+import { join } from "node:path";
 import {
 	claudeTerminalArgs,
 	CLI_INSTALL_SPECS,
 	codexTerminalArgs,
+	grokTerminalArgs,
 	managedCliBinDirs,
+	opencodeTerminalArgs,
 	resolveToolBinary,
 	serveToolsOverHttp,
 	TERMINAL_TOOL_NAME_PATTERN
@@ -33,10 +37,13 @@ import { brand } from "./brand";
 import { resolveExistingFolder } from "./folder-grants";
 import { terminalSessionPolicy } from "./policies";
 import type { TerminalApproval } from "./policies";
+import { ensureGrokTerminalHome } from "./grok-isolation";
 import type { LocalAppConfig } from "./local/app-config";
 import { LOCAL_SCOPE, scopeFlag } from "./local/scope";
 import { composeLocalSystemPrompt } from "./local/system-prompt";
 import { messageOf } from "./error-message";
+import { writeNoFollow } from "./no-follow-write";
+import { opencodeTerminalConfigJson } from "./opencode-isolation";
 import { managedCliDir } from "./paths";
 import { manifestToToolSet } from "./tool-proxy";
 import { resolveWorkFolder } from "./work-folder";
@@ -223,6 +230,13 @@ export interface TerminalSessionDeps {
 	/** A pinned model id, or `undefined` to let the CLI pick its own default. */
 	modelId?: string;
 	/**
+	 * The project the session runs under, or `undefined` for none. The backend scopes the composed
+	 * spec's integration tools by it - without it a connection shared into the project contributes
+	 * tools to that project's chat turns but silently none to this session. The backend still
+	 * authorizes membership itself; this only names the workspace.
+	 */
+	projectId?: string;
+	/**
 	 * The CLIs this runner has connected, reported at connect (presence parity with the daemon).
 	 *
 	 * This rides a `/connect`, which UPSERTS the durable device record, so it must already have been
@@ -391,6 +405,7 @@ export async function runTerminalSession(deps: TerminalSessionDeps): Promise<voi
 					deviceId: deps.deviceId,
 					connectionId: deps.cli,
 					...(deps.modelId ? { modelId: deps.modelId } : {}),
+					...(deps.projectId ? { projectId: deps.projectId } : {}),
 					...(sessionId ? { sessionId } : {})
 				})
 			});
@@ -450,6 +465,7 @@ export async function runTerminalSession(deps: TerminalSessionDeps): Promise<voi
 	);
 
 	await serveRecordAndSupervise({
+		appDataRoot: deps.appDataRoot,
 		audit: deps.audit,
 		scopeKey: deps.backendUrl,
 		sessionId: spec.sessionId,
@@ -682,6 +698,12 @@ interface SuperviseInput {
 	cwd: string;
 	/** The environment values the user's local stdio MCP servers were added with. */
 	mcpEnv: Record<string, string>;
+	/**
+	 * The per-CLI environment that carries the MCP seam for a CLI whose servers live in CONFIG rather
+	 * than argv (`GROK_HOME` for grok, `OPENCODE_CONFIG_CONTENT` for opencode - see
+	 * {@link terminalCliEnv}); empty for the argv-carried CLIs.
+	 */
+	cliEnv: Record<string, string>;
 	/** The loopback MCP listener the CLI talks to, torn down with the session. */
 	served: LocalMcpHandle;
 	/** The process the signal + exit handlers are installed on. */
@@ -726,7 +748,7 @@ function superviseCli(input: SuperviseInput): void {
 	const child = input.spawn(input.binary, input.args, {
 		cwd: input.cwd,
 		stdio: "inherit",
-		env: { ...process.env, ...input.mcpEnv }
+		env: { ...process.env, ...input.cliEnv, ...input.mcpEnv }
 	});
 	input.onSpawned();
 
@@ -781,8 +803,59 @@ function superviseCli(input: SuperviseInput): void {
 	child.on("exit", (code: number | null) => finish(code ?? 0));
 }
 
+/**
+ * Composes the per-CLI ENVIRONMENT half of the terminal MCP seam. The seam is asymmetric by CLI
+ * design, not by ours (see the `terminal-args.ts` header): `claude` and `codex` take the session's
+ * MCP servers INLINE on argv, while `grok` and `opencode` take them only from CONFIG - grok rejects
+ * an unknown flag and opencode silently ignores one. So those two get their servers composed here:
+ * grok through a seeded terminal `GROK_HOME` (the only seam its TUI reads servers from), opencode
+ * through `OPENCODE_CONFIG_CONTENT` (the last config merge layer, ON TOP of the user's own config).
+ * Without this, a grok or opencode terminal session launches with no app tools at all while claude
+ * and codex have them - the exact per-CLI capability gap a session must not have.
+ *
+ * BEST-EFFORT: a seeding failure (an unwritable app-data root) degrades the session to the CLI's own
+ * configuration rather than refusing it - the CLI still opens, the line names what was lost, and the
+ * argv-carried CLIs are never affected (they return the empty overlay without touching the disk).
+ *
+ * @param cli - The CLI the session drives.
+ * @param appDataRoot - The app-data root the grok terminal home seeds under.
+ * @param servers - The session's full MCP server set, the app's loopback included.
+ * @param instructions - The session's composed instructions (opencode's file-carried channel).
+ * @param write - Sink for the degrade line.
+ * @returns The environment overlay for the spawn.
+ */
+function terminalCliEnv(
+	cli: TerminalCliId,
+	appDataRoot: string,
+	servers: Record<string, McpServerSpec>,
+	instructions: string,
+	write: (line: string) => void
+): Record<string, string> {
+	try {
+		if (cli === "grok") return { GROK_HOME: ensureGrokTerminalHome(appDataRoot, servers) };
+		if (cli === "opencode") {
+			// Instructions ride a FILE named by the config, because opencode's TUI has no system-prompt
+			// flag and an interactive session has no prompt to prepend to - this file is the session's
+			// only instructions channel. Rewritten per spawn, like every other seeded config.
+			let instructionsPath: string | undefined;
+			if (instructions.length > 0) {
+				const dir = join(appDataRoot, "opencode-terminal");
+				mkdirSync(dir, { recursive: true });
+				instructionsPath = join(dir, "instructions.md");
+				writeNoFollow(instructionsPath, `${instructions}\n`, 0o644);
+			}
+			return { OPENCODE_CONFIG_CONTENT: opencodeTerminalConfigJson(servers, instructionsPath) };
+		}
+	} catch (err) {
+		write(`Could not wire the app's MCP servers into ${cli}: ${messageOf(err)}\n`);
+	}
+	return {};
+}
+
 /** The fully-grounded, mode-resolved session facts {@link serveRecordAndSupervise} launches from. */
 interface TerminalLaunchPlan {
+	/** The app-data root (where a config-carried CLI's terminal home seeds). */
+	appDataRoot: string;
 	/** The local audit log. The session is recorded FAIL-CLOSED before the CLI is spawned. */
 	audit: AuditLog;
 	/** The scope stamped as the audit entry's `backendUrl` (a backend URL when paired, `local` on-device). */
@@ -911,6 +984,20 @@ async function serveRecordAndSupervise(plan: TerminalLaunchPlan): Promise<void> 
 		...(plan.modelId ? { modelId: plan.modelId } : {})
 	});
 
+	// The CONFIG-carried half of the MCP seam: the same server set the argv builders would emit - the
+	// session's servers plus the app's own loopback, under the same name the builders pin - composed
+	// into the environment for the CLIs whose config is the only seam they read servers from.
+	const cliEnv = terminalCliEnv(
+		plan.cli,
+		plan.appDataRoot,
+		{
+			...plan.mcpServers,
+			[`${brand().binary}-tools`]: { type: "http", url: mcpUrl }
+		},
+		plan.instructions,
+		write
+	);
+
 	superviseCli({
 		spawn: plan.spawn,
 		binary: plan.binary,
@@ -918,6 +1005,7 @@ async function serveRecordAndSupervise(plan: TerminalLaunchPlan): Promise<void> 
 		args,
 		cwd: plan.cwd,
 		mcpEnv: plan.mcpEnv,
+		cliEnv,
 		served,
 		host,
 		write,
@@ -948,6 +1036,13 @@ export interface LocalTerminalSessionDeps {
 	requestedCwd?: string;
 	/** A pinned model id, or `undefined` to let the CLI pick its own default. */
 	modelId?: string;
+	/**
+	 * Appended after the composed system prompt (blank-line separated), when the HOST wired something the
+	 * composed config cannot know about - the desktop passes the product-tools nudge here when it mounted
+	 * the app's loopback MCP server on this session, so the CLI is told those tools ARE the app. Absent
+	 * keeps the instructions byte-identical to the composed prompt.
+	 */
+	instructionsSuffix?: string;
 	/**
 	 * The work-tree segment this session's confined folder sits under (`work/<workKey>/<productId>`), from
 	 * `workspaceWorkKey`. Absent means {@link LOCAL_SCOPE} - the machine-global folder, byte-identical to the
@@ -1112,12 +1207,15 @@ export async function runLocalTerminalSession(deps: LocalTerminalSessionDeps): P
 	const { binary, binaryName, cwd } = ground;
 
 	// Composed HERE, from the file the app staged - there is no backend to ask, and nothing to wait for.
-	const instructions = composeLocalSystemPrompt(deps.config) ?? "";
+	const instructions = [composeLocalSystemPrompt(deps.config), deps.instructionsSuffix]
+		.filter((part): part is string => part !== undefined && part.length > 0)
+		.join("\n\n");
 	// The daemon mints the session's own id: the backend that would have minted one does not exist.
 	const sessionId = crypto.randomUUID();
 	const localMcpServers = deps.localMcpServers ?? {};
 
 	await serveRecordAndSupervise({
+		appDataRoot: deps.appDataRoot,
 		audit: deps.audit,
 		scopeKey: LOCAL_SCOPE,
 		sessionId,
@@ -1161,7 +1259,9 @@ const TERMINAL_ARGS_BUILDERS: Record<
 	(input: TerminalArgsInput, cwd: string) => string[]
 > = {
 	"claude-code": (input) => claudeTerminalArgs(input),
-	codex: (input, cwd) => codexTerminalArgs(input, cwd)
+	codex: (input, cwd) => codexTerminalArgs(input, cwd),
+	grok: (input, cwd) => grokTerminalArgs(input, cwd),
+	opencode: (input, cwd) => opencodeTerminalArgs(input, cwd)
 };
 
 /**

@@ -2,6 +2,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { isAbsolute, join } from "node:path";
 import { realpathDeepest } from "../../path-containment";
+import { realCodexHome, realGrokHome, realOpencodeDataHome } from "../cli-homes";
 import { writeJsonFileAtomic } from "./atomic-file";
 import type { ConnectedFolderDenyDeps } from "./connected-folder-deny";
 import { isRecord } from "./is-record";
@@ -200,9 +201,9 @@ export interface ConnectedFolderDenyDepsOpts {
  * Resolves the deny predicate's roots for the DAEMON, ONCE, from the daemon's OWN environment.
  *
  * This is the authority's seam. The predicate takes every root injected because its four call sites can
- * compute different ones: `%APPDATA%`/`%LOCALAPPDATA%` and `$CODEX_HOME` are env-relative, so a roaming or
- * redirected Windows profile puts them off `home` entirely, and the Electron MAIN process may hold a
- * different environment than the runtime fork it started. Main's refusal is fast feedback; THIS resolution
+ * compute different ones: `%APPDATA%`/`%LOCALAPPDATA%`, `$CODEX_HOME`, `$GROK_HOME` and `$XDG_DATA_HOME`
+ * are env-relative, so a roaming or redirected Windows profile puts them off `home` entirely, and the
+ * Electron MAIN process may hold a different environment than the runtime fork it started. Main's refusal is fast feedback; THIS resolution
  * is what the `PUT /v1/connected-folders` authority judges with, and a main/daemon disagreement fails at
  * that PUT by design.
  *
@@ -228,7 +229,9 @@ export function resolveConnectedFolderDenyDeps(
 	return {
 		appDataRoot,
 		home,
-		codexHome: env.CODEX_HOME ?? join(home, ".codex"),
+		codexHome: realCodexHome(home, env),
+		grokHome: realGrokHome(home, env),
+		opencodeDataHome: realOpencodeDataHome(home, env),
 		appData: env.APPDATA ?? join(home, "AppData", "Roaming"),
 		localAppData: env.LOCALAPPDATA ?? join(home, "AppData", "Local")
 	};

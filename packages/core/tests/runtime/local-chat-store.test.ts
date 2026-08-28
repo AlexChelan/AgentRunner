@@ -195,6 +195,33 @@ describe("createLocalChatStore", () => {
 		expect(stored?.updatedAt).toBeGreaterThan(1);
 	});
 
+	it("seedSession creates a TITLED shell at turn start, so the conversation lists immediately", () => {
+		// The lost-chat repro this pins: send a first turn, switch workspaces within seconds, switch
+		// back - the daemon's title-less shell was hidden as a placeholder and the conversation looked
+		// lost while its run (and the salvage) was still going. The seed labels it at turn start.
+		const store = createLocalChatStore(chatsDir());
+		store.setConversationId("u", "a", "conv-1", "codex");
+		store.seedSession("u", "a", "How do I whistle");
+		const stored = store.read("u", "a");
+		expect(stored?.title).toBe("How do I whistle");
+		expect(stored?.messages).toEqual([]);
+		// The resume handle the shell existed to carry survives the seed.
+		expect(store.getConversationId("u", "a", "codex")).toBe("conv-1");
+	});
+
+	it("seedSession never relabels a session that already has a name, and creates from nothing", () => {
+		const store = createLocalChatStore(chatsDir());
+		store.save("u", session({ id: "a", title: "Renamed by hand", updatedAt: 1, messages: [] }));
+		store.seedSession("u", "a", "derived prefix");
+		expect(store.read("u", "a")?.title).toBe("Renamed by hand");
+		// No prior record at all: the seed IS the record.
+		store.seedSession("u", "b", "Fresh");
+		expect(store.read("u", "b")?.title).toBe("Fresh");
+		// An empty title seeds nothing rather than minting an unlabelled shell.
+		store.seedSession("u", "c", "");
+		expect(store.read("u", "c")).toBeNull();
+	});
+
 	it("appendMessages CREATES the session when none exists, adopting the fallback title", () => {
 		const store = createLocalChatStore(chatsDir());
 		// The detached-turn case: the app never saved this session, so the daemon is its first writer.

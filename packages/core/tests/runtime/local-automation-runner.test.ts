@@ -7,6 +7,7 @@ import type { StartAutomatedOpts } from "../../src/runtime/local/local-session";
 import { cronFingerprint } from "../../src/runtime/local/automation-cadence";
 import { createAutomationRunner } from "../../src/runtime/local/automation-runner";
 import type {
+	LocalAutomation,
 	LocalAutomationOutcome,
 	LocalAutomationStore,
 	UserAutomationInput
@@ -97,6 +98,30 @@ function userInput(over: Partial<UserAutomationInput> = {}): UserAutomationInput
 	return { ...common, intervalMinutes: over.intervalMinutes ?? 5 };
 }
 
+/**
+ * Creates a user automation that is ALREADY past its first-run window.
+ *
+ * The store stamps a creation instant, and a never-run INTERVAL automation deliberately waits one full
+ * interval before its first fire - a freshly saved hourly automation that spends a run the moment it is
+ * saved is a surprise, and on a metered CLI a surprise with a bill. Every case below that is about
+ * FIRING therefore seeds one created a window ago; seeding "now" would silently turn each of them into a
+ * test of the first-run delay instead of the thing it names.
+ *
+ * The first-run delay itself has its own cases, which seed through `upsertUser` directly.
+ *
+ * @param store - The workspace store to write into.
+ * @param automation - The automation input (a cron one is unaffected: it arms before it ever fires).
+ * @returns The persisted automation.
+ */
+function seedDueUser(store: LocalAutomationStore, automation: UserAutomationInput): LocalAutomation {
+	const now = Date.now();
+	const back = automation.cron !== undefined ? 0 : automation.intervalMinutes * 60_000 + 1;
+	vi.setSystemTime(now - back);
+	const created = store.upsertUser(automation);
+	vi.setSystemTime(now);
+	return created;
+}
+
 /** A controllable fake session capturing every `startAutomated` and its `onDone` settle hook. */
 function fakeSession(over: { autoComplete?: boolean } = {}): {
 	session: { startAutomated(opts: StartAutomatedOpts): void; activeRunCount(): number };
@@ -140,7 +165,17 @@ function config(over: Partial<LocalAppConfig> = {}): LocalAppConfig {
  */
 function builtInSpec(over: Partial<BuiltInAutomationSpec> = {}): BuiltInAutomationSpec {
 	const { id = "fixture-digest", name = "Digest", prompt = "summarize", enabled = true } = over;
-	const common = { id, name, prompt, enabled };
+	const common = {
+		id,
+		name,
+		prompt,
+		enabled,
+		// The buyer knobs ride through only when a case sets one, so every other fixture stays the plain spec.
+		...(over.toggleable !== undefined ? { toggleable: over.toggleable } : {}),
+		...(over.hidden !== undefined ? { hidden: over.hidden } : {}),
+		...(over.cli !== undefined ? { cli: over.cli } : {}),
+		...(over.modelId !== undefined ? { modelId: over.modelId } : {})
+	};
 	if (over.cron !== undefined) {
 		return {
 			...common,
@@ -163,7 +198,7 @@ describe("createAutomationRunner", () => {
 	it("fires a due user automation once per elapsed interval, not on every tick", () => {
 		const stores = freshStores();
 		const store = stores.forWorkspace(null);
-		store.upsertUser(userInput());
+		seedDueUser(store, userInput());
 		const fake = fakeSession({ autoComplete: true });
 		const runner = createAutomationRunner({
 			stores,
@@ -183,7 +218,7 @@ describe("createAutomationRunner", () => {
 	it("catches up an overdue automation EXACTLY ONCE (no pile-up)", () => {
 		const stores = freshStores();
 		const store = stores.forWorkspace(null);
-		const automation = store.upsertUser(userInput());
+		const automation = seedDueUser(store, userInput());
 		// Overdue by many intervals: last ran long before BASE.
 		store.setRunState(automation.id, { lastRunAt: BASE - 100 * FIVE_MIN_MS });
 		const fake = fakeSession({ autoComplete: true });
@@ -205,7 +240,7 @@ describe("createAutomationRunner", () => {
 	it("defers a due fire while at the concurrency cap (no fire, no mark), then fires when a slot frees", () => {
 		const stores = freshStores();
 		const store = stores.forWorkspace(null);
-		const automation = store.upsertUser(userInput());
+		const automation = seedDueUser(store, userInput());
 		const fake = fakeSession({ autoComplete: true });
 		fake.setActive(1); // at the cap
 		const runner = createAutomationRunner({
@@ -272,7 +307,7 @@ describe("createAutomationRunner", () => {
 	it('runNow is "busy" while a run is in flight (single-flight), then startable again after it settles', () => {
 		const stores = freshStores();
 		const store = stores.forWorkspace(null);
-		const automation = store.upsertUser(userInput());
+		const automation = seedDueUser(store, userInput());
 		const fake = fakeSession(); // does NOT auto-complete: the run stays in flight
 		const runner = createAutomationRunner({
 			stores,
@@ -291,7 +326,7 @@ describe("createAutomationRunner", () => {
 	it('runNow is "busy" when the concurrency cap is full', () => {
 		const stores = freshStores();
 		const store = stores.forWorkspace(null);
-		const automation = store.upsertUser(userInput());
+		const automation = seedDueUser(store, userInput());
 		const fake = fakeSession();
 		fake.setActive(2);
 		const runner = createAutomationRunner({
@@ -308,7 +343,7 @@ describe("createAutomationRunner", () => {
 	it("defers a due fire when the process-wide run count is at cap even though the local session is idle", () => {
 		const stores = freshStores();
 		const store = stores.forWorkspace(null);
-		const automation = store.upsertUser(userInput());
+		const automation = seedDueUser(store, userInput());
 		const fake = fakeSession(); // the local session itself holds no run in flight (activeRunCount 0)
 		const runner = createAutomationRunner({
 			stores,
@@ -327,9 +362,9 @@ describe("createAutomationRunner", () => {
 	it("records the settled outcome and output; a null outcome (drain/cancel) leaves the prior state", () => {
 		const stores = freshStores();
 		const store = stores.forWorkspace(null);
-		const refusedId = store.upsertUser(userInput()).id;
-		const failedId = store.upsertUser(userInput()).id;
-		const leaveId = store.upsertUser(userInput()).id;
+		const refusedId = seedDueUser(store, userInput()).id;
+		const failedId = seedDueUser(store, userInput()).id;
+		const leaveId = seedDueUser(store, userInput()).id;
 		store.setRunState(leaveId, {
 			lastRunAt: BASE - FIVE_MIN_MS,
 			lastOutcome: "completed",
@@ -367,7 +402,7 @@ describe("createAutomationRunner", () => {
 	it("records a completed run with empty output as completed (ran, no output)", () => {
 		const stores = freshStores();
 		const store = stores.forWorkspace(null);
-		const automation = store.upsertUser(userInput());
+		const automation = seedDueUser(store, userInput());
 		const fake = fakeSession();
 		const runner = createAutomationRunner({
 			stores,
@@ -387,7 +422,7 @@ describe("createAutomationRunner", () => {
 	it("the merge-preserving mark advances ONLY lastRunAt, keeping the prior outcome/output during the run", () => {
 		const stores = freshStores();
 		const store = stores.forWorkspace(null);
-		const automation = store.upsertUser(userInput());
+		const automation = seedDueUser(store, userInput());
 		store.setRunState(automation.id, {
 			lastRunAt: BASE - FIVE_MIN_MS,
 			lastOutcome: "completed",
@@ -413,8 +448,8 @@ describe("createAutomationRunner", () => {
 	it("arms a fresh cron automation instead of firing it, while a fresh interval automation beside it still fires", () => {
 		const stores = freshStores();
 		const store = stores.forWorkspace(null);
-		const cronId = store.upsertUser(userInput({ cron: HOURLY_CRON, timezone: CRON_TZ })).id;
-		const intervalId = store.upsertUser(userInput()).id;
+		const cronId = seedDueUser(store, userInput({ cron: HOURLY_CRON, timezone: CRON_TZ })).id;
+		const intervalId = seedDueUser(store, userInput()).id;
 		const fake = fakeSession({ autoComplete: true });
 		const runner = createAutomationRunner({
 			stores,
@@ -445,7 +480,7 @@ describe("createAutomationRunner", () => {
 	it("holds an armed cron automation until its occurrence, then fires it exactly once and re-arms forward", () => {
 		const stores = freshStores();
 		const store = stores.forWorkspace(null);
-		const automation = store.upsertUser(userInput({ cron: HOURLY_CRON, timezone: CRON_TZ }));
+		const automation = seedDueUser(store, userInput({ cron: HOURLY_CRON, timezone: CRON_TZ }));
 		const fake = fakeSession({ autoComplete: true });
 		const runner = createAutomationRunner({
 			stores,
@@ -483,7 +518,7 @@ describe("createAutomationRunner", () => {
 	it("fires an overdue cron automation ONCE and re-arms from now, not from the occurrence it missed", () => {
 		const stores = freshStores();
 		const store = stores.forWorkspace(null);
-		const automation = store.upsertUser(userInput({ cron: HOURLY_CRON, timezone: CRON_TZ }));
+		const automation = seedDueUser(store, userInput({ cron: HOURLY_CRON, timezone: CRON_TZ }));
 		const fake = fakeSession({ autoComplete: true });
 		const runner = createAutomationRunner({
 			stores,
@@ -516,7 +551,7 @@ describe("createAutomationRunner", () => {
 	it("runNow on a cron automation fires it and arms the SAME next calendar occurrence a tick would have", () => {
 		const stores = freshStores();
 		const store = stores.forWorkspace(null);
-		const automation = store.upsertUser(userInput({ cron: HOURLY_CRON, timezone: CRON_TZ }));
+		const automation = seedDueUser(store, userInput({ cron: HOURLY_CRON, timezone: CRON_TZ }));
 		const fake = fakeSession({ autoComplete: true });
 		const runner = createAutomationRunner({
 			stores,
@@ -537,7 +572,7 @@ describe("createAutomationRunner", () => {
 	it("the settled terminal record PRESERVES the whole arming (a completed fire must not disarm)", () => {
 		const stores = freshStores();
 		const store = stores.forWorkspace(null);
-		const automation = store.upsertUser(userInput({ cron: HOURLY_CRON, timezone: CRON_TZ }));
+		const automation = seedDueUser(store, userInput({ cron: HOURLY_CRON, timezone: CRON_TZ }));
 		const fake = fakeSession(); // stays in flight until settled
 		const runner = createAutomationRunner({
 			stores,
@@ -562,7 +597,7 @@ describe("createAutomationRunner", () => {
 	it("the failed-outcome record after a throwing fire PRESERVES the whole arming", () => {
 		const stores = freshStores();
 		const store = stores.forWorkspace(null);
-		const automation = store.upsertUser(userInput({ cron: HOURLY_CRON, timezone: CRON_TZ }));
+		const automation = seedDueUser(store, userInput({ cron: HOURLY_CRON, timezone: CRON_TZ }));
 		const session = {
 			startAutomated(): void {
 				throw new Error("session boom");
@@ -588,7 +623,7 @@ describe("createAutomationRunner", () => {
 	it("survives a throwing mark write: logs, skips the fire, RELEASES the flight slot, and fires on retry", () => {
 		const stores = freshStores();
 		const store = stores.forWorkspace(null);
-		const automation = store.upsertUser(userInput());
+		const automation = seedDueUser(store, userInput());
 		let markCalls = 0;
 		const throwing: LocalAutomationStore = {
 			...store,
@@ -659,7 +694,7 @@ describe("createAutomationRunner", () => {
 	it("survives a throwing store write while ARMING: logs, keeps the loop alive, arms on a later tick", () => {
 		const stores = freshStores();
 		const store = stores.forWorkspace(null);
-		const automation = store.upsertUser(userInput({ cron: HOURLY_CRON, timezone: CRON_TZ }));
+		const automation = seedDueUser(store, userInput({ cron: HOURLY_CRON, timezone: CRON_TZ }));
 		let armCalls = 0;
 		const throwing: LocalAutomationStore = {
 			...store,
@@ -694,7 +729,7 @@ describe("createAutomationRunner", () => {
 	it("survives a throwing startAutomated: keeps the loop alive, releases the flight slot, records failed, re-fires", () => {
 		const stores = freshStores();
 		const store = stores.forWorkspace(null);
-		const automation = store.upsertUser(userInput());
+		const automation = seedDueUser(store, userInput());
 		const starts: StartAutomatedOpts[] = [];
 		let throwNext = true;
 		const session = {
@@ -738,7 +773,7 @@ describe("createAutomationRunner", () => {
 	it('runNow returns "failed" when the fire itself throws', () => {
 		const stores = freshStores();
 		const store = stores.forWorkspace(null);
-		const automation = store.upsertUser(userInput());
+		const automation = seedDueUser(store, userInput());
 		const session = {
 			startAutomated(): void {
 				throw new Error("session boom");
@@ -761,7 +796,7 @@ describe("createAutomationRunner", () => {
 	it("survives a throwing cap read: defers the fire and keeps the loop alive for the next tick", () => {
 		const stores = freshStores();
 		const store = stores.forWorkspace(null);
-		store.upsertUser(userInput());
+		seedDueUser(store, userInput());
 		const fake = fakeSession({ autoComplete: true });
 		let capThrows = true;
 		const lines: string[] = [];
@@ -791,7 +826,7 @@ describe("createAutomationRunner", () => {
 	it("survives a throwing store write on the terminal record", () => {
 		const stores = freshStores();
 		const store = stores.forWorkspace(null);
-		const automation = store.upsertUser(userInput());
+		const automation = seedDueUser(store, userInput());
 		let calls = 0;
 		const throwing: LocalAutomationStore = {
 			...store,
@@ -818,7 +853,7 @@ describe("createAutomationRunner", () => {
 	it("stop() halts the tick loop", () => {
 		const stores = freshStores();
 		const store = stores.forWorkspace(null);
-		store.upsertUser(userInput());
+		seedDueUser(store, userInput());
 		const fake = fakeSession({ autoComplete: true });
 		const runner = createAutomationRunner({
 			stores,
@@ -860,6 +895,82 @@ describe("createAutomationRunner", () => {
 		vi.advanceTimersByTime(1_000);
 		runner.stop();
 		expect(fake.starts).toHaveLength(1);
+	});
+
+	it("ignores a stored enabled-override on a FORCED built-in, firing it at the product's state", () => {
+		const stores = freshStores();
+		const store = stores.forWorkspace(null);
+		// The override document already holds `false` - written by an older build, or edited by hand. The
+		// drive server refuses to write one now, and this is the other half of that pair: an always-on
+		// automation must not be silently stopped by a file the product no longer accepts writes to.
+		store.setBuiltInEnabled("fixture-digest", false);
+		const fake = fakeSession({ autoComplete: true });
+		const runner = createAutomationRunner({
+			stores,
+			session: fake.session,
+			config: () =>
+				config({ automations: [builtInSpec({ enabled: true, toggleable: false })] }),
+			getMaxConcurrentRuns: () => 10,
+			tickMs: 1_000,
+			write: () => {}
+		});
+		runner.start();
+		vi.advanceTimersByTime(1_000);
+		runner.stop();
+		expect(fake.starts).toHaveLength(1);
+		expect(fake.starts[0]).toMatchObject({ automationId: "fixture-digest" });
+	});
+
+	it("fires a HIDDEN built-in exactly like a listed one (hiding is a list decision, not a run one)", () => {
+		const stores = freshStores();
+		const fake = fakeSession({ autoComplete: true });
+		const runner = createAutomationRunner({
+			stores,
+			session: fake.session,
+			config: () =>
+				config({
+					automations: [builtInSpec({ enabled: true, toggleable: false, hidden: true })]
+				}),
+			getMaxConcurrentRuns: () => 10,
+			tickMs: 1_000,
+			write: () => {}
+		});
+		runner.start();
+		vi.advanceTimersByTime(1_000);
+		expect(fake.starts).toHaveLength(1);
+		// ...and run-now still resolves it by id, so a hidden automation is never made unreachable.
+		vi.setSystemTime(BASE + 2 * FIVE_MIN_MS);
+		expect(runner.runNow("fixture-digest", null)).toBe("started");
+		runner.stop();
+	});
+
+	it("carries a PINNED cli/model into the fire instead of the app-config device default", () => {
+		const stores = freshStores();
+		const fake = fakeSession({ autoComplete: true });
+		const runner = createAutomationRunner({
+			stores,
+			session: fake.session,
+			// The device default is set AND different, so a pin that never travelled would still produce a
+			// fire - just on the wrong model, which is exactly the failure this guards.
+			config: () =>
+				config({
+					defaultCli: "codex",
+					defaultModel: "gpt-5",
+					automations: [builtInSpec({ cli: "claude-code", modelId: "opus" })]
+				}),
+			getMaxConcurrentRuns: () => 10,
+			tickMs: 1_000,
+			write: () => {}
+		});
+		runner.start();
+		vi.advanceTimersByTime(1_000);
+		runner.stop();
+		expect(fake.starts).toHaveLength(1);
+		expect(fake.starts[0]).toMatchObject({
+			automationId: "fixture-digest",
+			cli: "claude-code",
+			modelId: "opus"
+		});
 	});
 
 	it("aRMS a CRON built-in spec on its first tick without firing it, then fires at the occurrence", () => {
@@ -1031,7 +1142,7 @@ describe("createAutomationRunner", () => {
 	it("a throwing config() read fires nothing that tick and resumes once it reads again, logging it", () => {
 		const stores = freshStores();
 		const store = stores.forWorkspace(null);
-		store.upsertUser(userInput());
+		seedDueUser(store, userInput());
 		const fake = fakeSession({ autoComplete: true });
 		const lines: string[] = [];
 		let configThrows = true;
@@ -1066,8 +1177,8 @@ describe("createAutomationRunner", () => {
 		// An automation left in the no-project bucket: created before the device scoped by project, and no
 		// longer reachable from any surface once projects are the only workspace the app shows. Firing it
 		// would be a cron nobody can see or stop, which is the same reason the allowlist exists.
-		const strandedId = stores.forWorkspace(null).upsertUser(userInput()).id;
-		const projectAutomationId = stores.forWorkspace(PROJECT).upsertUser(userInput()).id;
+		const strandedId = seedDueUser(stores.forWorkspace(null), userInput()).id;
+		const projectAutomationId = seedDueUser(stores.forWorkspace(PROJECT), userInput()).id;
 		stores.replaceAllowlist([PROJECT]);
 		const fake = fakeSession({ autoComplete: true });
 		const runner = createAutomationRunner({
@@ -1096,10 +1207,10 @@ describe("createAutomationRunner", () => {
 
 	it("never ticks a project workspace missing from the allowlist, and ticks it once it is added", () => {
 		const stores = freshStores();
-		const projectAutomationId = stores.forWorkspace(PROJECT).upsertUser(userInput()).id;
+		const projectAutomationId = seedDueUser(stores.forWorkspace(PROJECT), userInput()).id;
 		// A second project workspace exists on disk but is never allowlisted: the allowlist, not the directory
 		// listing, is what admits a workspace.
-		stores.forWorkspace(OTHER_PROJECT).upsertUser(userInput());
+		seedDueUser(stores.forWorkspace(OTHER_PROJECT), userInput());
 		const fake = fakeSession({ autoComplete: true });
 		const runner = createAutomationRunner({
 			stores,
@@ -1184,8 +1295,8 @@ describe("createAutomationRunner", () => {
 		"ticks the no-project bucket alone, with no workKey, while projectScoped is %s",
 		(_label, flag) => {
 			const stores = freshStores();
-			const soleId = stores.forWorkspace(null).upsertUser(userInput()).id;
-			stores.forWorkspace(PROJECT).upsertUser(userInput());
+			const soleId = seedDueUser(stores.forWorkspace(null), userInput()).id;
+			seedDueUser(stores.forWorkspace(PROJECT), userInput());
 			stores.replaceAllowlist([PROJECT]);
 			const fake = fakeSession({ autoComplete: true });
 			const runner = createAutomationRunner({
@@ -1209,8 +1320,8 @@ describe("createAutomationRunner", () => {
 
 	it("ticks nothing when the config read throws, however the allowlist reads, logging it", () => {
 		const stores = freshStores();
-		stores.forWorkspace(null).upsertUser(userInput());
-		stores.forWorkspace(PROJECT).upsertUser(userInput());
+		seedDueUser(stores.forWorkspace(null), userInput());
+		seedDueUser(stores.forWorkspace(PROJECT), userInput());
 		stores.replaceAllowlist([PROJECT]);
 		const fake = fakeSession({ autoComplete: true });
 		const lines: string[] = [];
@@ -1277,7 +1388,7 @@ describe("createAutomationRunner", () => {
 		const stores = freshStores();
 		// Present in PROJECT only, with no allowlist document and no projectScoped flag: run-now is an explicit
 		// action on a workspace the caller can already see, so neither gate applies to it.
-		const projectAutomationId = stores.forWorkspace(PROJECT).upsertUser(userInput()).id;
+		const projectAutomationId = seedDueUser(stores.forWorkspace(PROJECT), userInput()).id;
 		const fake = fakeSession();
 		const runner = createAutomationRunner({
 			stores,
@@ -1300,7 +1411,7 @@ describe("createAutomationRunner", () => {
 		// opposite case: somebody is looking at the automation and pressed the button, so the scope rule that
 		// governs the unattended tick must not reach it - otherwise a stranded automation could never be run,
 		// only deleted.
-		const strandedId = stores.forWorkspace(null).upsertUser(userInput()).id;
+		const strandedId = seedDueUser(stores.forWorkspace(null), userInput()).id;
 		const fake = fakeSession();
 		const runner = createAutomationRunner({
 			stores,
@@ -1322,7 +1433,7 @@ describe("createAutomationRunner", () => {
 
 	it('runNow answers "unknown" for a malformed workspace id instead of throwing out of the daemon', () => {
 		const stores = freshStores();
-		const automationId = stores.forWorkspace(null).upsertUser(userInput()).id;
+		const automationId = seedDueUser(stores.forWorkspace(null), userInput()).id;
 		const fake = fakeSession();
 		const lines: string[] = [];
 		const runner = createAutomationRunner({
@@ -1341,7 +1452,7 @@ describe("createAutomationRunner", () => {
 
 	it("fires a workspace's automation in the folder that workspace has CONNECTED", () => {
 		const stores = freshStores();
-		const projectAutomationId = stores.forWorkspace(PROJECT).upsertUser(userInput()).id;
+		const projectAutomationId = seedDueUser(stores.forWorkspace(PROJECT), userInput()).id;
 		stores.replaceAllowlist([PROJECT]);
 		const fake = fakeSession({ autoComplete: true });
 		const asked: (string | null)[] = [];
@@ -1372,7 +1483,7 @@ describe("createAutomationRunner", () => {
 
 	it("carries NO connected folder when the workspace has none (the managed work tree)", () => {
 		const stores = freshStores();
-		stores.forWorkspace(PROJECT).upsertUser(userInput());
+		seedDueUser(stores.forWorkspace(PROJECT), userInput());
 		stores.replaceAllowlist([PROJECT]);
 		const fake = fakeSession({ autoComplete: true });
 		const runner = createAutomationRunner({
@@ -1399,7 +1510,7 @@ describe("createAutomationRunner", () => {
 		// the automation stays due and keeps re-stamping its `failed` last-run record, which is the row the
 		// user sees in the Automations list (the sidebar folder badge never learns about a dispatch failure).
 		const stores = freshStores();
-		const projectAutomationId = stores.forWorkspace(PROJECT).upsertUser(userInput()).id;
+		const projectAutomationId = seedDueUser(stores.forWorkspace(PROJECT), userInput()).id;
 		stores.replaceAllowlist([PROJECT]);
 		const fake = fakeSession({ autoComplete: true });
 		const lines: string[] = [];
@@ -1435,7 +1546,7 @@ describe("createAutomationRunner", () => {
 		// write a `failed` over an automation that is running fine, and pay for a realpath + predicate pass
 		// on every tick of every in-flight automation.
 		const stores = freshStores();
-		const projectAutomationId = stores.forWorkspace(PROJECT).upsertUser(userInput()).id;
+		const projectAutomationId = seedDueUser(stores.forWorkspace(PROJECT), userInput()).id;
 		// No autoComplete: the first fire stays in flight, so the second hits the single-flight gate.
 		const fake = fakeSession();
 		const asked: (string | null)[] = [];
@@ -1459,7 +1570,7 @@ describe("createAutomationRunner", () => {
 
 	it("runNow reports a broken connected folder as failed rather than running elsewhere", () => {
 		const stores = freshStores();
-		const projectAutomationId = stores.forWorkspace(PROJECT).upsertUser(userInput()).id;
+		const projectAutomationId = seedDueUser(stores.forWorkspace(PROJECT), userInput()).id;
 		const fake = fakeSession();
 		const runner = createAutomationRunner({
 			stores,
@@ -1475,5 +1586,86 @@ describe("createAutomationRunner", () => {
 		expect(runner.runNow(projectAutomationId, PROJECT)).toBe("failed");
 		expect(fake.starts).toHaveLength(0);
 		expect(stores.forWorkspace(PROJECT).getRunState(projectAutomationId).lastOutcome).toBe("failed");
+	});
+});
+
+describe("createAutomationRunner - the app's own tools", () => {
+	beforeEach(() => {
+		vi.useFakeTimers();
+		vi.setSystemTime(BASE);
+	});
+	afterEach(() => {
+		vi.useRealTimers();
+	});
+
+	/** The host's product-tools server, as the daemon's registry hands it to the runner. */
+	const APP_TOOLS = { "app-tools": { type: "http" as const, url: "http://127.0.0.1:51789/mcp" } };
+
+	it("mounts the host's app tools on an unattended fire, exactly as a chat turn carries them", () => {
+		const stores = freshStores();
+		const automation = seedDueUser(stores.forWorkspace(null), userInput());
+		// Overdue, so the tick fires it whatever anchor a never-run row is judged from.
+		stores.forWorkspace(null).setRunState(automation.id, { lastRunAt: BASE - 100 * FIVE_MIN_MS });
+		const fake = fakeSession({ autoComplete: true });
+		const runner = createAutomationRunner({
+			stores,
+			session: fake.session,
+			config: () => config(),
+			getMaxConcurrentRuns: () => 10,
+			appMcpServers: () => APP_TOOLS,
+			tickMs: 1_000,
+			write: () => {}
+		});
+
+		runner.start();
+		vi.advanceTimersByTime(1_000);
+		runner.stop();
+
+		expect(fake.starts[0]?.mcpServers).toEqual(APP_TOOLS);
+	});
+
+	it("re-reads the host's tools per fire, so a sign-out between fires stops mounting them", () => {
+		const stores = freshStores();
+		const automation = seedDueUser(stores.forWorkspace(null), userInput());
+		const fake = fakeSession({ autoComplete: true });
+		let serving = true;
+		const runner = createAutomationRunner({
+			stores,
+			session: fake.session,
+			config: () => config(),
+			getMaxConcurrentRuns: () => 10,
+			appMcpServers: () => (serving ? APP_TOOLS : {}),
+			write: () => {}
+		});
+
+		expect(runner.runNow(automation.id, null)).toBe("started");
+		serving = false;
+		expect(runner.runNow(automation.id, null)).toBe("started");
+
+		expect(fake.starts[0]?.mcpServers).toEqual(APP_TOOLS);
+		// An empty read passes NO field at all, so the fire composes like a pre-seam one (no nudge either).
+		expect(fake.starts[1]?.mcpServers).toBeUndefined();
+	});
+
+	it("fires without app tools when the host's registry throws, rather than failing the fire", () => {
+		const stores = freshStores();
+		const automation = seedDueUser(stores.forWorkspace(null), userInput());
+		const fake = fakeSession({ autoComplete: true });
+		const lines: string[] = [];
+		const runner = createAutomationRunner({
+			stores,
+			session: fake.session,
+			config: () => config(),
+			getMaxConcurrentRuns: () => 10,
+			appMcpServers: () => {
+				throw new Error("registry exploded");
+			},
+			write: (line) => lines.push(line)
+		});
+
+		expect(runner.runNow(automation.id, null)).toBe("started");
+		expect(fake.starts[0]?.mcpServers).toBeUndefined();
+		expect(stores.forWorkspace(null).getRunState(automation.id).lastOutcome).toBe("completed");
+		expect(lines.join("")).toContain("firing without them");
 	});
 });

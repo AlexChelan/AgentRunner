@@ -1,4 +1,4 @@
-import type { McpServerSpec, RunImage, RunStart } from "@agentrunner/protocol";
+import type { McpServerSpec, RunDocument, RunImage, RunStart } from "@agentrunner/protocol";
 import { needsMcpEnv } from "../local-mcp-spec";
 import type { LocalMcpSpec } from "../local-mcp-spec";
 import type { LocalAppConfig } from "./app-config";
@@ -17,6 +17,19 @@ import { composeLocalSystemPrompt } from "./system-prompt";
 
 /** The agent id every local run carries; with no `scheduleId`/`origin` on the wire, `deriveRunKind` reads it as `chat`. */
 const LOCAL_AGENT_ID = "chat";
+
+/**
+ * The instruction that rides a local run WHEN the request carries the app's product tools (the
+ * desktop serves them over loopback MCP). Generic on purpose - this is daemon-owned text, so it
+ * names no product: it only tells the model that the mounted MCP tools ARE the app, which is the
+ * one fact a CLI cannot infer on its own. Exported for the desktop's terminal branch, which mounts
+ * the same loopback server and owes its CLI the same fact.
+ */
+export const PRODUCT_TOOLS_NUDGE =
+	"This app's own tools are connected to you over MCP. When the user asks about their account, " +
+	"their data, or anything in this app, answer from those tools rather than guessing, running " +
+	"shell commands, or searching the web - discover what exists with the list/get tools first, " +
+	"and never fabricate account state.";
 
 /** The user sentinel for a run with no paired backend or subscription owner. */
 const LOCAL_USER_ID = "local";
@@ -37,8 +50,16 @@ export interface ComposeLocalRunOpts {
 	conversationId?: string;
 	/** Images attached to a chat turn, carried to an image-capable CLI in-flight. */
 	images?: RunImage[];
+	/** Documents (PDFs) attached to a chat turn, carried to a document-capable CLI in-flight. */
+	documents?: RunDocument[];
 	/** The LOCAL-scope store's MCP servers, keyed by name. */
 	localMcpServers: Record<string, LocalMcpSpec>;
+	/**
+	 * Per-request MCP servers the drive caller supplies for THIS turn (the desktop app's product-tools
+	 * loopback server), merged AFTER the stored ones so a request's server wins a name collision. The
+	 * drive route has already validated them down to loopback `http` specs.
+	 */
+	requestMcpServers?: Record<string, McpServerSpec>;
 }
 
 /** The on-device composition result. */
@@ -72,7 +93,17 @@ export interface ComposedLocalRun {
  * @returns The composed run, its MCP servers, and the refused server names ({@link ComposedLocalRun}).
  */
 export function composeLocalRun(opts: ComposeLocalRunOpts): ComposedLocalRun {
-	const { config, prompt, cli, modelId, effort, conversationId, images, localMcpServers } = opts;
+	const {
+		config,
+		prompt,
+		cli,
+		modelId,
+		effort,
+		conversationId,
+		images,
+		documents,
+		localMcpServers
+	} = opts;
 
 	const mcpServers: Record<string, McpServerSpec> = {};
 	const refusedServers: string[] = [];
@@ -83,6 +114,27 @@ export function composeLocalRun(opts: ComposeLocalRunOpts): ComposedLocalRun {
 			mcpServers[name] = spec;
 		}
 	}
+	// The request's servers land LAST so they win a name collision: the one caller of this seam is the
+	// user's own app serving the product's tools, and a stored server accidentally sharing the name
+	// must not silently mask them.
+	for (const [name, spec] of Object.entries(opts.requestMcpServers ?? {})) {
+		mcpServers[name] = spec;
+	}
+
+	// A turn that carries the app's product tools also carries the nudge to USE them: a CLI asked a
+	// natural account question ("how many credits do I have?") otherwise reaches for its shell and the
+	// web and answers "I can't see your account from this chat" while the exact tool sits mounted. The
+	// nudge rides ONLY when request servers are present, so a plain local chat's prompt is unchanged.
+	// The STAGED nudge wins: the host stages its buyer-editable capability voice (the same string its
+	// server lanes inject), and the engine's own wording is only the fallback for a host that has not.
+	// An EMPTY staged string is the host saying "send no nudge at all", and is honoured as such.
+	const instructions = composeLocalSystemPrompt(config);
+	const hasRequestServers = Object.keys(opts.requestMcpServers ?? {}).length > 0;
+	const systemPrompt = hasRequestServers
+		? [instructions, config.toolsNudge ?? PRODUCT_TOOLS_NUDGE]
+				.filter((part): part is string => Boolean(part))
+				.join("\n\n")
+		: instructions;
 
 	const start: RunStart = {
 		type: "run.start",
@@ -93,8 +145,9 @@ export function composeLocalRun(opts: ComposeLocalRunOpts): ComposedLocalRun {
 		connectionId: cli,
 		input: prompt,
 		...(images && images.length > 0 ? { inputImages: images } : {}),
+		...(documents && documents.length > 0 ? { inputDocuments: documents } : {}),
 		webToolManifest: [],
-		systemPrompt: composeLocalSystemPrompt(config),
+		systemPrompt,
 		modelId,
 		effort,
 		conversationId

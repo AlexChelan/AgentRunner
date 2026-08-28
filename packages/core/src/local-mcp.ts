@@ -203,16 +203,20 @@ export async function serveToolsOverHttp(
 	const server = await (makeServer ?? (() => defaultServerFactory(serverName)))();
 	for (const [name, t] of Object.entries(tools)) {
 		const inputSchema = await resolveInputSchema(t);
+		// The AI SDK's v7 tool shape allows a FUNCTION description (resolved per call with a run
+		// context this bridge does not have); MCP registration needs a static string, so only a
+		// string description is forwarded and a dynamic one registers without.
+		const description = typeof t.description === "string" ? t.description : undefined;
 		server.registerTool(
 			name,
 			{
-				...(t.description !== undefined ? { description: t.description } : {}),
+				...(description !== undefined ? { description } : {}),
 				inputSchema
 			},
 			async (args) => {
 				try {
 					const out = t.execute
-						? await t.execute(args, { toolCallId: "local-mcp", messages: [] })
+						? await t.execute(args, { toolCallId: "local-mcp", messages: [], context: undefined })
 						: undefined;
 					// Coerce a missing/void result to a stable JSON string. `JSON.stringify(undefined)` is the
 					// value `undefined` (not `"undefined"`), which would leave the text block without its `text`

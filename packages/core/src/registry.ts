@@ -1,6 +1,9 @@
 import type { DetectResult, ModelInfo } from "@agentrunner/core-types";
+import { CONNECTABLE_TOOL_IDS } from "@agentrunner/protocol";
 import { createClaudeCodeAdapter } from "./adapters/claude-code";
 import { createCodexAdapter } from "./adapters/codex";
+import { createGrokAdapter } from "./adapters/grok";
+import { createOpencodeAdapter } from "./adapters/opencode";
 import type { RunTool } from "./adapters/types";
 import { makeDrivers } from "./drivers";
 import type { AgentDrivers } from "./drivers";
@@ -23,11 +26,17 @@ export interface AgentRuntimeRegistryDeps {
 	runTool: RunTool;
 	/** Optional driver overrides; defaults to the real SDK/CLI drivers. */
 	drivers?: AgentDrivers;
+	/**
+	 * The CLI ids this HOST wants adapters for; an adapter is built only when its id is listed.
+	 * Defaults to `CONNECTABLE_TOOL_IDS` (the daemon's dispatch set), so a host that does not care
+	 * keeps exactly the registry it already had. The desktop passes its own wider set.
+	 */
+	cliIds?: readonly string[];
 }
 
 /** The agentic-adapter registry: enumerate, look up, or require an adapter by id. */
 export interface AgentRuntimeRegistry {
-	/** Returns all built agentic adapters (claude-code, codex), in order. */
+	/** Returns every agentic adapter built for the host's CLI set, in order. */
 	getAdapters(): RuntimeToolAdapter[];
 	/** Returns one adapter by id, or `undefined`. */
 	getAdapter(id: string): RuntimeToolAdapter | undefined;
@@ -40,40 +49,80 @@ export interface AgentRuntimeRegistry {
 }
 
 /**
- * Builds the agentic-adapter registry from injected host dependencies. It wires ONLY the
- * two agentic adapters (Claude Code, Codex) - no PROVIDER_CATALOG, no completion adapters, no
- * Gemini, no `mainConfig` read - so the package stays Electron- and config-free. The drivers
- * default to the real SDK/CLI drivers; the host may inject fakes (or alternates) via
- * `deps.drivers`.
+ * Builds the agentic-adapter registry from injected host dependencies. It wires ONLY agentic
+ * adapters - no PROVIDER_CATALOG, no completion adapters, no Gemini, no `mainConfig` read - so the
+ * package stays Electron- and config-free. The drivers default to the real SDK/CLI drivers; the
+ * host may inject fakes (or alternates) via `deps.drivers`.
  *
- * OpenCode and Hermes were removed on 2026-08-02: both were ACP-driven, and ACP offers no
- * tool-restriction control, so a dispatched run's capability floor could only be asked for. It was
- * not honoured - see `tests/adversarial/floor-escape.test.ts` for what the real binaries did.
+ * WHICH adapters get built is the host's choice (`deps.cliIds`), because one builder serves two
+ * hosts with different CLI sets: the daemon drives only the dispatchable `CONNECTABLE_TOOL_IDS`
+ * (the default), while the desktop app drives its own wider local set. An adapter is constructed
+ * only when its id is listed, so an unlisted CLI has no adapter at all - and dispatch resolves runs
+ * through this registry, so an adapter here is a live dispatch target regardless of any allowlist
+ * upstream.
+ *
+ * OpenCode and Hermes were removed from the DISPATCH set on 2026-08-02: both were ACP-driven, and
+ * ACP offers no tool-restriction control, so a dispatched run's capability floor could only be asked
+ * for. It was not honoured - see `tests/adversarial/floor-escape.test.ts` for what the real binaries
+ * did. That is why they are absent from the default set rather than from this builder.
  *
  * @param deps - The binary resolver, key loader, registry lookup, tool runner, and
- *   optional driver overrides.
+ *   optional driver overrides plus host CLI set.
  * @returns The registry (`getAdapters`, `getAdapter`, `requireAdapter`).
  */
 export function buildAgentRuntimeRegistry(deps: AgentRuntimeRegistryDeps): AgentRuntimeRegistry {
 	const drivers = deps.drivers ?? makeDrivers();
+	const cliIds = deps.cliIds ?? CONNECTABLE_TOOL_IDS;
+	const wants = (id: string): boolean => cliIds.includes(id);
 	const common = {
 		resolveBinary: deps.resolveBinary,
 		loadApiKey: deps.loadApiKey,
 		listRegistryModels: deps.listRegistryModels,
 		runTool: deps.runTool
 	};
-	const adapters: RuntimeToolAdapter[] = [
-		createClaudeCodeAdapter({
-			...common,
-			driver: drivers.claudeDriver,
-			listAdvertisedModels: drivers.claudeModelLister
-		}),
-		createCodexAdapter({
-			...common,
-			driver: drivers.codexDriver,
-			listAdvertisedModels: drivers.codexModelLister
-		})
+	// A table rather than a chain of conditional spreads: the ORDER an enumerating host renders is this
+	// array's order, and each `make` stays lazy so an unlisted CLI's adapter is never constructed.
+	const buildable: { id: string; make: () => RuntimeToolAdapter }[] = [
+		{
+			id: "claude-code",
+			make: () =>
+				createClaudeCodeAdapter({
+					...common,
+					driver: drivers.claudeDriver,
+					listAdvertisedModels: drivers.claudeModelLister
+				})
+		},
+		{
+			id: "codex",
+			make: () =>
+				createCodexAdapter({
+					...common,
+					driver: drivers.codexDriver,
+					listAdvertisedModels: drivers.codexModelLister
+				})
+		},
+		{
+			id: "grok",
+			make: () =>
+				createGrokAdapter({
+					...common,
+					driver: drivers.grokDriver,
+					listAdvertisedModels: drivers.grokModelLister
+				})
+		},
+		{
+			id: "opencode",
+			make: () =>
+				createOpencodeAdapter({
+					...common,
+					driver: drivers.opencodeDriver,
+					listAdvertisedModels: drivers.opencodeModelLister
+				})
+		}
 	];
+	const adapters: RuntimeToolAdapter[] = buildable
+		.filter((entry) => wants(entry.id))
+		.map((entry) => entry.make());
 
 	const getAdapter = (id: string): RuntimeToolAdapter | undefined =>
 		adapters.find((adapter) => adapter.id === id);

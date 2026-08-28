@@ -1,4 +1,4 @@
-import { readdirSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
@@ -29,31 +29,59 @@ import {
  */
 const fixturesDir = fileURLToPath(new URL("./fixtures/", import.meta.url));
 
-/** The frozen versions on disk, oldest first (derived, so a new directory is picked up automatically). */
-const FROZEN_VERSIONS: readonly number[] = readdirSync(fixturesDir)
-	.filter((entry) => /^v\d+$/.test(entry))
-	.map((entry) => Number(entry.slice(1)))
-	.sort((a, b) => a - b);
+/**
+ * Every version this suite drives: 1 through the version this tree speaks. Derived from the constant
+ * rather than the directory listing, because the fixture layout is SPARSE - `v<N>/` holds only what
+ * version N CHANGED. Every version still resolves a full payload set; see {@link fixture}.
+ */
+const FROZEN_VERSIONS: readonly number[] = Array.from(
+	{ length: RUNNER_PROTOCOL_VERSION },
+	(_, i) => i + 1
+);
 
 /**
- * Reads a frozen fixture.
+ * Reads the frozen fixture a version resolves for `file`: its own directory when that version froze the
+ * file, else the newest earlier version that did. The sparse layout stores each shape once, at the
+ * version that changed it; the bytes any given version reads are unchanged by that.
  *
  * @param version - The protocol version whose frozen payload is wanted.
  * @param file - The fixture filename (for example `run-start.json`).
  * @returns The parsed JSON value, before any schema validation.
+ * @throws When no version at or below `version` froze the file.
  */
 function fixture(version: number, file: string): unknown {
-	return JSON.parse(readFileSync(join(fixturesDir, `v${version}`, file), "utf8"));
+	for (let v = version; v >= 1; v--) {
+		const path = join(fixturesDir, `v${v}`, file);
+		if (existsSync(path)) return JSON.parse(readFileSync(path, "utf8"));
+	}
+	throw new Error(`no fixture for ${file} at or below v${version}`);
 }
 
 describe("the frozen version set", () => {
 	it("includes the version this tree speaks, and every earlier one", () => {
 		expect(FROZEN_VERSIONS).toContain(RUNNER_PROTOCOL_VERSION);
 		expect(FROZEN_VERSIONS.at(-1)).toBe(RUNNER_PROTOCOL_VERSION);
-		// Contiguous from 1: a gap would mean a shipped version's bytes were deleted, which rule 4 forbids.
 		expect(FROZEN_VERSIONS).toEqual(
 			Array.from({ length: RUNNER_PROTOCOL_VERSION }, (_, i) => i + 1)
 		);
+	});
+
+	it("resolves a full payload set for every version, the ones with no directory included", () => {
+		// What the contiguous-directory check used to prove, restated for the sparse layout: no version
+		// may be missing a shape it shipped, however few files its own directory holds.
+		const unresolvable = FROZEN_VERSIONS.flatMap((version) =>
+			["run-start.json", "connect-instruction.json", "poll-response.json"]
+				.filter((file) => {
+					try {
+						fixture(version, file);
+						return false;
+					} catch {
+						return true;
+					}
+				})
+				.map((file) => `v${version}/${file}`)
+		);
+		expect(unresolvable).toEqual([]);
 	});
 });
 

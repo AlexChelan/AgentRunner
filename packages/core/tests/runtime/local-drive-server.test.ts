@@ -14,17 +14,20 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import type { RunHooks } from "../../src/runtime/executor";
 import { createLocalChatStore } from "../../src/runtime/local/chat-store";
 import type { LocalChatStore, LocalStoredChatSession } from "../../src/runtime/local/chat-store";
+import { createAppToolsRegistry } from "../../src/runtime/local/app-tools";
+import type { AppToolsRegistry } from "../../src/runtime/local/app-tools";
 import { DRIVE_HOST, startLocalDriveServer } from "../../src/runtime/local/drive-server";
 import type {
 	CliCatalogEntry,
 	CliConnectResult,
+	InstallToolResult,
 	LocalDriveHandle
 } from "../../src/runtime/local/drive-server";
-import type { ConnectableToolId } from "@agentrunner/protocol";
+import type { DesktopCliId } from "@agentrunner/core-types";
 import {
 	createWorkspaceAutomationStores,
 	createWorkspaceTaskOverrideStores
@@ -129,6 +132,8 @@ function denyDeps(dir: string): ConnectedFolderDenyDeps {
 		appDataRoot: join(dir, "app-data"),
 		home,
 		codexHome: join(home, ".codex"),
+		grokHome: join(home, ".grok"),
+		opencodeDataHome: join(home, ".local", "share", "opencode"),
 		appData: join(home, "AppData", "Roaming"),
 		localAppData: join(home, "AppData", "Local")
 	};
@@ -143,10 +148,20 @@ async function start(over?: {
 	connectedFolders?: ConnectedFolderStore;
 	connectedFolderDeny?: ConnectedFolderDenyDeps;
 	automationRunner?: Pick<AutomationRunner, "runNow">;
+	appTools?: AppToolsRegistry;
 	config?: () => LocalAppConfig;
-	listConnections?: () => { toolId: string; authHealth: string; images: boolean }[];
+	listConnections?: () => {
+		toolId: string;
+		authHealth: string;
+		images: boolean;
+		documents: boolean;
+	}[];
 	detectCatalog?: () => Promise<CliCatalogEntry[]>;
-	connectCli?: (toolId: ConnectableToolId) => Promise<CliConnectResult>;
+	connectCli?: (toolId: DesktopCliId) => Promise<CliConnectResult>;
+	installTool?: (
+		toolId: DesktopCliId,
+		onProgress: (line: string) => void
+	) => Promise<InstallToolResult>;
 	listToolModels?: (
 		toolId: string
 	) => Promise<{ id: string; name: string; recommended?: boolean }[]>;
@@ -177,10 +192,12 @@ async function start(over?: {
 		connectedFolders,
 		connectedFolderDeny: over?.connectedFolderDeny ?? denyDeps(dir),
 		automationRunner: over?.automationRunner ?? fakeRunner().runner,
+		...(over?.appTools !== undefined ? { appTools: over.appTools } : {}),
 		config: over?.config ?? (() => ({ productId: "demo", productName: "Demo" })),
 		listConnections: over?.listConnections ?? (() => []),
 		detectCatalog: over?.detectCatalog ?? (async () => []),
 		connectCli: over?.connectCli ?? (async () => ({ status: "connected", authHealth: "healthy" })),
+		installTool: over?.installTool ?? (async () => ({ status: "installed" })),
 		listToolModels: over?.listToolModels ?? (async () => []),
 		lifecycle: over?.lifecycle ?? (() => "app-scoped"),
 		launchIdentity: over?.launchIdentity ?? { productId: "demo", productName: "Demo" },
@@ -197,7 +214,17 @@ async function start(over?: {
  */
 function builtInSpec(over: Partial<BuiltInAutomationSpec> = {}): BuiltInAutomationSpec {
 	const { id = "digest", name = "Daily digest", prompt = "summarize", enabled = false } = over;
-	const common = { id, name, prompt, enabled };
+	const common = {
+		id,
+		name,
+		prompt,
+		enabled,
+		// The buyer knobs ride through only when a case sets one, so every other fixture stays the plain spec.
+		...(over.toggleable !== undefined ? { toggleable: over.toggleable } : {}),
+		...(over.hidden !== undefined ? { hidden: over.hidden } : {}),
+		...(over.cli !== undefined ? { cli: over.cli } : {}),
+		...(over.modelId !== undefined ? { modelId: over.modelId } : {})
+	};
 	if (over.cron !== undefined) {
 		return {
 			...common,
@@ -295,10 +322,13 @@ function send(
 	});
 }
 
-/** An open NDJSON stream: resolves on response headers, then accumulates one line per `\n`. */
+/**
+ * An open NDJSON stream: resolves on response headers, then accumulates one line per `\n`. The body is
+ * optional - the chat route carries one, the install route carries none.
+ */
 function openStream(
 	socketPath: string,
-	opts: { path: string; token?: string; host?: string; body: string }
+	opts: { path: string; token?: string; host?: string; body?: string }
 ): Promise<{
 	status: number;
 	headers: IncomingHttpHeaders;
@@ -350,7 +380,7 @@ function openStream(
 			});
 		});
 		req.on("error", reject);
-		req.write(opts.body);
+		if (opts.body !== undefined) req.write(opts.body);
 		req.end();
 	});
 }
@@ -361,6 +391,20 @@ function openStream(
  * cases below depend on.
  */
 const settle = (): Promise<void> => new Promise<void>((resolve) => setTimeout(resolve, 50));
+
+/**
+ * Yields the event loop until `ready` holds, or the turn bound is spent. Deliberately `setImmediate` and
+ * never a timer: a case holding FAKE timers (the naming run's timeout) still needs the real socket to
+ * deliver its request, and a timer-based wait would never resolve there. The bound only stops a runaway
+ * loop - a caller asserts the condition itself afterwards, so a spent bound fails loudly.
+ *
+ * @param ready - The condition to wait for.
+ */
+async function until(ready: () => boolean): Promise<void> {
+	for (let turn = 0; turn < 20_000 && !ready(); turn += 1) {
+		await new Promise<void>((resolve) => setImmediate(resolve));
+	}
+}
 
 /** A typed session factory (override only what a case cares about). */
 function chatSession(over: Partial<LocalStoredChatSession> = {}): LocalStoredChatSession {
@@ -642,8 +686,8 @@ describe("startLocalDriveServer - health and tools", () => {
 
 	it("gET /v1/tools projects the connection list", async () => {
 		const conns = [
-			{ toolId: "claude-code", authHealth: "healthy", images: true },
-			{ toolId: "codex", authHealth: "unknown", images: false }
+			{ toolId: "claude-code", authHealth: "healthy", images: true, documents: true },
+			{ toolId: "codex", authHealth: "unknown", images: false, documents: false }
 		];
 		const { handle } = await start({ listConnections: () => conns });
 		const res = await send(handle.socketPath, {
@@ -676,6 +720,28 @@ describe("startLocalDriveServer - health and tools", () => {
 		expect(res.status).toBe(200);
 		expect(JSON.parse(res.text)).toEqual({ models });
 		expect(asked).toEqual(["claude-code"]);
+	});
+
+	it("gET /v1/tools/<toolId>/models serves the desktop-only CLIs, not just the dispatch set", async () => {
+		// The drive server is the DESKTOP surface: it gates on the host catalog, which is wider than the
+		// cloud-dispatch allowlist. A desktop-only CLI 404ing here leaves its picker permanently empty.
+		const asked: string[] = [];
+		const { handle } = await start({
+			listToolModels: async (toolId) => {
+				asked.push(toolId);
+				return [];
+			}
+		});
+		for (const toolId of ["grok", "opencode"]) {
+			const res = await send(handle.socketPath, {
+				method: "GET",
+				path: `/v1/tools/${toolId}/models`,
+				token: handle.token
+			});
+			expect(res.status).toBe(200);
+			expect(JSON.parse(res.text)).toEqual({ models: [] });
+		}
+		expect(asked).toEqual(["grok", "opencode"]);
 	});
 
 	it("gET /v1/tools/<toolId>/models answers a DOMAIN 404 for a non-connectable tool id", async () => {
@@ -715,7 +781,8 @@ describe("startLocalDriveServer - health and tools", () => {
 				installed: true,
 				authenticated: true,
 				connected: true,
-				images: true
+				images: true,
+				documents: true
 			},
 			{
 				toolId: "codex",
@@ -723,7 +790,8 @@ describe("startLocalDriveServer - health and tools", () => {
 				installed: true,
 				authenticated: true,
 				connected: false,
-				images: false
+				images: false,
+				documents: false
 			}
 		];
 		const { handle } = await start({ detectCatalog: async () => catalog });
@@ -778,6 +846,28 @@ describe("startLocalDriveServer - health and tools", () => {
 		expect(JSON.parse(res.text)).toEqual({ status: "needs-login" });
 	});
 
+	it("pOST /v1/tools/<toolId>/connect serves the desktop-only CLIs, not just the dispatch set", async () => {
+		// Same fence as the models route: the in-app connect is a LOCAL action on the operator's own
+		// machine, so it must reach every CLI the desktop catalog offers, not only the dispatchable ones.
+		const asked: string[] = [];
+		const { handle } = await start({
+			connectCli: async (toolId) => {
+				asked.push(toolId);
+				return { status: "not-installed" };
+			}
+		});
+		for (const toolId of ["grok", "opencode"]) {
+			const res = await send(handle.socketPath, {
+				method: "POST",
+				path: `/v1/tools/${toolId}/connect`,
+				token: handle.token
+			});
+			expect(res.status).toBe(200);
+			expect(JSON.parse(res.text)).toEqual({ status: "not-installed" });
+		}
+		expect(asked).toEqual(["grok", "opencode"]);
+	});
+
 	it("pOST /v1/tools/<toolId>/connect answers a DOMAIN 404 for a non-connectable tool id", async () => {
 		const { handle } = await start({
 			connectCli: async () => {
@@ -802,6 +892,375 @@ describe("startLocalDriveServer - health and tools", () => {
 		const res = await send(handle.socketPath, { method: "POST", path: "/v1/tools/codex/connect" });
 		expect(res.status).toBe(404);
 		expect(res.text).toBe("");
+	});
+});
+
+describe("startLocalDriveServer - install/update", () => {
+	it("streams the install's progress lines, then exactly one terminal result frame", async () => {
+		const asked: DesktopCliId[] = [];
+		const { handle } = await start({
+			installTool: async (toolId, onProgress) => {
+				asked.push(toolId);
+				onProgress("Installing from npm...");
+				onProgress("Verifying install...");
+				return { status: "installed" };
+			}
+		});
+		const stream = await openStream(handle.socketPath, {
+			path: "/v1/tools/grok/install",
+			token: handle.token
+		});
+		expect(stream.status).toBe(200);
+		expect(stream.headers["content-type"]).toBe("application/x-ndjson");
+		await stream.ended;
+		expect(stream.lines.map((line) => JSON.parse(line))).toEqual([
+			{ type: "install.progress", line: "Installing from npm..." },
+			{ type: "install.progress", line: "Verifying install..." },
+			{ type: "install.result", result: { status: "installed" } }
+		]);
+		expect(asked).toEqual(["grok"]);
+	});
+
+	it("sends the head and the progress BEFORE the install finishes", async () => {
+		// The whole reason this route streams: an npm install runs for minutes, so a client that only
+		// heard from the daemon at the END would sit on a silent socket with nothing to render and no
+		// evidence the runtime is still alive.
+		let finish!: (result: InstallToolResult) => void;
+		const pending = new Promise<InstallToolResult>((resolve) => (finish = resolve));
+		const { handle } = await start({
+			installTool: (_toolId, onProgress) => {
+				onProgress("Downloading...");
+				return pending;
+			}
+		});
+		const stream = await openStream(handle.socketPath, {
+			path: "/v1/tools/opencode/install",
+			token: handle.token
+		});
+		// The head and the first phase are already on the wire while the install is still running.
+		expect(stream.status).toBe(200);
+		expect(JSON.parse(await stream.firstLine)).toEqual({
+			type: "install.progress",
+			line: "Downloading..."
+		});
+		finish({ status: "installed" });
+		await stream.ended;
+		expect(JSON.parse(stream.lines[stream.lines.length - 1] ?? "")).toEqual({
+			type: "install.result",
+			result: { status: "installed" }
+		});
+	});
+
+	it("reports a CLI the USER manages as a terminal user-managed result", async () => {
+		// The app installs FOR a user who has none; a CLI on the user's own PATH stays theirs. The route
+		// carries that verdict as a 200 result frame (never an error), so the UI can say who owns it.
+		const { handle } = await start({
+			installTool: async () => ({ status: "user-managed", path: "/opt/homebrew/bin/grok" })
+		});
+		const stream = await openStream(handle.socketPath, {
+			path: "/v1/tools/grok/install",
+			token: handle.token
+		});
+		await stream.ended;
+		expect(stream.status).toBe(200);
+		expect(stream.lines.map((line) => JSON.parse(line))).toEqual([
+			{
+				type: "install.result",
+				result: { status: "user-managed", path: "/opt/homebrew/bin/grok" }
+			}
+		]);
+	});
+
+	it("carries a refused install as a terminal result frame, not a transport error", async () => {
+		const { handle } = await start({
+			installTool: async () => ({ status: "failed", reason: "could not find npm" })
+		});
+		const stream = await openStream(handle.socketPath, {
+			path: "/v1/tools/grok/install",
+			token: handle.token
+		});
+		await stream.ended;
+		expect(stream.status).toBe(200);
+		expect(stream.lines.map((line) => JSON.parse(line))).toEqual([
+			{ type: "install.result", result: { status: "failed", reason: "could not find npm" } }
+		]);
+	});
+
+	it("still ends the stream with a result when the dep throws", async () => {
+		const { handle } = await start({
+			installTool: () => Promise.reject(new Error("disk on fire"))
+		});
+		const stream = await openStream(handle.socketPath, {
+			path: "/v1/tools/grok/install",
+			token: handle.token
+		});
+		await stream.ended;
+		expect(stream.lines.map((line) => JSON.parse(line))).toEqual([
+			{ type: "install.result", result: { status: "failed", reason: "disk on fire" } }
+		]);
+	});
+
+	it("finishes an install whose client walked away, without writing to the dead socket", async () => {
+		// Closing the window must not abandon a half-written install tree - the work owns its own lifetime,
+		// exactly like a chat run. The daemon has to survive the frames it can no longer deliver.
+		let finish!: (result: InstallToolResult) => void;
+		const pending = new Promise<InstallToolResult>((resolve) => (finish = resolve));
+		let finished = false;
+		const { handle } = await start({
+			installTool: async (_toolId, onProgress) => {
+				onProgress("Downloading...");
+				const result = await pending;
+				onProgress("Verifying install...");
+				finished = true;
+				return result;
+			}
+		});
+		const stream = await openStream(handle.socketPath, {
+			path: "/v1/tools/grok/install",
+			token: handle.token
+		});
+		await stream.firstLine;
+		await stream.sever();
+		await settle();
+
+		finish({ status: "installed" });
+		await settle();
+
+		expect(finished).toBe(true);
+		// The runtime is still serving: the writes aimed at the closed response took nothing down.
+		expect(
+			(await send(handle.socketPath, { method: "GET", path: "/v1/health", token: handle.token }))
+				.status
+		).toBe(200);
+	});
+
+	it("answers a DOMAIN 404 for a non-desktop tool id, and never installs it", async () => {
+		const { handle } = await start({
+			installTool: () => {
+				throw new Error("must not install a tool outside the desktop catalog");
+			}
+		});
+		const res = await send(handle.socketPath, {
+			method: "POST",
+			path: "/v1/tools/not-a-cli/install",
+			token: handle.token
+		});
+		expect(res.status).toBe(404);
+		expect(JSON.parse(res.text)).toEqual({ error: "unknown tool" });
+	});
+
+	it("without the bearer token is a bare 404 and never reaches the install", async () => {
+		const { handle } = await start({
+			installTool: () => {
+				throw new Error("must not be reached before auth");
+			}
+		});
+		const res = await send(handle.socketPath, {
+			method: "POST",
+			path: "/v1/tools/grok/install"
+		});
+		expect(res.status).toBe(404);
+		expect(res.text).toBe("");
+	});
+});
+
+describe("startLocalDriveServer - title runs", () => {
+	const titleBody = JSON.stringify({ cli: "grok", modelId: "grok-4.5", prompt: "name this" });
+
+	/**
+	 * Mirrors `TITLE_RUN_TIMEOUT_MS` in `drive-server.ts` (not exported: it is an internal budget). The
+	 * timeout case advances to either side of it, so a budget quietly widened to hours fails here.
+	 */
+	const TITLE_RUN_BUDGET_MS = 120_000;
+
+	it("connects an unconnected CLI headlessly, then runs the naming turn", async () => {
+		// The terminal lane spawns the user's own login with no LOCAL connection record, so the first
+		// naming on a fresh device arrives before any connection exists - the route must connect
+		// headlessly instead of dying on the executor's "Unknown connection".
+		const connects: string[] = [];
+		const fake = fakeSession({
+			async: (hooks, runId) => {
+				hooks.onEvent({
+					type: "run.event",
+					runId,
+					event: { type: "delta", text: "Pong question" }
+				});
+				hooks.onClose();
+			}
+		});
+		const { handle } = await start({
+			session: fake.session,
+			listConnections: () => [],
+			connectCli: async (toolId) => {
+				connects.push(toolId);
+				return { status: "connected", authHealth: "healthy" };
+			}
+		});
+		const res = await send(handle.socketPath, {
+			method: "POST",
+			path: "/v1/title",
+			token: handle.token,
+			body: titleBody
+		});
+		expect(res.status).toBe(200);
+		expect(JSON.parse(res.text)).toEqual({ text: "Pong question" });
+		expect(connects).toEqual(["grok"]);
+	});
+
+	it("a CLI that cannot connect answers null without starting a run", async () => {
+		const fake = fakeSession();
+		const { handle } = await start({
+			session: fake.session,
+			listConnections: () => [],
+			connectCli: async () => ({ status: "needs-login" })
+		});
+		const res = await send(handle.socketPath, {
+			method: "POST",
+			path: "/v1/title",
+			token: handle.token,
+			body: titleBody
+		});
+		expect(res.status).toBe(200);
+		expect(JSON.parse(res.text)).toEqual({ text: null });
+		expect(fake.started).toHaveLength(0);
+	});
+
+	it("an already-connected CLI is not re-probed", async () => {
+		const connects: string[] = [];
+		const fake = fakeSession({
+			async: (hooks, runId) => {
+				hooks.onEvent({ type: "run.event", runId, event: { type: "delta", text: "T" } });
+				hooks.onClose();
+			}
+		});
+		const { handle } = await start({
+			session: fake.session,
+			listConnections: () => [
+				{ toolId: "grok", authHealth: "healthy", images: false, documents: false }
+			],
+			connectCli: async (toolId) => {
+				connects.push(toolId);
+				return { status: "connected", authHealth: "healthy" };
+			}
+		});
+		const res = await send(handle.socketPath, {
+			method: "POST",
+			path: "/v1/title",
+			token: handle.token,
+			body: titleBody
+		});
+		expect(JSON.parse(res.text)).toEqual({ text: "T" });
+		expect(connects).toEqual([]);
+	});
+
+	/** The connection record every case below starts from, so the headless connect probe stays out of them. */
+	const connected = (): {
+		toolId: string;
+		authHealth: string;
+		images: boolean;
+		documents: boolean;
+	}[] => [
+		{ toolId: "grok", authHealth: "healthy", images: false, documents: false }
+	];
+
+	/** Posts the naming run and resolves with the whole response. */
+	const postTitle = (handle: LocalDriveHandle): ReturnType<typeof send> =>
+		send(handle.socketPath, {
+			method: "POST",
+			path: "/v1/title",
+			token: handle.token,
+			body: titleBody
+		});
+
+	it("joins the collected deltas into one answer, and answers null for an all-whitespace reply", async () => {
+		const streamed = fakeSession({
+			async: (hooks, runId) => {
+				for (const text of ["Ship ", "the ", "release"]) {
+					hooks.onEvent({ type: "run.event", runId, event: { type: "delta", text } });
+				}
+				hooks.onClose();
+			}
+		});
+		const { handle } = await start({ session: streamed.session, listConnections: connected });
+		expect(JSON.parse((await postTitle(handle)).text)).toEqual({ text: "Ship the release" });
+
+		// A model that answered with nothing but layout must NOT become the title: null is what tells the
+		// caller to keep the prefix name it already has, and `""` would blank the tab instead.
+		const blank = fakeSession({
+			async: (hooks, runId) => {
+				hooks.onEvent({ type: "run.event", runId, event: { type: "delta", text: "  " } });
+				hooks.onEvent({ type: "run.event", runId, event: { type: "delta", text: "\n" } });
+				hooks.onClose();
+			}
+		});
+		const { handle: h2 } = await start({ session: blank.session, listConnections: connected });
+		expect(JSON.parse((await postTitle(h2)).text)).toEqual({ text: null });
+	});
+
+	it("answers null once when the CLI refuses to start the naming run", async () => {
+		const refused = fakeSession({ refuse: "No CLI selected" });
+		const { handle } = await start({ session: refused.session, listConnections: connected });
+
+		const res = await postTitle(handle);
+		expect(res.status).toBe(200);
+		// One parse of the WHOLE body: a second answer on the same response would either throw
+		// ERR_HTTP_HEADERS_SENT server-side or trail a second document here.
+		expect(JSON.parse(res.text)).toEqual({ text: null });
+		expect(refused.started).toHaveLength(0);
+	});
+
+	it("answers EXACTLY once when the run both errors and closes", async () => {
+		// `error` answers and `onClose` answers, and a naming run reliably does both. Without the guard the
+		// second answer is an ERR_HTTP_HEADERS_SENT raised inside the run's own close hook - on the drive
+		// server, in the executor's callback, where nothing catches it.
+		const fake = fakeSession();
+		const { handle } = await start({ session: fake.session, listConnections: connected });
+		const pending = postTitle(handle);
+		await until(() => fake.started.length === 1);
+		expect(fake.started).toHaveLength(1);
+
+		const run = fake.started[0]!;
+		run.hooks.onEvent({
+			type: "run.event",
+			runId: run.runId,
+			event: { type: "error", message: "the CLI died" }
+		});
+		expect(() => run.hooks.onClose()).not.toThrow();
+
+		const res = await pending;
+		expect(res.status).toBe(200);
+		expect(JSON.parse(res.text)).toEqual({ text: null });
+	});
+
+	it("cancels the run and answers null once the naming turn outlives its budget", async () => {
+		// A naming run spends the user's OWN CLI subscription, so a run left going past the budget keeps
+		// billing them for a title nobody will ever read.
+		const fake = fakeSession();
+		const { handle } = await start({ session: fake.session, listConnections: connected });
+		// ONLY the two timer functions: `setImmediate` (the fake session's own scheduling) and the socket's
+		// I/O must keep running, or the request never reaches the route whose timer this case advances.
+		vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+		try {
+			const pending = postTitle(handle);
+			await until(() => fake.started.length === 1);
+			expect(fake.started).toHaveLength(1);
+
+			// Just short of the budget nothing has fired yet - so the assertion below is the TIMEOUT firing,
+			// not an eager cancel.
+			await vi.advanceTimersByTimeAsync(TITLE_RUN_BUDGET_MS - 1_000);
+			expect(fake.cancels).toEqual([]);
+
+			await vi.advanceTimersByTimeAsync(1_000);
+			const res = await pending;
+			expect(res.status).toBe(200);
+			expect(JSON.parse(res.text)).toEqual({ text: null });
+			expect(fake.cancels).toEqual([fake.started[0]!.runId]);
+
+			// The cancelled run still closes afterwards, and that late close must write nothing.
+			expect(() => fake.started[0]!.hooks.onClose()).not.toThrow();
+		} finally {
+			vi.useRealTimers();
+		}
 	});
 });
 
@@ -1206,6 +1665,74 @@ describe("startLocalDriveServer - chat streaming", () => {
 		await c.ended;
 	});
 
+	it("seeds the conversation's derived title BEFORE the run starts, so it lists immediately", async () => {
+		// The "my conversation disappeared" shape: a client that switches workspace seconds after sending
+		// leaves a title-less shell every list hides, while the run - and the salvage that will record it -
+		// is still going. The seed has to land BEFORE the run, which is why this reads the store from
+		// inside `startChat` rather than after the stream ends.
+		const dir = mkdtempSync(join(tmpdir(), "runner-drive-"));
+		const chats = createLocalChatStore(join(dir, "chats"));
+		const atStart: (LocalStoredChatSession | null)[] = [];
+		const fake = fakeSession({
+			sync: () => void atStart.push(chats.read("ns", "sess")),
+			async: (hooks) => hooks.onClose()
+		});
+		const { handle } = await start({ session: fake.session, chats });
+		const s = await openStream(handle.socketPath, {
+			path: "/v1/chat",
+			token: handle.token,
+			body: chatBody({ prompt: "how do I whistle" })
+		});
+		await s.ended;
+
+		expect(atStart).toHaveLength(1);
+		expect(atStart[0]?.title).toBe("how do I whistle");
+
+		const list = await send(handle.socketPath, {
+			method: "GET",
+			path: "/v1/chats?namespace=ns",
+			token: handle.token
+		});
+		expect(JSON.parse(list.text)).toEqual({
+			chats: [expect.objectContaining({ id: "sess", title: "how do I whistle" })]
+		});
+	});
+
+	it("still streams the turn when the title seed THROWS (the seed is best-effort)", async () => {
+		// A label write is not worth a turn. An unwritable sidecar costs this one conversation its shell
+		// title and nothing else - never a 500 on a turn the user is watching.
+		const dir = mkdtempSync(join(tmpdir(), "runner-drive-"));
+		const store = createLocalChatStore(join(dir, "chats"));
+		const chats: LocalChatStore = {
+			...store,
+			seedSession: () => {
+				throw new Error("unwritable sidecar");
+			}
+		};
+		const fake = fakeSession({
+			async: (hooks, runId) => {
+				hooks.onEvent({ type: "run.event", runId, event: { type: "delta", text: "hi" } });
+				hooks.onClose();
+			}
+		});
+		const { handle } = await start({ session: fake.session, chats });
+		const s = await openStream(handle.socketPath, {
+			path: "/v1/chat",
+			token: handle.token,
+			body: chatBody()
+		});
+		expect(s.status).toBe(200);
+		await s.ended;
+
+		expect(fake.started).toHaveLength(1);
+		expect(s.lines).toHaveLength(2);
+		expect(JSON.parse(s.lines[0]!).type).toBe("run.started");
+		expect(JSON.parse(s.lines[1]!)).toMatchObject({
+			type: "run.event",
+			event: { type: "delta", text: "hi" }
+		});
+	});
+
 	it("pOST /v1/runs/<runId>/cancel reaches the session and 202s", async () => {
 		const fake = fakeSession();
 		const { handle } = await start({ session: fake.session });
@@ -1452,6 +1979,21 @@ describe("startLocalDriveServer - validation", () => {
 		expect(res.status).toBe(400);
 	});
 
+	it("400s more than three attached documents (the per-turn cap)", async () => {
+		const { handle } = await start();
+		const documents = Array.from({ length: 4 }, () => ({
+			dataUrl: "data:application/pdf;base64,SlZC",
+			mediaType: "application/pdf"
+		}));
+		const res = await send(handle.socketPath, {
+			method: "POST",
+			path: "/v1/chat",
+			token: handle.token,
+			body: chatBody({ documents })
+		});
+		expect(res.status).toBe(400);
+	});
+
 	it("400s a PUT whose session.id does not match the path id", async () => {
 		const { handle } = await start();
 		const body = JSON.stringify({ namespace: "ns", session: chatSession({ id: "other" }) });
@@ -1539,6 +2081,30 @@ describe("startLocalDriveServer - advertised effort levels", () => {
 			(await send(socketPath, { method: "GET", path: "/v1/automations", token })).text
 		).automations;
 		expect(listed).toEqual([expect.objectContaining({ effort: "ultra" })]);
+	});
+
+	it("carries an adoption stamp through the PUT, the store and the list", async () => {
+		// A mirror of an org-shared definition is created over this exact wire, so the stamp has to
+		// survive all three hops. Losing it anywhere un-adopts the mirror silently: it keeps firing, but
+		// the app can no longer pair it with the definition and can never report that its author has
+		// rewritten the prompt this machine runs.
+		const { handle } = await start();
+		const { socketPath, token } = handle;
+		const created = await send(socketPath, {
+			method: "PUT",
+			path: "/v1/automations/new",
+			token,
+			body: automationBody({ sourceId: "def-1", sourceVersion: 4 })
+		});
+		expect(created.status).toBe(200);
+		expect(JSON.parse(created.text).automation).toMatchObject({
+			sourceId: "def-1",
+			sourceVersion: 4
+		});
+		const listed = JSON.parse(
+			(await send(socketPath, { method: "GET", path: "/v1/automations", token })).text
+		).automations;
+		expect(listed).toEqual([expect.objectContaining({ sourceId: "def-1", sourceVersion: 4 })]);
 	});
 
 	it("still 400s an EMPTY automation effort", async () => {
@@ -1846,6 +2412,69 @@ describe("startLocalDriveServer - built-in enabled override", () => {
 			(await send(socketPath, { method: "DELETE", path: "/v1/automations/digest", token })).status
 		).toBe(400);
 	});
+
+	it("refuses an enabled-override for a forced (toggleable: false) built-in, writing nothing", async () => {
+		const { handle } = await start({
+			config: configWith(builtInSpec({ enabled: true, toggleable: false }))
+		});
+		const { socketPath, token } = handle;
+
+		// The list says the switch is not the user's: `toggleable: false` rides the row so a client can
+		// drop the control rather than offer one this PUT refuses.
+		expect(
+			JSON.parse((await send(socketPath, { method: "GET", path: "/v1/automations", token })).text)
+				.automations
+		).toEqual([expect.objectContaining({ id: "digest", enabled: true, toggleable: false })]);
+
+		const refused = await send(socketPath, {
+			method: "PUT",
+			path: "/v1/automations/digest",
+			token,
+			body: JSON.stringify({ enabled: false })
+		});
+		expect(refused.status).toBe(400);
+
+		// And nothing was stored: a write accepted here and ignored at fire time is a switch that looks
+		// like it worked. The row still reads at the product's forced state.
+		expect(
+			JSON.parse((await send(socketPath, { method: "GET", path: "/v1/automations", token })).text)
+				.automations
+		).toEqual([expect.objectContaining({ id: "digest", enabled: true })]);
+	});
+
+	it("carries a PINNED cli/model onto a built-in row, so the app shows what it runs on", async () => {
+		const { handle } = await start({
+			config: configWith(builtInSpec({ cli: "claude-code", modelId: "opus" }))
+		});
+		expect(
+			JSON.parse(
+				(await send(handle.socketPath, { method: "GET", path: "/v1/automations", token: handle.token }))
+					.text
+			).automations
+		).toEqual([expect.objectContaining({ id: "digest", cli: "claude-code", modelId: "opus" })]);
+	});
+
+	it("omits a hidden built-in from the list while it stays addressable by id", async () => {
+		const { handle } = await start({
+			config: configWith(
+				builtInSpec({ id: "backfill", enabled: true, toggleable: false, hidden: true }),
+				builtInSpec({ id: "digest" })
+			)
+		});
+		const { socketPath, token } = handle;
+
+		// Only the visible one lists - hiding is a LIST decision, taken where the list is built.
+		expect(
+			JSON.parse((await send(socketPath, { method: "GET", path: "/v1/automations", token })).text)
+				.automations
+		).toEqual([expect.objectContaining({ id: "digest" })]);
+
+		// The hidden id still classifies as a BUILT-IN, so it is not mistaken for a user automation that
+		// could be edited or deleted: a delete answers the built-in refusal, never a silent 200.
+		expect(
+			(await send(socketPath, { method: "DELETE", path: "/v1/automations/backfill", token })).status
+		).toBe(400);
+	});
 });
 
 describe("startLocalDriveServer - automation cadences", () => {
@@ -1987,10 +2616,12 @@ describe("startLocalDriveServer - the projected next run", () => {
 		expect(byId.get(ran.id)?.nextRunAt).toBe(
 			new Date(now - 10 * 60_000 + 30 * 60_000).toISOString()
 		);
-		// A never-run one reads as due now, which is when it really fires.
+		// A never-run one projects ONE INTERVAL past its creation, which is when it really fires: a fresh
+		// automation deliberately waits a full window rather than spending a run the moment it is saved.
+		// Reading "now" here is how the list said "Next run now" on a row that would not run for 30 minutes.
 		const freshAt = Date.parse(byId.get(fresh.id)?.nextRunAt ?? "");
-		expect(freshAt).toBeGreaterThanOrEqual(now);
-		expect(freshAt).toBeLessThan(now + 60_000);
+		expect(freshAt).toBeGreaterThanOrEqual(now + 29 * 60_000);
+		expect(freshAt).toBeLessThan(now + 31 * 60_000);
 		// A cron automation reports the instant the runner armed.
 		expect(byId.get(armed.id)?.nextRunAt).toBe(new Date(armedAt).toISOString());
 		for (const automation of listed) {
@@ -3202,6 +3833,8 @@ describe("connected folders", () => {
 				appDataRoot: "/app-data",
 				home: "not-absolute",
 				codexHome: "/home/.codex",
+				grokHome: "/home/.grok",
+				opencodeDataHome: "/home/.local/share/opencode",
 				appData: "/home/AppData/Roaming",
 				localAppData: "/home/AppData/Local"
 			}
@@ -3302,5 +3935,147 @@ describe("connected folders", () => {
 			expect(res.status, method).toBe(404);
 			expect(res.text).toBe("");
 		}
+	});
+});
+
+describe("per-request MCP servers on POST /v1/chat (the app's product-tools seam)", () => {
+	it("passes validated loopback http servers through to startChat", async () => {
+		const fake = fakeSession({ async: (hooks) => hooks.onClose() });
+		const { handle } = await start({ session: fake.session });
+		const stream = await openStream(handle.socketPath, {
+			path: "/v1/chat",
+			token: handle.token,
+			body: chatBody({
+				mcpServers: { apptools: { type: "http", url: "http://127.0.0.1:43110/mcp" } }
+			})
+		});
+		await stream.ended;
+		expect(stream.status).toBe(200);
+		expect(fake.started).toHaveLength(1);
+		expect(fake.started[0]?.opts.mcpServers).toEqual({
+			apptools: { type: "http", url: "http://127.0.0.1:43110/mcp" }
+		});
+	});
+
+	it("passes NO mcpServers option at all when the request carries none", async () => {
+		const fake = fakeSession({ async: (hooks) => hooks.onClose() });
+		const { handle } = await start({ session: fake.session });
+		const stream = await openStream(handle.socketPath, {
+			path: "/v1/chat",
+			token: handle.token,
+			body: chatBody()
+		});
+		await stream.ended;
+		expect(fake.started[0]?.opts.mcpServers).toBeUndefined();
+	});
+
+	it("400s a stdio spec - arbitrary code execution stays refused on every request surface", async () => {
+		const fake = fakeSession();
+		const { handle } = await start({ session: fake.session });
+		const res = await send(handle.socketPath, {
+			method: "POST",
+			path: "/v1/chat",
+			token: handle.token,
+			body: chatBody({ mcpServers: { evil: { type: "stdio", command: "sh" } } })
+		});
+		expect(res.status).toBe(400);
+		expect(fake.started).toHaveLength(0);
+	});
+
+	it("400s a non-loopback url - anything remote belongs in the user's own mcp add store", async () => {
+		const fake = fakeSession();
+		const { handle } = await start({ session: fake.session });
+		for (const url of ["http://evil.example/mcp", "http://10.0.0.5/mcp", "file:///etc/passwd"]) {
+			const res = await send(handle.socketPath, {
+				method: "POST",
+				path: "/v1/chat",
+				token: handle.token,
+				body: chatBody({ mcpServers: { srv: { type: "http", url } } })
+			});
+			expect(res.status, url).toBe(400);
+		}
+		expect(fake.started).toHaveLength(0);
+	});
+});
+
+describe("startLocalDriveServer - app tools", () => {
+	/** The host's serve, as main publishes it. */
+	const SERVE = { name: "app-tools", url: "http://127.0.0.1:51789/mcp" };
+
+	it("registers the host's product-tools server, so the next unattended fire mounts it", async () => {
+		const appTools = createAppToolsRegistry();
+		const { handle } = await start({ appTools });
+		const res = await send(handle.socketPath, {
+			method: "PUT",
+			path: "/v1/app-tools",
+			token: handle.token,
+			body: JSON.stringify(SERVE)
+		});
+		expect(res.status).toBe(200);
+		expect(appTools.servers()).toEqual({ "app-tools": { type: "http", url: SERVE.url } });
+	});
+
+	it("withdraws the registration on DELETE, so a sign-out stops the fires mounting it", async () => {
+		const appTools = createAppToolsRegistry();
+		appTools.set(SERVE);
+		const { handle } = await start({ appTools });
+		const res = await send(handle.socketPath, {
+			method: "DELETE",
+			path: "/v1/app-tools",
+			token: handle.token
+		});
+		expect(res.status).toBe(200);
+		expect(appTools.servers()).toEqual({});
+	});
+
+	it("400s anything but a loopback http server, and registers nothing", async () => {
+		const appTools = createAppToolsRegistry();
+		const { handle } = await start({ appTools });
+		const bodies = [
+			JSON.stringify({ name: "app-tools", url: "http://evil.example/mcp" }),
+			JSON.stringify({ name: "app-tools", url: "http://10.0.0.5/mcp" }),
+			JSON.stringify({ name: "app tools", url: SERVE.url }),
+			JSON.stringify({ name: "app-tools", command: "/bin/sh", type: "stdio" }),
+			JSON.stringify({ name: "app-tools", url: SERVE.url, extra: 1 })
+		];
+		for (const body of bodies) {
+			const res = await send(handle.socketPath, {
+				method: "PUT",
+				path: "/v1/app-tools",
+				token: handle.token,
+				body
+			});
+			expect(res.status, body).toBe(400);
+		}
+		expect(appTools.servers()).toEqual({});
+	});
+
+	it("404s the route on a host that serves no app tools at all", async () => {
+		const { handle } = await start();
+		const put = await send(handle.socketPath, {
+			method: "PUT",
+			path: "/v1/app-tools",
+			token: handle.token,
+			body: JSON.stringify(SERVE)
+		});
+		const del = await send(handle.socketPath, {
+			method: "DELETE",
+			path: "/v1/app-tools",
+			token: handle.token
+		});
+		expect(put.status).toBe(404);
+		expect(del.status).toBe(404);
+	});
+
+	it("refuses an unauthenticated registration, like every other route", async () => {
+		const appTools = createAppToolsRegistry();
+		const { handle } = await start({ appTools });
+		const res = await send(handle.socketPath, {
+			method: "PUT",
+			path: "/v1/app-tools",
+			body: JSON.stringify(SERVE)
+		});
+		expect(res.status).toBe(404);
+		expect(appTools.servers()).toEqual({});
 	});
 });

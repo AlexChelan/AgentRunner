@@ -10,10 +10,13 @@ const srcDir = fileURLToPath(new URL("../src", import.meta.url));
 const fixturesDir = fileURLToPath(new URL("./fixtures", import.meta.url));
 
 /**
- * A stable content hash of every protocol source file: each file's `src`-relative path and its raw
- * bytes, in sorted path order. Sorted so a filesystem's directory order can never move the hash, and
- * path-prefixed so renaming a file is a change even when its contents are identical. Every file counts,
- * not just `.ts` - a data file added beside the schemas is wire surface too.
+ * A stable content hash of every protocol source file: each file's `src`-relative path and its
+ * line-ending-normalized bytes, in sorted path order. Sorted so a filesystem's directory order can
+ * never move the hash, and path-prefixed so renaming a file is a change even when its contents are
+ * identical. Every file counts, not just `.ts` - a data file added beside the schemas is wire surface
+ * too. CRLF collapses to LF before hashing because git on Windows checks sources out with CRLF by
+ * default (`core.autocrlf`), and a hash of raw bytes then differs per PLATFORM rather than per wire
+ * change - the recorded baseline is captured on LF, for which the normalization is the identity.
  *
  * @returns The hex sha256 digest of the whole `src/` tree.
  */
@@ -21,12 +24,12 @@ function hashProtocolSource(): string {
 	const hash = createHash("sha256");
 	const files = readdirSync(srcDir, { recursive: true, withFileTypes: true })
 		.filter((entry) => entry.isFile())
-		.map((entry) => relative(srcDir, join(entry.parentPath, entry.name)))
+		.map((entry) => relative(srcDir, join(entry.parentPath, entry.name)).replaceAll("\\", "/"))
 		.sort();
 	for (const file of files) {
 		hash.update(file);
 		hash.update("\0");
-		hash.update(readFileSync(join(srcDir, file)));
+		hash.update(readFileSync(join(srcDir, file), "utf8").replaceAll("\r\n", "\n"));
 		hash.update("\0");
 	}
 	return hash.digest("hex");
@@ -60,14 +63,21 @@ describe("protocol version baseline", () => {
 		expect(RUNNER_PROTOCOL_VERSION).toBe(baseline.version);
 	});
 
-	it("has a fixtures directory for every version up to the current one", () => {
-		// A bump that forgets to freeze its fixtures ships a version nothing pins the shape of.
+	it("freezes fixtures only for versions that have actually shipped", () => {
+		// The fixture layout is SPARSE (see `wire-fixtures.test.ts`): `v<N>/` holds only what version N
+		// CHANGED, and a version that changed no shape has no directory at all - v5 narrowed a constant,
+		// not a schema. So "a directory per version" is no longer the invariant; what still is, is that
+		// every directory names a version that exists, and that v1 (the base every walk-back ends at) is
+		// present. The per-version COMPLETENESS guard - a bump that forgot to freeze what it changed -
+		// lives in `wire-fixtures.test.ts`, which resolves every case for every version and fails by name.
 		const frozen = readdirSync(fixturesDir, { withFileTypes: true })
 			.filter((entry) => entry.isDirectory())
-			.map((entry) => entry.name)
-			.sort();
-		const expected = Array.from({ length: baseline.version }, (_, i) => `v${i + 1}`);
-		expect(frozen).toEqual(expected);
+			.map((entry) => Number(entry.name.replace(/^v/, "")));
+		expect(frozen).toContain(1);
+		const outOfRange = frozen.filter(
+			(version) => !Number.isInteger(version) || version < 1 || version > baseline.version
+		);
+		expect(outOfRange, `fixture directories above v${baseline.version}`).toEqual([]);
 	});
 
 	it("fails when src/** changed without a recorded baseline", () => {

@@ -64,6 +64,24 @@ describe("connection-snapshot bounds", () => {
 		expect(parsed.map((c) => c.toolId)).toEqual(["opencode", "codex"]);
 	});
 
+	it("rejects an unavailable reason past the wire bound, and drops only that entry", () => {
+		const long = "x".repeat(1000);
+		expect(
+			CliConnectionInfoSchema.safeParse({
+				toolId: "claude-code",
+				authHealth: "needs-reauth",
+				unavailableReason: long
+			}).success
+		).toBe(false);
+		// Same rule as the loose `toolId`: one over-long reason costs that CLI, never the snapshot.
+		expect(
+			CliConnectionsSchema.parse([
+				{ toolId: "claude-code", authHealth: "needs-reauth", unavailableReason: long },
+				{ toolId: "codex", authHealth: "healthy" }
+			])
+		).toEqual([{ toolId: "codex", authHealth: "healthy" }]);
+	});
+
 	it("publishes an entry-count ceiling for the consumer that persists the snapshot", () => {
 		// Bounding only the per-CLI models still let one device pin megabytes by reporting thousands of
 		// distinct tool ids; the registry truncates to this.

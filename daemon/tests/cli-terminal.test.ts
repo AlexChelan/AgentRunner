@@ -26,17 +26,47 @@ describe('cli routing - terminal', () => {
   it('"terminal --cli" rejects a CLI that cannot be driven interactively', async () => {
     const solo = tempAppData('terminal-cli')
     const state = await pairWithBearer(solo, 'https://termx.example')
-    // Any id outside the terminal set is refused; `opencode` is one (it left the connectable set on
-    // 2026-08-02 and was never spike-verified in INTERACTIVE mode either). The assertion is on the
-    // REFUSAL and the names it offers instead, not on this id in particular.
+    // Any id outside the terminal set is refused; `cursor` is one (no interactive argv builder exists
+    // for it). The assertion is on the REFUSAL and the names it offers instead, not on this id in
+    // particular.
     state.upsertConnection('https://termx.example', {
-      toolId: 'opencode',
+      toolId: 'cursor',
       source: 'reused',
       authHealth: 'healthy'
     })
-    await run(['terminal', '--cli', 'opencode'])
+    await run(['terminal', '--cli', 'cursor'])
     expect(out.exitCode).toBe(1)
     expect(out.stdout).toContain('claude-code, codex')
+  })
+
+  // grok and opencode ARE terminal-capable, but only the DESKTOP can connect them: the daemon can
+  // neither log them in nor dispatch to them. Its `--cli` allowlist is therefore the terminal set
+  // intersected with the connectable ids, so a daemon user is never offered a CLI this process
+  // cannot open.
+  it('"terminal --cli" refuses a desktop-only CLI and never names one in the daemon', async () => {
+    const solo = tempAppData('terminal-desktop-cli')
+    const url = 'https://termdesktop.example'
+    const state = await pairWithBearer(solo, url)
+    // Recorded as connected, so the refusal can only come from the allowlist - never from "not connected".
+    state.upsertConnection(url, { toolId: 'grok', source: 'reused', authHealth: 'healthy' })
+
+    await run(['terminal', '--cli', 'grok', '--url', url])
+    expect(out.exitCode).toBe(1)
+    expect(out.stdout).toContain('claude-code, codex')
+    expect(out.stdout).not.toContain('grok')
+    expect(out.stdout).not.toContain('opencode')
+  })
+
+  it('"terminal --cli codex" still passes the daemon allowlist', async () => {
+    const solo = tempAppData('terminal-codex-allowed')
+    const url = 'https://termcodex.example'
+    await pairWithBearer(solo, url)
+    // Nothing connected, so a codex that PASSES the allowlist falls through to the connect
+    // remediation instead of the "must be one of" refusal.
+    await run(['terminal', '--cli', 'codex', '--url', url])
+    expect(out.exitCode).toBe(1)
+    expect(out.stdout).toContain('codex is not connected')
+    expect(out.stdout).not.toContain('must be one of')
   })
 
   // The whole point of the store: a server the user added is on their CLI's MCP surface the next time

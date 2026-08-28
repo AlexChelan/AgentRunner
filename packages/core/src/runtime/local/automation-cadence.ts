@@ -122,19 +122,23 @@ export function nextCronOccurrenceMs(
 
 /**
  * The next fire instant to SHOW for an automation, in epoch milliseconds - a read-only list projection that
- * never arms anything. An interval automation that has NEVER run reads as `nowMs`, because a fresh interval
- * row is due on the next tick; one that has run projects from its last run, clamped to now so an overdue
- * automation reads as due rather than in the past. A cron automation reports the runner's armed instant when
- * it has one, else the next occurrence from now. Takes primitives so this module never imports the store.
+ * never arms anything. An interval automation projects one interval past its ANCHOR - its last run, or, before
+ * it has ever run, its creation - clamped to now so an overdue automation reads as due rather than in the
+ * past. That is the same anchor `computeAutomationWork` fires on, so a freshly created hourly automation
+ * reads "in about 60 minutes" and then fires then, instead of promising a run it has not scheduled. An
+ * automation with NEITHER anchor (a built-in spec, or a row from a build predating the creation stamp) reads
+ * as `nowMs`, matching the runner's rule of firing it on the next tick. A cron automation reports the runner's
+ * armed instant when it has one, else the next occurrence from now. Takes primitives so this module never
+ * imports the store.
  *
  * @param cadence - The automation's cadence.
- * @param state - Its last-run and armed-next-run instants, each absent when unset.
+ * @param state - Its creation, last-run and armed-next-run instants, each absent when unset.
  * @param nowMs - The current epoch milliseconds (read ONCE per list response by the caller).
  * @returns The instant to display, or `null` when a cron cadence cannot be projected.
  */
 export function displayNextRunAtMs(
 	cadence: AutomationCadence,
-	state: { lastRunAtMs?: number; armedNextRunAtMs?: number },
+	state: { lastRunAtMs?: number; armedNextRunAtMs?: number; createdAtMs?: number },
 	nowMs: number
 ): number | null {
 	if (cadence.cron !== undefined) {
@@ -145,7 +149,8 @@ export function displayNextRunAtMs(
 			return null;
 		}
 	}
-	return state.lastRunAtMs === undefined
+	const anchor = state.lastRunAtMs ?? state.createdAtMs;
+	return anchor === undefined
 		? nowMs
-		: Math.max(nowMs, state.lastRunAtMs + cadence.intervalMinutes * MS_PER_MINUTE);
+		: Math.max(nowMs, anchor + cadence.intervalMinutes * MS_PER_MINUTE);
 }

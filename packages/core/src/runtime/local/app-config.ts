@@ -25,6 +25,14 @@ export interface LocalAppConfig {
 	productName: string;
 	/** The buyer's system-prompt base, grounded further by {@link composeLocalRun}. */
 	instructions?: string;
+	/**
+	 * The instruction a run whose turn mounts the app's product tools carries, staged by the host from
+	 * its own buyer-editable prompt seam so the local lane speaks with the same voice as its server
+	 * lanes. Absent falls back to the engine's built-in wording - a run must never lose the nudge to a
+	 * host that has not staged one. An EMPTY string is the host's only way to say "send no nudge at
+	 * all", and suppresses it: a buyer who blanks the capability prompt gets silence, not English.
+	 */
+	toolsNudge?: string;
 	/** Pre-selected connection/tool id (e.g. `claude-code`) the local session defaults to. */
 	defaultCli?: string;
 	/** Pre-selected model id the local session defaults to. */
@@ -56,6 +64,17 @@ export interface LocalAppConfig {
 	 */
 	projectsEnabled?: boolean;
 	/**
+	 * The product's OUTWARD MCP server endpoint (`https://app.example.com/api/mcp`), staged only when the
+	 * buyer enabled it. A coding CLI opened in this app's terminal is given it as a SECOND MCP server
+	 * beside the loopback one, so the CLI can reach the product's own hosted tools - the account, the
+	 * data - rather than only what this machine serves.
+	 *
+	 * Endpoint only. The CLI performs its own OAuth against it on first connect (that is the whole point
+	 * of the Better Auth MCP server), so nothing here carries a token, and staging the URL grants nothing
+	 * on its own. Absent means the buyer switched the MCP server off, and no such entry is emitted.
+	 */
+	mcpServerUrl?: string;
+	/**
 	 * Built-in automation specs the product ships, already filtered to this surface by the renderer. Each is a
 	 * SPEC (its enabled is the default; the daemon store holds any user override). Validated per-element on
 	 * load: a malformed spec is dropped, never fatal, so one bad entry cannot brick the daemon boot.
@@ -64,11 +83,11 @@ export interface LocalAppConfig {
 }
 
 /**
- * A product-shipped built-in automation spec, staged into the app-config by the renderer. Unlike a user
- * automation it carries no per-fire cli/model - a local fire uses the app-config defaults - and its `enabled`
- * is only the DEFAULT (the daemon store holds any user enabled-override). Its fire cadence is the flat
- * {@link AutomationCadence} union: an interval of at least {@link MIN_INTERVAL_MINUTES}, or a cron expression
- * with an optional timezone.
+ * A product-shipped built-in automation spec, staged into the app-config by the renderer. Its `enabled` is
+ * normally only the DEFAULT (the daemon store holds any user enabled-override), and it carries a per-fire
+ * cli/model only when the product PINNED one - otherwise a local fire uses the app-config defaults. Its fire
+ * cadence is the flat {@link AutomationCadence} union: an interval of at least {@link MIN_INTERVAL_MINUTES},
+ * or a cron expression with an optional timezone.
  */
 export type BuiltInAutomationSpec = {
 	/** Stable id (the safe single-path-segment charset), the run state and enabled-override are keyed by. */
@@ -79,7 +98,40 @@ export type BuiltInAutomationSpec = {
 	prompt: string;
 	/** The DEFAULT enabled flag (a fresh install fires nothing until the user opts in). */
 	enabled: boolean;
+	/**
+	 * Whether the user may turn this automation on/off. Absent reads as true. `false` makes {@link enabled}
+	 * the FORCED state rather than a default: the drive server refuses an enabled-override for it and the
+	 * runner ignores one already on disk (see {@link effectiveBuiltInEnabled}).
+	 */
+	toggleable?: boolean;
+	/**
+	 * Whether the automation is kept OFF the drive's automations list. Absent reads as false. It changes
+	 * nothing about firing - the runner reads the staged specs directly - so a hidden automation runs
+	 * exactly as usual and simply never appears in the app's list.
+	 */
+	hidden?: boolean;
+	/** The connection/tool id the product PINNED this automation to; absent uses the app-config default. */
+	cli?: string;
+	/** The model id the product PINNED this automation to; absent uses the app-config default. */
+	modelId?: string;
 } & AutomationCadence;
+
+/**
+ * The enabled state a built-in actually runs at, given the workspace's stored override. A `toggleable: false`
+ * spec IGNORES the override outright: the product forced the state, so a stale (or hand-edited) override
+ * document must never re-decide it. Shared by the drive server's list projection and the runner's fire
+ * gate, so what the app SHOWS and what the daemon RUNS can never disagree.
+ *
+ * @param spec - The staged built-in spec.
+ * @param override - The workspace's stored enabled-override, or `undefined` when it holds none.
+ * @returns The effective enabled flag.
+ */
+export function effectiveBuiltInEnabled(
+	spec: BuiltInAutomationSpec,
+	override: boolean | undefined
+): boolean {
+	return spec.toggleable === false ? spec.enabled : (override ?? spec.enabled);
+}
 
 /**
  * Validates a {@link LocalAppConfig}. `productId` is pinned to a single path-safe segment - it becomes a
@@ -95,6 +147,7 @@ const LocalAppConfigSchema = z.object({
 		.refine((v) => !/^\.+$/.test(v), "productId must not be all dots"),
 	productName: z.string().min(1, "productName must not be empty"),
 	instructions: z.string().optional(),
+	toolsNudge: z.string().optional(),
 	defaultCli: z.string().optional(),
 	defaultModel: z.string().optional(),
 	fallbackCli: z.string().optional(),
@@ -105,6 +158,10 @@ const LocalAppConfigSchema = z.object({
 	maxChatsPerAgent: z.number().int().min(0).optional(),
 	projectScoped: z.boolean().optional(),
 	projectsEnabled: z.boolean().optional(),
+	// Pinned to an http(s) URL rather than any string: it becomes an MCP server endpoint a spawned CLI
+	// connects to, so a `file:`/`data:` value - or a path the CLI would resolve locally - must never reach
+	// one. A malformed value invalidates the config loudly instead of shipping a CLI a broken server.
+	mcpServerUrl: z.url({ protocol: /^https?$/ }).optional(),
 	automations: z.unknown().optional()
 });
 
@@ -115,6 +172,10 @@ const LocalAppConfigSchema = z.object({
  * `timezone` admitted only beside a cron, since an interval has no zone to be evaluated in. `cron` carries
  * the non-empty rule because {@link isValidCron} deliberately does not: the parser reads the empty string as
  * an every-minute expression, so a blank field would otherwise ship as a minutely fire.
+ *
+ * The buyer knobs (`toggleable`, `hidden`, `cli`, `modelId`) are declared here for one reason beyond
+ * validation: zod STRIPS unknown keys, so a field the host stages but this schema omits is silently dropped
+ * and the knob never reaches the daemon at all.
  */
 const BuiltInAutomationSpecSchema = z
 	.object({
@@ -140,7 +201,11 @@ const BuiltInAutomationSpecSchema = z
 			.min(1, "automation timezone must not be empty")
 			.refine(isValidTimeZone, "automation timezone must be a valid IANA timezone")
 			.optional(),
-		enabled: z.boolean()
+		enabled: z.boolean(),
+		toggleable: z.boolean().optional(),
+		hidden: z.boolean().optional(),
+		cli: z.string().min(1, "automation cli must not be empty").optional(),
+		modelId: z.string().min(1, "automation modelId must not be empty").optional()
 	})
 	.refine((v) => (v.intervalMinutes !== undefined) !== (v.cron !== undefined), {
 		message: "automation must set exactly one of intervalMinutes or cron"

@@ -80,6 +80,7 @@ const USAGE =
   '  terminal [<productId>] [--url <backend>]     open your CLI as an interactive session wired to your product\n' +
   '           [--cli claude-code|codex] [--model <id>]  (its tools, your MCP servers, its work folder)\n' +
   '           [--cwd <path>]                      run the session in one of YOUR folders instead\n' +
+  "           [--project <id>]                    include that project's shared integrations in the session's tools\n" +
   '  terminal --local --app-config <path>         open that session with no backend at all - composed on this device\n' +
   '  serve [--url <backend>] [--if-paired]        pair + connect a CLI if needed, then run the daemon\n' +
   '        [--enroll <code>]                      (--enroll: redeem a one-time enrollment code at boot instead of pairing)\n' +

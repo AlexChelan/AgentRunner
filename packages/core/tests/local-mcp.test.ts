@@ -202,7 +202,7 @@ describe("serveToolsOverHttp", () => {
 			expect(listed).toEqual(["record"]);
 			const result = await client.tools.record.execute?.(
 				{ note: "hello" },
-				{ toolCallId: "1", messages: [] }
+				{ toolCallId: "1", messages: [], context: undefined }
 			);
 			expect(executed).toEqual(["hello"]);
 			expect(JSON.stringify(result)).toContain("stored:hello");
@@ -235,7 +235,7 @@ describe("serveToolsOverHttp", () => {
 			expect(Object.keys(second.tools)).toEqual(["record"]);
 			const result = await second.tools.record.execute?.(
 				{ note: "again" },
-				{ toolCallId: "2", messages: [] }
+				{ toolCallId: "2", messages: [], context: undefined }
 			);
 			expect(JSON.stringify(result)).toContain("stored:again");
 		} finally {

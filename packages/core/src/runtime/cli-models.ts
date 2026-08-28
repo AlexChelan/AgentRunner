@@ -4,7 +4,7 @@ import type { RuntimeToolAdapter } from "../runtime-types";
 
 /**
  * Projects one adapter's model catalog to the shared picker wire shape
- * (`{ id, name, recommended?, effortLevels?, defaultEffort? }`). ONE projection, two surfaces: the
+ * (`{ id, name, recommended?, effortLevels?, defaultEffort?, contextWindow? }`). ONE projection, two surfaces: the
  * desktop reads it straight off the local drive (`GET /v1/tools/<toolId>/models`) and the web reads
  * the very same entries after the daemon reports them over the runner wire, so the two pickers can
  * never drift on what a CLI offers.
@@ -35,7 +35,11 @@ export async function listAdapterModels(
 			name: model.label ?? model.id,
 			...(model.recommended ? { recommended: true } : {}),
 			...(effortLevels ? { effortLevels: [...effortLevels] } : {}),
-			...(model.defaultEffort ? { defaultEffort: model.defaultEffort } : {})
+			...(model.defaultEffort ? { defaultEffort: model.defaultEffort } : {}),
+			// The registry's own window, carried rather than recomputed: it is what a chat surface divides
+			// its token count by, and a model whose catalog publishes none stays absent so the surface shows
+			// the count alone instead of a percentage of a guess.
+			...(model.contextWindow ? { contextWindow: model.contextWindow } : {})
 		};
 	});
 }

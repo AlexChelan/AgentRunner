@@ -13,6 +13,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { DESKTOP_CLI_IDS } from "@agentrunner/core-types";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { resolveToolBinary } from "../src/binaries";
 import {
@@ -104,6 +105,19 @@ function managedPath(toolId: string, platform: NodeJS.Platform): string {
 	const path = managedBinaryPath(baseDir, toolId, platform);
 	if (!path) throw new Error(`expected a managed binary path for ${toolId}`);
 	return path;
+}
+
+/** Whether this platform has the POSIX mode bits the install-root cases assert on. */
+const posix = process.platform !== "win32";
+
+/**
+ * Registers a case only on a platform with POSIX mode bits.
+ *
+ * @param name - The case title.
+ * @param body - The case body.
+ */
+function itPosix(name: string, body: () => Promise<void> | void): void {
+	if (posix) it(name, body);
 }
 
 describe("installCli - Claude Code (raw binary + checksum)", () => {
@@ -722,7 +736,7 @@ describe("installCli - managed-install path safety (symlink / TOCTOU)", () => {
 		);
 	});
 
-	it.skipIf(process.platform === "win32")(
+	itPosix(
 		"creates the managed install root private (0700) on non-Windows",
 		async () => {
 			await installCli(baseDir, "claude-code", () => {}, new AbortController().signal, undefined, {
@@ -736,7 +750,7 @@ describe("installCli - managed-install path safety (symlink / TOCTOU)", () => {
 		}
 	);
 
-	it.skipIf(process.platform === "win32")(
+	itPosix(
 		"tightens a PRE-EXISTING loose-permission install root to 0700 on non-Windows",
 		async () => {
 			// mkdirSync's `mode` applies only to dirs it creates; a `clis/<id>` left world-readable by a
@@ -966,6 +980,287 @@ describe("installCli - failure and lifecycle paths", () => {
 	});
 });
 
+describe("installCli - npm-package recipe (grok / opencode)", () => {
+	/** The npm the installer is told to find on PATH. */
+	const NPM = "/usr/local/bin/npm";
+
+	/** One recorded child run (the npm install, then the launcher's `--version` probe). */
+	interface Run {
+		bin: string;
+		args: string[];
+	}
+
+	/** Where an npm-recipe CLI's launcher shim lands under the managed tree. */
+	function npmBinDir(toolId: string): string {
+		return join(baseDir, "clis", toolId, "node_modules", ".bin");
+	}
+
+	/**
+	 * Install deps for an npm-recipe CLI: a stubbed `npm` resolution, a `runToolFn` that
+	 * MATERIALIZES what a real `npm install` leaves behind (the launcher shim in
+	 * `node_modules/.bin` plus the installed package's own manifest), and a fetch that fails the
+	 * test if the download path is ever taken. No real npm and no network.
+	 */
+	function npmDeps(
+		toolId: string,
+		over: {
+			platform?: NodeJS.Platform;
+			/** `null` installs no shim at all (npm "succeeded" but left no launcher). */
+			shimName?: string | null;
+			/** The `name` the installed manifest declares (a mismatch is the name-squat case). */
+			manifestName?: string;
+			version?: string;
+			installCode?: number;
+			/** What a failing npm wrote to stderr (the only place it reports E404/EACCES). */
+			installStderr?: string;
+			/** A failing npm that still left a launcher behind (a partial tree). */
+			partialOnFailure?: boolean;
+			/** Fired once `npm install` has written its tree: a cancel that lands mid-install. */
+			abortAfterInstall?: AbortController;
+			versionCode?: number;
+			versionStdout?: string;
+			/** `null` means npm is not on PATH. */
+			npmPath?: string | null;
+		} = {}
+	): {
+		deps: InstallDeps;
+		runs: Run[];
+		calls: Array<{ url: string }>;
+	} {
+		const spec = requireInstallSpec(toolId);
+		const recipe = spec.recipe;
+		if (recipe.kind !== "npm-package") throw new Error(`${toolId} is not an npm-package CLI`);
+		const platform = over.platform ?? "darwin";
+		const version = over.version ?? "1.2.3";
+		const runs: Run[] = [];
+		const { fetchFn, calls } = makeFetch([]);
+		const runToolFn = async (bin: string, args: string[]): Promise<ExecResult> => {
+			runs.push({ bin, args });
+			if (args[0] !== "install") {
+				return { code: over.versionCode ?? 0, stdout: over.versionStdout ?? `${spec.binary} ${version}` };
+			}
+			const code = over.installCode ?? 0;
+			if (code === 0 || over.partialOnFailure) {
+				const shim =
+					over.shimName === null
+						? null
+						: (over.shimName ?? (platform === "win32" ? `${spec.binary}.cmd` : spec.binary));
+				if (shim) {
+					mkdirSync(npmBinDir(toolId), { recursive: true });
+					writeFileSync(join(npmBinDir(toolId), shim), "#!/bin/sh\n");
+				}
+			}
+			if (code === 0) {
+				const pkgDir = join(baseDir, "clis", toolId, "node_modules", ...recipe.pkg.split("/"));
+				mkdirSync(pkgDir, { recursive: true });
+				writeFileSync(
+					join(pkgDir, "package.json"),
+					JSON.stringify({ name: over.manifestName ?? recipe.pkg, version })
+				);
+			}
+			// npm takes no signal, so a cancel can only ever land with the tree already on disk.
+			over.abortAfterInstall?.abort();
+			return { code, stdout: "", ...(over.installStderr ? { stderr: over.installStderr } : {}) };
+		};
+		return {
+			deps: {
+				fetchFn,
+				runToolFn,
+				platform,
+				arch: "arm64",
+				resolveBinaryFn: (name) =>
+					name === "npm" ? (over.npmPath === null ? null : (over.npmPath ?? NPM)) : null
+			},
+			runs,
+			calls
+		};
+	}
+
+	/** Runs a full npm-recipe install, returning what it ran. */
+	async function install(
+		toolId: string,
+		over: Parameters<typeof npmDeps>[1] = {},
+		version?: string
+	): Promise<{ runs: Run[]; calls: Array<{ url: string }>; progress: string[] }> {
+		const { deps, runs, calls } = npmDeps(toolId, over);
+		const progress: string[] = [];
+		await installCli(
+			baseDir,
+			toolId,
+			(l) => progress.push(l),
+			new AbortController().signal,
+			version,
+			deps
+		);
+		return { runs, calls, progress };
+	}
+
+	it("npm-installs the pinned package into the managed dir, then verifies the launcher", async () => {
+		const { runs, calls } = await install("grok");
+
+		// The registry name is fixed in code, and the managed dir is npm's --prefix, so nothing
+		// lands in the user's global node_modules.
+		expect(runs[0]).toEqual({
+			bin: NPM,
+			args: ["install", "@xai-official/grok@latest", "--prefix", join(baseDir, "clis", "grok")]
+		});
+		// The verify runs the launcher npm actually wrote, not a bare name off PATH.
+		expect(runs[1]).toEqual({ bin: join(npmBinDir("grok"), "grok"), args: ["--version"] });
+		expect(runs).toHaveLength(2);
+		// Never touches the binary-download path: no fetch, no checksum, no archive.
+		expect(calls).toHaveLength(0);
+	});
+
+	it("honors an explicit version pin instead of @latest", async () => {
+		const { runs } = await install("opencode", { version: "1.18.16" }, "1.18.16");
+		expect(runs[0]?.args).toEqual([
+			"install",
+			"opencode-ai@1.18.16",
+			"--prefix",
+			join(baseDir, "clis", "opencode")
+		]);
+	});
+
+	it("verifies the .cmd shim npm writes on Windows (never a .exe)", async () => {
+		const { runs } = await install("grok", { platform: "win32" });
+		expect(runs[1]?.bin).toBe(join(npmBinDir("grok"), "grok.cmd"));
+	});
+
+	it("fails with an actionable message when npm is not on PATH (and runs nothing)", async () => {
+		const { deps, runs } = npmDeps("grok", { npmPath: null });
+		await expect(
+			installCli(baseDir, "grok", () => {}, new AbortController().signal, undefined, deps)
+		).rejects.toThrow(/npm/i);
+		expect(runs).toHaveLength(0);
+	});
+
+	it("fails when npm install exits non-zero", async () => {
+		const { deps, runs } = npmDeps("grok", { installCode: 1 });
+		await expect(
+			installCli(baseDir, "grok", () => {}, new AbortController().signal, undefined, deps)
+		).rejects.toThrow(/npm install .* failed/i);
+		// Never probes a launcher that was never installed.
+		expect(runs).toHaveLength(1);
+	});
+
+	it("fails when npm reports success but leaves no launcher to resolve", async () => {
+		const { deps } = npmDeps("grok", { shimName: null });
+		await expect(
+			installCli(baseDir, "grok", () => {}, new AbortController().signal, undefined, deps)
+		).rejects.toThrow(/no grok launcher/i);
+	});
+
+	// The name-squat guard: `@vibe-kit/grok-cli` is a different package to the official
+	// `@xai-official/grok`, so what LANDED must carry exactly the name that was requested.
+	it("refuses a tree whose installed manifest names a different package", async () => {
+		const { deps, runs } = npmDeps("grok", { manifestName: "@vibe-kit/grok-cli" });
+		await expect(
+			installCli(baseDir, "grok", () => {}, new AbortController().signal, undefined, deps)
+		).rejects.toThrow(/@vibe-kit\/grok-cli/);
+		expect(runs).toHaveLength(1);
+	});
+
+	it("fails when the launcher's --version exits non-zero", async () => {
+		const { deps } = npmDeps("grok", { versionCode: 1 });
+		await expect(
+			installCli(baseDir, "grok", () => {}, new AbortController().signal, undefined, deps)
+		).rejects.toThrow(/failed to run/);
+	});
+
+	it("fails when --version does not report the version npm just installed", async () => {
+		const { deps } = npmDeps("grok", { versionStdout: "command not found" });
+		await expect(
+			installCli(baseDir, "grok", () => {}, new AbortController().signal, undefined, deps)
+		).rejects.toThrow(/did not report @xai-official\/grok@1\.2\.3/);
+	});
+
+	// A refusal that leaves the launcher on disk is a refusal in name only: `managedCliBinDirs`
+	// offers `node_modules/.bin` to the resolver unconditionally, so the very next `detect()` would
+	// find and RUN the tree this module just rejected - and `connect.ts` early-returns on a CLI that
+	// detects as installed, so it would never be replaced. Every post-npm failure must clean up.
+	describe("a refused install leaves nothing resolvable", () => {
+		const refusals: Array<{ name: string; over: Parameters<typeof npmDeps>[1] }> = [
+			{ name: "a squatted package name", over: { manifestName: "@vibe-kit/grok-cli" } },
+			{ name: "a launcher that will not run", over: { versionCode: 1 } },
+			{ name: "a version that is not the one installed", over: { versionStdout: "9.9.9" } },
+			{ name: "no launcher at all", over: { shimName: null } },
+			{
+				name: "a failed npm that left a partial tree",
+				over: { installCode: 1, partialOnFailure: true }
+			}
+		];
+
+		for (const { name, over } of refusals) {
+			it(`removes the npm tree after ${name}`, async () => {
+				const { deps } = npmDeps("grok", over);
+				await expect(
+					installCli(baseDir, "grok", () => {}, new AbortController().signal, undefined, deps)
+				).rejects.toThrow();
+
+				// Nothing the resolver can find, through the exact call every consumer makes.
+				expect(
+					resolveToolBinary("grok", {
+						candidates: [],
+						env: { PATH: "" },
+						platform: "darwin",
+						managedDirs: managedCliBinDirs(baseDir)
+					})
+				).toBeNull();
+				expect(existsSync(join(baseDir, "clis", "grok", "node_modules"))).toBe(false);
+			});
+		}
+
+		// A cancel is the ONE refusal npm cannot help with: it takes no signal, so it always runs to
+		// completion and writes its tree first. Rejecting the caller without deleting that tree would
+		// hand `managedCliBinDirs` an unverified install - which `detect()` then reports as installed,
+		// and which both install call sites early-return on, so it would never be replaced.
+		it("removes the npm tree after a cancel that lands once npm has already written it", async () => {
+			const controller = new AbortController();
+			const { deps } = npmDeps("grok", { abortAfterInstall: controller });
+			await expect(
+				installCli(baseDir, "grok", () => {}, controller.signal, undefined, deps)
+			).rejects.toThrow("Install cancelled");
+
+			// The caller is rejected the instant the signal fires, while the install's own cleanup runs
+			// on the microtasks behind it; one macrotask turn flushes those, so this reads settled state.
+			await new Promise((resolve) => setTimeout(resolve, 0));
+
+			expect(
+				resolveToolBinary("grok", {
+					candidates: [],
+					env: { PATH: "" },
+					platform: "darwin",
+					managedDirs: managedCliBinDirs(baseDir)
+				})
+			).toBeNull();
+			expect(existsSync(join(baseDir, "clis", "grok", "node_modules"))).toBe(false);
+		});
+	});
+
+	// npm reports E404/ETARGET/EACCES/network failures on STDERR and prints nothing to stdout, so a
+	// ten-minute install that fails must not fail silently.
+	it("reports npm's stderr as the reason the install failed", async () => {
+		const { deps } = npmDeps("grok", {
+			installCode: 1,
+			installStderr: "npm error code E404\nnpm error 404 Not Found - GET https://registry.npmjs.org/x"
+		});
+		await expect(
+			installCli(baseDir, "grok", () => {}, new AbortController().signal, undefined, deps)
+		).rejects.toThrow(/E404/);
+	});
+
+	it("resolves the npm launcher through the same resolver every consumer uses", async () => {
+		await install("grok");
+		const resolved = resolveToolBinary("grok", {
+			candidates: [],
+			env: { PATH: "" },
+			platform: "darwin",
+			managedDirs: managedCliBinDirs(baseDir)
+		});
+		expect(resolved).toBe(join(npmBinDir("grok"), "grok"));
+	});
+});
+
 describe("managed binary resolution", () => {
 	it("resolves the managed binary after a simulated install (managed dir is a candidate)", () => {
 		const binPath = managedPath("claude-code", "darwin");
@@ -1006,19 +1301,76 @@ describe("managed binary resolution", () => {
 		expect(managedPath("codex", "darwin")).toBe(join(baseDir, "clis", "codex", "codex"));
 		expect(managedPath("codex", "win32")).toBe(join(baseDir, "clis", "codex", "codex.exe"));
 	});
+
+	// `npm install --prefix <dir>` lands its launcher in `<dir>/node_modules/.bin`, as a bare shim
+	// on POSIX and a `.cmd` on Windows - never the `.exe` a downloaded binary uses.
+	it("points managedBinaryPath at node_modules/.bin for an npm-package CLI", () => {
+		expect(managedPath("grok", "darwin")).toBe(
+			join(baseDir, "clis", "grok", "node_modules", ".bin", "grok")
+		);
+		expect(managedPath("grok", "win32")).toBe(
+			join(baseDir, "clis", "grok", "node_modules", ".bin", "grok.cmd")
+		);
+	});
+
+	it("lists each CLI's own executable dir, by recipe", () => {
+		expect(managedCliBinDirs(baseDir)).toEqual([
+			join(baseDir, "clis", "claude-code"),
+			join(baseDir, "clis", "codex"),
+			join(baseDir, "clis", "grok", "node_modules", ".bin"),
+			join(baseDir, "clis", "opencode", "node_modules", ".bin")
+		]);
+	});
+
+	it("resolves a Windows .cmd launcher from the managed node_modules/.bin", () => {
+		const shim = managedPath("opencode", "win32");
+		mkdirSync(join(shim, ".."), { recursive: true });
+		writeFileSync(shim, "@echo off\n");
+
+		const resolved = resolveToolBinary("opencode", {
+			candidates: [],
+			env: { PATH: "" },
+			platform: "win32",
+			managedDirs: managedCliBinDirs(baseDir)
+		});
+		expect(resolved).toBe(shim);
+	});
 });
 
 describe("install metadata", () => {
-	it("knows the two coding CLIs and rejects others", () => {
-		expect(isInstallableCli("claude-code")).toBe(true);
-		expect(isInstallableCli("codex")).toBe(true);
+	// The installable set is the DESKTOP CLI set, NOT the dispatch allowlist: a desktop CLI runs on the
+	// operator's own machine under their own consent, so `grok` and `opencode` are installable here while
+	// staying off `CONNECTABLE_TOOL_IDS`. Pinned against `DESKTOP_CLI_IDS` so a CLI added to the desktop
+	// catalog without install metadata fails here instead of reaching a user as an uninstallable row.
+	it("covers exactly the desktop CLI set and rejects others", () => {
+		expect([...Object.keys(CLI_INSTALL_SPECS)].sort()).toEqual([...DESKTOP_CLI_IDS].sort());
+		for (const id of DESKTOP_CLI_IDS) expect(isInstallableCli(id)).toBe(true);
 		expect(isInstallableCli("anthropic")).toBe(false);
-		expect(Object.keys(CLI_INSTALL_SPECS)).toHaveLength(2);
 	});
 
 	it("defines each CLI vendor login subcommand", () => {
 		expect(CLI_INSTALL_SPECS["claude-code"]?.loginArgs).toEqual(["auth", "login"]);
 		expect(CLI_INSTALL_SPECS.codex?.loginArgs).toEqual(["login"]);
+		expect(CLI_INSTALL_SPECS.grok?.loginArgs).toEqual(["login"]);
+		expect(CLI_INSTALL_SPECS.opencode?.loginArgs).toEqual(["auth", "login"]);
+	});
+
+	// The recipe is what an install DISPATCHES on, and its npm package name is fixed in code here -
+	// never caller-supplied - so an install can only ever fetch one of these known sources.
+	it("marks the standalone-binary CLIs binary-download", () => {
+		expect(CLI_INSTALL_SPECS["claude-code"]?.recipe.kind).toBe("binary-download");
+		expect(CLI_INSTALL_SPECS.codex?.recipe.kind).toBe("binary-download");
+	});
+
+	it("pins the npm package of each npm-distributed CLI", () => {
+		expect(CLI_INSTALL_SPECS.grok?.recipe).toEqual({
+			kind: "npm-package",
+			pkg: "@xai-official/grok"
+		});
+		expect(CLI_INSTALL_SPECS.opencode?.recipe).toEqual({
+			kind: "npm-package",
+			pkg: "opencode-ai"
+		});
 	});
 
 	it("requireInstallSpec returns the spec for a managed id and throws otherwise", () => {
@@ -1028,18 +1380,19 @@ describe("install metadata", () => {
 });
 
 describe("removed CLIs", () => {
-	// OpenCode and Hermes were dropped from the dispatch allowlist on 2026-08-02 because their
-	// capability floor could not be enforced. Neither may retain an install path: a managed install
-	// is how a removed CLI would quietly come back.
-	it.each(["opencode", "hermes"])("never treats %s as installable", (id) => {
-		expect(isInstallableCli(id)).toBe(false);
-		expect(Object.hasOwn(CLI_INSTALL_SPECS, id)).toBe(false);
+	// Hermes was dropped on 2026-08-02 because its capability floor could not be enforced, and it never
+	// returned to any catalog. It may not retain an install path: a managed install is how a removed CLI
+	// would quietly come back. (OpenCode was dropped from the DISPATCH allowlist the same day and stays
+	// off it, but it is a desktop CLI again - see the install-metadata census above.)
+	it("never treats hermes as installable", () => {
+		expect(isInstallableCli("hermes")).toBe(false);
+		expect(Object.hasOwn(CLI_INSTALL_SPECS, "hermes")).toBe(false);
 	});
 
-	it.each(["opencode", "hermes"])("refuses to install %s without fetching anything", async (id) => {
+	it("refuses to install hermes without fetching anything", async () => {
 		const { fetchFn, calls } = makeFetch([]);
 		await expect(
-			installCli(baseDir, id, () => {}, new AbortController().signal, undefined, { fetchFn })
+			installCli(baseDir, "hermes", () => {}, new AbortController().signal, undefined, { fetchFn })
 		).rejects.toThrow(/not an installable CLI/);
 		expect(calls).toHaveLength(0);
 	});

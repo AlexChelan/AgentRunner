@@ -14,12 +14,15 @@ import type {
 import { realpathDeepest } from "../../src/path-containment";
 import {
 	codexHomeDir,
+	grokHomeDir,
 	localDataDir,
 	runtimeIdentityDir,
 	secretsDir
 } from "../../src/runtime/paths";
 import {
 	codexCredentialReadDenyPaths,
+	grokCredentialReadDenyPaths,
+	opencodeCredentialReadDenyPaths,
 	sensitiveHomeReadDenyPaths
 } from "../../src/runtime/read-deny";
 
@@ -36,6 +39,8 @@ function posixDeps(overrides: Partial<ConnectedFolderDenyDeps> = {}): ConnectedF
 		appDataRoot: APP_DATA_ROOT,
 		home: HOME,
 		codexHome: join(HOME, ".codex"),
+		grokHome: join(HOME, ".grok"),
+		opencodeDataHome: join(HOME, ".local", "share", "opencode"),
 		appData: join(HOME, "AppData", "Roaming"),
 		localAppData: join(HOME, "AppData", "Local"),
 		platform: "darwin",
@@ -50,6 +55,8 @@ function win32Deps(overrides: Partial<ConnectedFolderDenyDeps> = {}): ConnectedF
 		appDataRoot: "C:\\Users\\Tester\\AppData\\Roaming\\Runner",
 		home: "C:\\Users\\Tester",
 		codexHome: "C:\\Users\\Tester\\.codex",
+		grokHome: "C:\\Users\\Tester\\.grok",
+		opencodeDataHome: "C:\\Users\\Tester\\.local\\share\\opencode",
 		appData: "C:\\Users\\Tester\\AppData\\Roaming",
 		localAppData: "C:\\Users\\Tester\\AppData\\Local",
 		platform: "win32",
@@ -92,6 +99,31 @@ describe("connectedFolderDenyEntries", () => {
 		expect(redirected.map((entry) => entry.path)).toContain("/opt/codex-home");
 	});
 
+	it("covers every grokCredentialReadDenyPaths entry, plus an injected $GROK_HOME that differs", () => {
+		const deps = posixDeps({ grokHome: process.env.GROK_HOME ?? join(HOME, ".grok") });
+		const paths = connectedFolderDenyEntries(deps).map((entry) => entry.path);
+		for (const denied of grokCredentialReadDenyPaths(APP_DATA_ROOT, HOME)) {
+			expect(paths).toContain(denied);
+		}
+		// The default location is covered whatever the environment says.
+		expect(paths).toContain(join(HOME, ".grok"));
+		expect(paths).toContain(grokHomeDir(APP_DATA_ROOT));
+		const redirected = connectedFolderDenyEntries(posixDeps({ grokHome: "/opt/grok-home" }));
+		expect(redirected.map((entry) => entry.path)).toContain("/opt/grok-home");
+	});
+
+	it("covers the opencode DATA home, plus an injected $XDG_DATA_HOME that differs", () => {
+		const deps = posixDeps({ opencodeDataHome: opencodeCredentialReadDenyPaths(HOME)[0] ?? "" });
+		const paths = connectedFolderDenyEntries(deps).map((entry) => entry.path);
+		for (const denied of opencodeCredentialReadDenyPaths(HOME)) expect(paths).toContain(denied);
+		// The default location is covered whatever the environment says.
+		expect(paths).toContain(join(HOME, ".local", "share", "opencode"));
+		const redirected = connectedFolderDenyEntries(
+			posixDeps({ opencodeDataHome: "/opt/data/opencode" })
+		);
+		expect(redirected.map((entry) => entry.path)).toContain("/opt/data/opencode");
+	});
+
 	it("adds the curated write/persistence set the read list never covered, as a platform UNION", () => {
 		// Built with darwin deps, yet the Linux and Windows entries are present: an entry that does not
 		// exist on this OS is inert, exactly like the read list.
@@ -129,8 +161,10 @@ describe("connectedFolderDenyEntries", () => {
 			"APP_DATA",
 			"CODEX_CREDENTIALS",
 			"CREDENTIAL_STORE",
+			"GROK_CREDENTIALS",
 			"HOME_SENSITIVE",
 			"LOCAL_DATA",
+			"OPENCODE_CREDENTIALS",
 			"PERSISTENCE",
 			"RUNTIME_IDENTITY",
 			"SECRETS"
@@ -142,11 +176,21 @@ describe("connectedFolderDenyEntries", () => {
 		const entries = connectedFolderDenyEntries(posixDeps());
 		const codex = entries.filter((entry) => entry.path === join(HOME, ".codex"));
 		expect(codex).toEqual([{ code: "CODEX_CREDENTIALS", path: join(HOME, ".codex") }]);
+		const grok = entries.filter((entry) => entry.path === join(HOME, ".grok"));
+		expect(grok).toEqual([{ code: "GROK_CREDENTIALS", path: join(HOME, ".grok") }]);
 	});
 });
 
 describe("connectedFolderDenyEntries: fail-closed on a misconfigured root", () => {
-	const roots = ["appDataRoot", "home", "codexHome", "appData", "localAppData"] as const;
+	const roots = [
+		"appDataRoot",
+		"home",
+		"codexHome",
+		"grokHome",
+		"opencodeDataHome",
+		"appData",
+		"localAppData"
+	] as const;
 
 	for (const root of roots) {
 		it(`throws rather than silently mis-classifying when ${root} is empty`, () => {
@@ -180,7 +224,10 @@ describe("refuseConnectedFolder: every class, equal / under / ancestor", () => {
 		{ code: "SECRETS", entry: secretsDir(APP_DATA_ROOT) },
 		{ code: "RUNTIME_IDENTITY", entry: runtimeIdentityDir(APP_DATA_ROOT) },
 		{ code: "CODEX_CREDENTIALS", entry: codexHomeDir(APP_DATA_ROOT) },
+		{ code: "GROK_CREDENTIALS", entry: grokHomeDir(APP_DATA_ROOT) },
 		{ code: "APP_DATA", entry: APP_DATA_ROOT },
+		{ code: "GROK_CREDENTIALS", entry: join(HOME, ".grok") },
+		{ code: "OPENCODE_CREDENTIALS", entry: join(HOME, ".local", "share", "opencode") },
 		{ code: "HOME_SENSITIVE", entry: join(HOME, ".ssh") },
 		{ code: "PERSISTENCE", entry: join(HOME, "Library", "LaunchAgents") },
 		{ code: "CREDENTIAL_STORE", entry: join(deps.localAppData, "Microsoft", "Credentials") }
@@ -490,6 +537,8 @@ describe("refuseConnectedFolder: canonicalization through symlinks", () => {
 			appDataRoot: join(linkedHome, "Library", "Application Support", "Runner"),
 			home: linkedHome,
 			codexHome: join(linkedHome, ".codex"),
+			grokHome: join(linkedHome, ".grok"),
+			opencodeDataHome: join(linkedHome, ".local", "share", "opencode"),
 			appData: join(linkedHome, "AppData", "Roaming"),
 			localAppData: join(linkedHome, "AppData", "Local")
 		};

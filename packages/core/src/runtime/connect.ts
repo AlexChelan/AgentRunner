@@ -12,6 +12,8 @@ import {
 import { makeDrivers } from "../drivers";
 import type { CodexContainment } from "../drivers";
 import type { AgentRuntimeRegistry, AuthStatus, ConnectionRef, DetectResult } from "../index";
+import { isDesktopCliId } from "@agentrunner/core-types";
+import type { DesktopCliId } from "@agentrunner/core-types";
 import { CONNECTABLE_TOOL_IDS, isConnectableToolId } from "@agentrunner/protocol";
 import type { AuthHealth, ConnectableToolId } from "@agentrunner/protocol";
 import type { CliConnection, StateStore } from "./storage/state-store";
@@ -52,15 +54,22 @@ function subscriptionConnection(toolId: string): ConnectionRef {
  * a nonzero exit onto NOT-authenticated, so a fake `code: 0` would report every installed CLI as
  * healthy even when the user is not signed in. Injectable so a test can drive a nonzero probe.
  *
+ * `cliIds` is a SEPARATE positional argument rather than a field on `opts`, because `opts` is the
+ * container-identity contract asserted whole (`toEqual`) by the daemon's own suite - an extra key
+ * there would read as a containment change. It defaults to {@link CONNECTABLE_TOOL_IDS}, so the
+ * daemon keeps its dispatch-only registry while the desktop app passes its wider local CLI set.
+ *
  * @param baseDir - The managed-CLI base directory under the app-data root.
  * @param run - The tool runner (defaults to the real no-shell {@link runTool}).
  * @param opts - Host containment, forwarded to the drivers. Omit it off a container.
+ * @param cliIds - The CLI ids to build adapters for (defaults to {@link CONNECTABLE_TOOL_IDS}).
  * @returns The agent-runtime registry.
  */
 export function buildRunnerRegistry(
 	baseDir: string,
 	run: (bin: string, args: string[]) => Promise<{ code: number; stdout: string }> = runTool,
-	opts?: RunnerContainment
+	opts?: RunnerContainment,
+	cliIds: readonly string[] = CONNECTABLE_TOOL_IDS
 ): AgentRuntimeRegistry {
 	const managedDirs = managedCliBinDirs(baseDir);
 	return buildAgentRuntimeRegistry({
@@ -68,6 +77,7 @@ export function buildRunnerRegistry(
 		loadApiKey: () => null,
 		listRegistryModels: (provider) => fetchModelRegistry({ provider }),
 		runTool: run,
+		cliIds,
 		// Only a contained host overrides the drivers; every other caller keeps the registry's own
 		// default drivers, so the containerized path adds nothing to a desktop install.
 		...(opts
@@ -228,7 +238,34 @@ function finishConnected(
 	return { kind, toolId, authHealth };
 }
 
-/** Persists a per-CLI connection record under the backend. */
+/**
+ * Persists a per-CLI connection record under the backend.
+ *
+ * SECURITY INVARIANT, stated here because this is the FUNNEL every interactive and headless connect
+ * reaches the state store through: **a connection recorded under a non-local (backend) scope must name a
+ * CLI in `CONNECTABLE_TOOL_IDS`.** A run's capability floor is derived from its scope -
+ * `floored = !isLocalScope(backendKey)` in `run-context-builder` - so a desktop-only CLI recorded under a
+ * backend scope would become dispatchable and FLOORED, and neither grok nor opencode can enforce a floor
+ * (no sandbox, no read-deny; see their adapters' `enforcesNetworkOff: false`). That is the shape of the
+ * 2026-08-02 incident, where a floored run read `~/.ssh` key material.
+ *
+ * The invariant is distributed across three writers, none of which may be relaxed alone:
+ * - `connect-runner.ts` (`handle`) - the WIRE-driven connect, the only path a paired backend can trigger.
+ *   It re-validates `isConnectableToolId` and skips anything else.
+ * - `runConnect` above - the operator's own `runner connect`, which narrows `targets` to
+ *   `CONNECTABLE_TOOL_IDS` whether a single `only` id or the default set.
+ * - `backend-session.ts` (the auth re-persist) - refreshes `authHealth` on records that already exist, so
+ *   it can only rewrite an id one of the two above already admitted; it mints none.
+ *
+ * The TRUE backstop is not any of these, though: every `buildRunnerRegistry` call in `apps/runner` takes
+ * the narrow default `cliIds`, so even a connection that somehow reached a backend scope resolves NO
+ * runtime adapter and the run fails closed with "no runtime adapter for this tool". These checks are the
+ * belt; that default is the braces. `desktop-only-proof` in `tests/fence.test.ts` pins the set itself.
+ *
+ * The DESKTOP drive server deliberately records under the LOCAL scope with the wider `isDesktopCliId`
+ * gate - that is the whole point of the split, and it is safe precisely because local scope is never
+ * floored.
+ */
 function recordConnection(
 	deps: Pick<ConnectDeps, "state" | "backendUrl">,
 	conn: CliConnection
@@ -298,16 +335,24 @@ export type HeadlessConnectOutcome =
  * that is already signed in records and connects in the same instruction. A connection is recorded
  * ONLY on `connected` (D-C6). Never throws.
  *
- * @param toolId - The connectable tool id.
+ * The gate is the DESKTOP catalog ({@link isDesktopCliId}), not the narrower cloud-dispatch allowlist:
+ * this connect drives a CLI on the operator's own machine, so a desktop-only tool belongs here.
+ *
+ * @param toolId - The desktop CLI id.
  * @param deps - The registry, base dir, state store, backend url, and optional diagnostic sink.
  * @param opts - Whether to managed-install a missing installable CLI.
  * @returns The typed headless connect outcome.
  */
 export async function connectHeadless(
-	toolId: ConnectableToolId,
+	toolId: DesktopCliId,
 	deps: HeadlessConnectDeps,
 	opts: { install: boolean }
 ): Promise<HeadlessConnectOutcome> {
+	// A RUNTIME check, not just the type: an id can arrive from stored state or a wire payload the type
+	// never saw. It answers exactly what an adapterless tool answers - a clean informational failure the
+	// picker renders, never a throw a route would have to turn into a 500.
+	if (!isDesktopCliId(toolId))
+		return { status: "failed", toolId, reason: "no runtime adapter for this tool" };
 	const log = deps.log ?? ((): void => undefined);
 	const adapter = deps.registry.getAdapter(toolId);
 	if (!adapter) return { status: "failed", toolId, reason: "no runtime adapter for this tool" };

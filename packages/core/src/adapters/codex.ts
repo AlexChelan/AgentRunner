@@ -35,6 +35,14 @@ const CAPABILITIES: AdapterCapabilities = {
 	// Codex's SDK has no per-action approval hook; it runs a static safe posture.
 	interactiveApproval: false,
 	subscriptionRequiresDisclosure: false,
+	// The app-server's `turn/start` input array takes native `image` items beside the prompt text, so an
+	// attachment reaches the model as an image - no file written, nothing to clean up.
+	images: true,
+	// TRUE BY FALLBACK: the `turn/start` input array has `text` and `image` items and no document item
+	// of any kind, so the driver stages each PDF and names its path in the prompt for Codex's own file
+	// tool to open. A different mechanism from images on the same CLI, which is why the two flags are
+	// separate rather than one "attachments" boolean.
+	documents: true,
 	// Codex is the ONE adapter that can OS-enforce network-off: its SDK sets
 	// `networkAccessEnabled: false`, so a `network: 'off'` run is genuinely blocked.
 	enforcesNetworkOff: true,
@@ -107,6 +115,8 @@ export function createCodexAdapter(deps: CodexAdapterDeps): RuntimeToolAdapter {
 				start: ({ binaryPath, apiKey, signal }) =>
 					deps.driver({
 						prompt: prependSystemPrompt(req.systemPrompt, req.prompt),
+						...(req.images && req.images.length > 0 ? { images: req.images } : {}),
+						...(req.documents && req.documents.length > 0 ? { documents: req.documents } : {}),
 						cwd: req.cwd,
 						model: req.modelId,
 						apiKey,
@@ -125,7 +135,7 @@ export function createCodexAdapter(deps: CodexAdapterDeps): RuntimeToolAdapter {
 						...(req.denyReadPaths ? { denyReadPaths: req.denyReadPaths } : {}),
 						// Isolated CODEX_HOME for a headless run (config.toml with NO personal MCP servers; auth
 						// symlinked). Absent = the user's own ~/.codex (the interactive terminal keeps its config).
-						...(req.codexHome ? { codexHome: req.codexHome } : {}),
+						...(req.configHome ? { configHome: req.configHome } : {}),
 						...(req.conversationId ? { resume: req.conversationId } : {}),
 						signal
 					})

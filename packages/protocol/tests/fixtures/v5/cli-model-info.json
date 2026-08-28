@@ -1,7 +1,0 @@
-{
-  "id": "openrouter:anthropic/claude-fable-5",
-  "name": "Claude Fable 5",
-  "recommended": true,
-  "effortLevels": ["low", "medium", "high", "xhigh"],
-  "defaultEffort": "medium"
-}

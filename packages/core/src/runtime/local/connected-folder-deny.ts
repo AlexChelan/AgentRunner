@@ -30,7 +30,7 @@ import { posix as posixPath, win32 as win32Path } from "node:path";
 // Imported from the leaf module rather than the package barrel: the Electron MAIN process is one of the
 // four callers, and the barrel would drag the whole runner graph (the AI SDK included) in behind it.
 import { realpathDeepest } from "../../path-containment";
-import { codexHomeDir, localDataDir, runtimeIdentityDir, secretsDir } from "../paths";
+import { codexHomeDir, grokHomeDir, localDataDir, runtimeIdentityDir, secretsDir } from "../paths";
 import { sensitiveHomeReadDenyPaths } from "../read-deny";
 
 /**
@@ -45,6 +45,8 @@ export type ConnectedFolderRefusalCode =
 	| "RUNTIME_IDENTITY"
 	| "HOME_SENSITIVE"
 	| "CODEX_CREDENTIALS"
+	| "GROK_CREDENTIALS"
+	| "OPENCODE_CREDENTIALS"
 	| "PERSISTENCE"
 	| "CREDENTIAL_STORE";
 
@@ -84,8 +86,8 @@ export interface ConnectedFolderVerdict {
 /**
  * The roots the protected set is built from. ALL of them are injected so the four call sites provably
  * compute ONE set: `%APPDATA%`/`%LOCALAPPDATA%` are env-relative (a roaming or redirected Windows profile
- * puts them off `home` entirely), and `$CODEX_HOME` is env-relative too, so the caller resolves each
- * env-first with a home-based fallback ONCE and passes the answer here.
+ * puts them off `home` entirely), and `$CODEX_HOME`, `$GROK_HOME` and `$XDG_DATA_HOME` are env-relative
+ * too, so the caller resolves each env-first with a home-based fallback ONCE and passes the answer here.
  */
 export interface ConnectedFolderDenyDeps {
 	/** The runner's app-data root (`appDataDir()`). */
@@ -94,6 +96,14 @@ export interface ConnectedFolderDenyDeps {
 	readonly home: string;
 	/** The user's real Codex home: `$CODEX_HOME` if set, else `~/.codex`. */
 	readonly codexHome: string;
+	/** The user's real Grok home: `$GROK_HOME` if set, else `~/.grok`. */
+	readonly grokHome: string;
+	/**
+	 * The user's real opencode DATA home (where its `auth.json` provider logins live):
+	 * `$XDG_DATA_HOME/opencode` if that variable is set and non-empty, else `~/.local/share/opencode`.
+	 * NOT the config base - the runner repoints only the config base, so the credential stays here.
+	 */
+	readonly opencodeDataHome: string;
 	/** Windows roaming app data: `%APPDATA%` if set, else `~/AppData/Roaming`. Inert off Windows. */
 	readonly appData: string;
 	/** Windows local app data: `%LOCALAPPDATA%` if set, else `~/AppData/Local`. Inert off Windows. */
@@ -143,10 +153,12 @@ function assertAbsolute(path: string, name: string, p: PlatformPath): void {
  * The full protected set: every folder (or file) a project may never be bound to on this device.
  *
  * Read sets unioned: the app-data root and its `local/`, `secrets/` and `runtime/` subtrees, every
- * {@link sensitiveHomeReadDenyPaths} entry, and the Codex credential homes (the injected real one, the
- * default `~/.codex`, and the runner-managed isolated home - a superset of
- * {@link codexCredentialReadDenyPaths} for any caller that resolved `codexHome` env-first, computed here
- * from the injected root instead so this module reads no environment).
+ * {@link sensitiveHomeReadDenyPaths} entry, and EVERY coding CLI's credential homes (the injected real one,
+ * the default location, and the runner-managed isolated home where one exists - a superset of
+ * {@link codexCredentialReadDenyPaths}, {@link grokCredentialReadDenyPaths} and
+ * {@link opencodeCredentialReadDenyPaths} for any caller that resolved those roots env-first, computed here
+ * from the injected root instead so this module reads no environment). A grant is not per-CLI, so unlike the
+ * read lists there is no "except its own" carve-out: no project may be bound to any of them.
  *
  * Curated write set unioned on top - the deliberate divergence from the read list documented at the top
  * of this module.
@@ -165,11 +177,13 @@ function assertAbsolute(path: string, name: string, p: PlatformPath): void {
 export function connectedFolderDenyEntries(
 	deps: ConnectedFolderDenyDeps
 ): ConnectedFolderDenyEntry[] {
-	const { appDataRoot, home, codexHome, appData, localAppData } = deps;
+	const { appDataRoot, home, codexHome, grokHome, opencodeDataHome, appData, localAppData } = deps;
 	const p = pathFor(deps.platform ?? process.platform);
 	assertAbsolute(appDataRoot, "appDataRoot", p);
 	assertAbsolute(home, "home", p);
 	assertAbsolute(codexHome, "codexHome", p);
+	assertAbsolute(grokHome, "grokHome", p);
+	assertAbsolute(opencodeDataHome, "opencodeDataHome", p);
 	assertAbsolute(appData, "appData", p);
 	assertAbsolute(localAppData, "localAppData", p);
 	const entries: ConnectedFolderDenyEntry[] = [
@@ -178,11 +192,23 @@ export function connectedFolderDenyEntries(
 		{ code: "SECRETS", path: secretsDir(appDataRoot) },
 		{ code: "RUNTIME_IDENTITY", path: runtimeIdentityDir(appDataRoot) },
 		{ code: "CODEX_CREDENTIALS", path: codexHomeDir(appDataRoot) },
+		{ code: "GROK_CREDENTIALS", path: grokHomeDir(appDataRoot) },
 		{ code: "APP_DATA", path: appDataRoot },
 		// The user's Codex login: the injected real home plus the default location, so a caller whose
 		// `$CODEX_HOME` differs from ours still cannot bind either.
 		{ code: "CODEX_CREDENTIALS", path: codexHome },
 		{ code: "CODEX_CREDENTIALS", path: p.join(home, ".codex") },
+		// The user's Grok login, the same way: `~/.grok/auth.json` holds the x.ai OAuth tokens, and the
+		// runner-managed home above links to (or on a contained/Windows host copies) that very file.
+		{ code: "GROK_CREDENTIALS", path: grokHome },
+		{ code: "GROK_CREDENTIALS", path: p.join(home, ".grok") },
+		// The user's opencode login. Only the DATA home is listed, and there is no runner-managed
+		// counterpart to list beside it: opencode's isolation repoints the CONFIG base alone, so no
+		// credential is ever copied or symlinked into the app-data root (and the config base that IS there
+		// carries no credential and is already covered by `APP_DATA`). opencode resolves this path with no
+		// platform branch, so the `~/.local/share` fallback is the right default on macOS and Windows too.
+		{ code: "OPENCODE_CREDENTIALS", path: opencodeDataHome },
+		{ code: "OPENCODE_CREDENTIALS", path: p.join(home, ".local", "share", "opencode") },
 		...sensitiveHomeReadDenyPaths(home).map(
 			(path): ConnectedFolderDenyEntry => ({ code: "HOME_SENSITIVE", path })
 		),

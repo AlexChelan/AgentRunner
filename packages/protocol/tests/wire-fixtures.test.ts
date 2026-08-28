@@ -1,4 +1,4 @@
-import { readdirSync, readFileSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
@@ -28,6 +28,7 @@ import {
 	PollResponseSchema,
 	ReasoningEffortSchema,
 	RunConversationMsgSchema,
+	RunDocumentSchema,
 	RunEventEnvelopeSchema,
 	RunImageSchema,
 	RUNNER_PROTOCOL_VERSION,
@@ -67,26 +68,61 @@ const fixturesDir = fileURLToPath(new URL("./fixtures/", import.meta.url));
  * The frozen protocol versions, oldest first. The LAST entry is the version this source tree speaks
  * ({@link RUNNER_PROTOCOL_VERSION}); every earlier entry is a permanent baseline.
  *
- * RULE 4: a directory under `tests/fixtures/` is APPEND-ONLY. Once a version ships, no file in its
- * directory is ever edited or deleted - those bytes are what some daemon in the field actually sends,
- * and this suite is the only thing that proves the current schema still accepts them.
+ * RULE 4: a version's frozen bytes are APPEND-ONLY. Once a version ships, the bytes {@link loadFixture}
+ * resolves for it are never edited, because those bytes are what some daemon in the field actually
+ * sends and this suite is the only thing that proves the current schema still accepts them.
+ *
+ * The LAYOUT is sparse: `v<N>/` holds only the fixtures version N actually CHANGED, and everything else
+ * is inherited by walking back to the newest version at or below N that froze the file. Editing a file
+ * therefore rewrites history for EVERY later version that inherits it - which is why rule 4 is stated
+ * about the resolved bytes rather than about one directory.
  */
-const FROZEN_VERSIONS = [1, 2, 3, 4, 5, 6, 7] as const;
+const FROZEN_VERSIONS = [1, 2, 3, 4, 5, 6, 7, 8, 9] as const;
 
 /**
- * Reads and JSON-parses a wire fixture from a version's fixture directory.
+ * The path a version reads a fixture from: its own directory when that version froze the file, else the
+ * newest earlier version that did. `null` when no version at or below it ever froze one.
+ *
+ * @param version - The protocol version asking.
+ * @param file - The fixture filename (for example `run-start.json`).
+ * @returns The absolute path, or `null` when the file is unknown at this version.
+ */
+function resolveFixture(version: number, file: string): string | null {
+	for (let v = version; v >= 1; v--) {
+		const path = join(fixturesDir, `v${v}`, file);
+		if (existsSync(path)) return path;
+	}
+	return null;
+}
+
+/**
+ * Reads and JSON-parses the wire fixture a version resolves for `file`.
  *
  * @param version - The protocol version whose frozen shape is wanted.
  * @param file - The fixture filename (for example `run-start.json`).
  * @returns The parsed JSON value, before any schema validation.
+ * @throws When no version at or below `version` froze the file.
  */
 function loadFixture(version: number, file: string): unknown {
-	return JSON.parse(readFileSync(join(fixturesDir, `v${version}`, file), "utf8"));
+	const path = resolveFixture(version, file);
+	if (path === null) throw new Error(`no fixture for ${file} at or below v${version}`);
+	return JSON.parse(readFileSync(path, "utf8"));
 }
 
-/** Every fixture filename present for a version (so a version may freeze a subset). */
+/**
+ * Every fixture filename a version resolves - what it froze itself PLUS everything it inherits.
+ *
+ * @param version - The protocol version asking.
+ * @returns The effective fixture set at that version.
+ */
 function fixtureFiles(version: number): Set<string> {
-	return new Set(readdirSync(join(fixturesDir, `v${version}`)));
+	const files = new Set<string>();
+	for (let v = 1; v <= version; v++) {
+		const dir = join(fixturesDir, `v${v}`);
+		if (!existsSync(dir)) continue;
+		for (const file of readdirSync(dir)) files.add(file);
+	}
+	return files;
 }
 
 /**
@@ -143,6 +179,10 @@ const cases: ReadonlyArray<{ schema: z.ZodType; name: string; file: string; sinc
 		since: 3
 	},
 	{ schema: RunImageSchema, name: "RunImageSchema", file: "run-image.json" },
+	// v9's additive document attachment. `since: 9` rather than a backfill into v1-v8: those directories
+	// are the permanent record of what those versions really put on the wire, and no daemon below v9 ever
+	// sent a document.
+	{ schema: RunDocumentSchema, name: "RunDocumentSchema", file: "run-document.json", since: 9 },
 	{ schema: ToolResultSchema, name: "ToolResultSchema", file: "tool-result.json" },
 	{ schema: ToolCallSchema, name: "ToolCallSchema", file: "tool-call.json" },
 	{
@@ -164,7 +204,25 @@ const cases: ReadonlyArray<{ schema: z.ZodType; name: string; file: string; sinc
 		file: "cli-connection-info.models.json",
 		since: 3
 	},
+	// The additive availability mark, frozen as its own file rather than added to either entry above:
+	// both of those are the record of a snapshot reported before this field existed, and they must keep
+	// decoding with nothing injected. Same shape as `models` and `contextWindow`.
+	{
+		schema: CliConnectionInfoSchema,
+		name: "CliConnectionInfoSchema",
+		file: "cli-connection-info.unavailable-reason.json",
+		since: 9
+	},
 	{ schema: CliModelInfoSchema, name: "CliModelInfoSchema", file: "cli-model-info.json", since: 3 },
+	// The additive `contextWindow`, frozen as its own file rather than added to the v3 entry above: that
+	// one is the record of a catalog reported before the field existed, and it must keep decoding with
+	// nothing injected. Both halves are pinned, exactly as the additive `models` field is.
+	{
+		schema: CliModelInfoSchema,
+		name: "CliModelInfoSchema",
+		file: "cli-model-info.window.json",
+		since: 8
+	},
 	{
 		schema: ConnectInstructionSchema,
 		name: "ConnectInstructionSchema",
@@ -490,6 +548,49 @@ describe("connectable tool id set", () => {
 	// closed. Old daemons keep reporting them; the backend simply will not dispatch to them.
 	it("freezes CONNECTABLE_TOOL_IDS to its v5 value", () => {
 		expect(CONNECTABLE_TOOL_IDS).toEqual(["claude-code", "codex"]);
+	});
+});
+
+describe("sparse fixture resolution", () => {
+	// The walk-back IS the freeze under a sparse layout, so it is asserted directly rather than only
+	// through the 800-odd cases that ride on it. A resolution that silently fell through to the wrong
+	// directory would still parse - and would quietly re-freeze a version against another version's bytes.
+	it("reads a version's own directory when that version froze the file", () => {
+		// v9 is the version that changed `run-start` (it added the document attachment).
+		expect(resolveFixture(9, "run-start.json")).toBe(join(fixturesDir, "v9", "run-start.json"));
+		expect(resolveFixture(9, "run-document.json")).toBe(
+			join(fixturesDir, "v9", "run-document.json")
+		);
+	});
+
+	it("walks back to the newest earlier version that froze the file", () => {
+		// `tool-call.json` was last changed at v2, so every version from v2 up must read v2's bytes -
+		// v5 has no directory at all, and must still resolve.
+		for (const version of [2, 3, 4, 5, 6, 7, 8, 9]) {
+			expect(resolveFixture(version, "tool-call.json")).toBe(
+				join(fixturesDir, "v2", "tool-call.json")
+			);
+		}
+		// ...and v1 keeps its own, older bytes rather than borrowing v2's.
+		expect(resolveFixture(1, "tool-call.json")).toBe(join(fixturesDir, "v1", "tool-call.json"));
+		expect(loadFixture(1, "tool-call.json")).not.toEqual(loadFixture(2, "tool-call.json"));
+	});
+
+	it("resolves nothing for a shape no version at or below it froze", () => {
+		// `run-document.json` arrived at v9; v8 must not inherit it from anywhere.
+		expect(resolveFixture(8, "run-document.json")).toBeNull();
+		expect(fixtureFiles(8).has("run-document.json")).toBe(false);
+		expect(fixtureFiles(9).has("run-document.json")).toBe(true);
+	});
+
+	it("inherits every unchanged shape, so a version's effective set never shrinks", () => {
+		// The regression a sparse layout could introduce: a version reading FEWER shapes than the one
+		// before it, which would make this suite pass by testing less.
+		for (const version of FROZEN_VERSIONS.slice(1)) {
+			const previous = fixtureFiles(version - 1);
+			const current = fixtureFiles(version);
+			expect([...previous].filter((file) => !current.has(file))).toEqual([]);
+		}
 	});
 });
 

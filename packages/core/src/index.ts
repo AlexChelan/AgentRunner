@@ -41,6 +41,7 @@ export {
 } from "./cli-install";
 
 export type {
+	CliInstallRecipe,
 	CliInstallSpec,
 	CliLoginCommand,
 	ExtractArchive,
@@ -94,8 +95,10 @@ export {
 export {
 	claudeTerminalArgs,
 	codexTerminalArgs,
+	grokTerminalArgs,
 	isSafeTerminalToolName,
 	isTerminalCliId,
+	opencodeTerminalArgs,
 	TERMINAL_CLI_IDS,
 	TERMINAL_TOOL_NAME_PATTERN
 } from "./terminal-args";

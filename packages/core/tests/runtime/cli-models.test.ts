@@ -63,6 +63,19 @@ describe("listAdapterModels", () => {
 		]);
 	});
 
+	it("carries a model's context window through, and omits an unpublished one", async () => {
+		// The window rides to both pickers, where a chat composer divides its token count by it. Dropped
+		// here, the desktop's local lane shows a bare count with nothing to compare it against.
+		const models: ModelInfo[] = [
+			{ id: "sized", source: "registry", contextWindow: 200_000 },
+			{ id: "unsized", source: "tool" }
+		];
+		expect(await listAdapterModels(adapter({ listModels: async () => models }))).toEqual([
+			{ id: "sized", name: "sized", contextWindow: 200_000 },
+			{ id: "unsized", name: "unsized" }
+		]);
+	});
+
 	it("lets a model's OWN advertised ladder win over the adapter's declared floor", async () => {
 		const capabilities: AdapterCapabilities = {
 			...CAPS,
@@ -238,5 +251,23 @@ describe("toConnectionStatus", () => {
 			{ toolId: "hermes", authHealth: "healthy" },
 			{ toolId: "codex", authHealth: "needs-reauth" }
 		]);
+	});
+
+	it("drops the availability mark too - the poll query is what this projection exists to bound", () => {
+		// `unavailableReason` follows the `models` precedent deliberately: `stream-client.ts` URL-encodes
+		// this result into the stream URL on every reconnect, and a 200-char tail per CLI is the exact
+		// cost the projection was introduced to avoid. Every reader takes it from the durable device
+		// record instead. A future field added to `CliConnectionInfo` and casually threaded through here
+		// would re-open that.
+		expect(
+			toConnectionStatus([
+				{
+					toolId: "claude-code",
+					authHealth: "needs-reauth",
+					models: [{ id: "m1", name: "M1" }],
+					unavailableReason: "needs-reauth: sign in again"
+				}
+			])
+		).toEqual([{ toolId: "claude-code", authHealth: "needs-reauth" }]);
 	});
 });

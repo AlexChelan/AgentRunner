@@ -32,7 +32,7 @@ describe("mcpServersToToolsWith", () => {
 		const client = fakeClient();
 		const { tools } = await mcpServersToToolsWith(servers, () => client);
 		expect(Object.keys(tools)).toEqual(["search"]);
-		await tools.search.execute?.({ q: "hi" }, { toolCallId: "1", messages: [] });
+		await tools.search.execute?.({ q: "hi" }, { toolCallId: "1", messages: [], context: undefined });
 		expect(client.callTool).toHaveBeenCalledWith({ name: "search", arguments: { q: "hi" } });
 	});
 
@@ -58,8 +58,8 @@ describe("mcpServersToToolsWith", () => {
 		};
 		const { tools } = await mcpServersToToolsWith(two, () => clients[i++]);
 		expect(Object.keys(tools).sort()).toEqual(["b_search", "search"]);
-		await tools.search.execute?.({ q: "first" }, { toolCallId: "1", messages: [] });
-		await tools.b_search.execute?.({ q: "second" }, { toolCallId: "2", messages: [] });
+		await tools.search.execute?.({ q: "first" }, { toolCallId: "1", messages: [], context: undefined });
+		await tools.b_search.execute?.({ q: "second" }, { toolCallId: "2", messages: [], context: undefined });
 		expect(clients[0].callTool).toHaveBeenCalledWith({ name: "search", arguments: { q: "first" } });
 		expect(clients[1].callTool).toHaveBeenCalledWith({
 			name: "search",

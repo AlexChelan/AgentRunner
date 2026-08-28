@@ -13,7 +13,10 @@ import type {
 	AdvertisedModel,
 	AdvertisedModelLister,
 	AgenticDriverMessage,
-	CommonAdapterDeps
+	BinaryProbe,
+	CommonAdapterDeps,
+	ExecResult,
+	RunTool
 } from "./types";
 
 /**
@@ -98,7 +101,7 @@ export interface BinaryProbeMemoOptions<T> {
  * @returns A probe that resolves the binary path and serves the empty value when discovery is unavailable.
  */
 export function memoizeBinaryProbe<T>(
-	probe: ((params: { binaryPath: string }) => Promise<T>) | undefined,
+	probe: BinaryProbe<T> | undefined,
 	options: BinaryProbeMemoOptions<T>
 ): (binaryPath: string | null) => Promise<T> {
 	const now = options.now ?? Date.now;
@@ -202,6 +205,32 @@ export function emitDriverMessage(
  * @param name - The binary name to resolve (e.g. `'claude'`).
  * @returns The detect result (installed flag, version, and resolved path).
  */
+/**
+ * A model lister (or any list-returning probe) over a RESOLVED binary: run the CLI with `args`, parse its
+ * stdout, and DEGRADE TO `[]` on anything else - a missing binary, a foreign CLI version, a non-zero exit
+ * or a thrown spawn all leave the adapter on its registry/fallback catalog.
+ *
+ * @param runTool - The adapter's binary runner.
+ * @param args - The probe's argv (without the binary itself).
+ * @param parse - Turns the probe's stdout into the list.
+ * @returns A probe over the resolved binary path.
+ */
+export function makeStdoutProbe<T>(
+	runTool: RunTool,
+	args: string[],
+	parse: (stdout: string) => T[]
+): BinaryProbe<T[]> {
+	return async ({ binaryPath }): Promise<T[]> => {
+		try {
+			const { code, stdout } = await runTool(binaryPath, args);
+			if (code !== 0) return [];
+			return parse(stdout);
+		} catch {
+			return [];
+		}
+	};
+}
+
 export async function detectBinary(deps: CommonAdapterDeps, name: string): Promise<DetectResult> {
 	const path = deps.resolveBinary(name);
 	if (!path) return { installed: false };
@@ -244,6 +273,19 @@ export interface SubscriptionStatusCopy {
 	failDetail: string;
 	/** Thrown-error message when the status probe itself fails to run (non-evidence). */
 	errorDetail: string;
+	/**
+	 * Reads signed-in OFF THE PROBE'S STDOUT instead of its exit code, for a CLI whose status command
+	 * exits 0 either way. Grok is that CLI: `grok inspect --json` exits 0 signed OUT and carries no
+	 * auth-state field at all, and `grok models` prints `You are not authenticated.` / `You are logged
+	 * in with <provider>.` and exits 0 for both. An exit-code check against either would report
+	 * healthy forever and let a signed-out connection fail only mid-turn.
+	 *
+	 * Return `undefined` when the output matches NEITHER shape (an offline probe, a foreign CLI
+	 * version, a reworded message). That is NON-EVIDENCE, so the check throws and the caller keeps the
+	 * connection's last-known health - exactly as a spawn failure does. Absent leaves the exit-code
+	 * path, which is correct for a CLI (Codex) whose status command really does exit non-zero.
+	 */
+	readStdout?: (stdout: string) => boolean | undefined;
 }
 
 /**
@@ -270,16 +312,21 @@ export async function subscriptionStatusCheck(
 	// connection's last-known health. Only a status command that actually RAN and reported signed-out
 	// (nonzero exit) returns `authenticated: false` and legitimately flips a connection to needs-reauth.
 	if (!path) throw new Error(copy.notInstalledDetail);
+	let result: ExecResult;
 	try {
-		const { code } = await deps.runTool(path, copy.statusArgs);
-		return {
-			authenticated: code === 0,
-			mode: "subscription",
-			detail: code === 0 ? copy.okDetail : copy.failDetail
-		};
+		result = await deps.runTool(path, copy.statusArgs);
 	} catch {
 		throw new Error(copy.errorDetail);
 	}
+	// A CLI whose status command exits 0 either way is read from its OUTPUT instead. An output that
+	// matches neither shape is non-evidence and throws, same as a spawn failure (see `readStdout`).
+	const signedIn = copy.readStdout ? copy.readStdout(result.stdout) : result.code === 0;
+	if (signedIn === undefined) throw new Error(copy.errorDetail);
+	return {
+		authenticated: signedIn,
+		mode: "subscription",
+		detail: signedIn ? copy.okDetail : copy.failDetail
+	};
 }
 
 /** Context an adapter receives to start its driver for one run. */

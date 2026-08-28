@@ -2,6 +2,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import type { ConnectionRef } from "@agentrunner/core";
+import type { RunImage } from "@agentrunner/protocol";
 import { createCodexAdapter } from "../src/adapters/codex";
 import type { CodexAdapterDeps } from "../src/adapters/codex";
 import type { AgenticCliDriverParams, AgenticDriverMessage } from "../src/adapters/types";
@@ -76,16 +77,16 @@ describe("codex adapter", () => {
 		expect(capturedMcp).toEqual({ appTools: { type: "http", url: "http://127.0.0.1:1/t/mcp" } });
 	});
 
-	it("threads the run codexHome into the driver params (isolated CODEX_HOME)", async () => {
+	it("threads the run configHome into the driver params (isolated CODEX_HOME)", async () => {
 		let capturedHome: string | undefined;
 		const a = makeAdapter({
 			async *driver(params: AgenticCliDriverParams) {
-				capturedHome = params.codexHome;
+				capturedHome = params.configHome;
 				yield { kind: "done" };
 			}
 		});
 		const sink = collect();
-		a.run({ ...baseReq, codexHome: "/iso/codex-home" }, ctx, resolvers, sink.emit);
+		a.run({ ...baseReq, configHome: "/iso/codex-home" }, ctx, resolvers, sink.emit);
 		await vi.waitFor(() => expect(sink.events.at(-1)?.type).toBe("done"));
 		expect(capturedHome).toBe("/iso/codex-home");
 	});
@@ -130,6 +131,37 @@ describe("codex adapter", () => {
 		a.run({ ...baseReq, conversationId: "thread-7" }, ctx, resolvers, sink.emit);
 		await vi.waitFor(() => expect(sink.events.at(-1)?.type).toBe("done"));
 		expect(capturedResume).toBe("thread-7");
+	});
+
+	it("threads a turn's images into the driver params", async () => {
+		// The adapter is the seam that decides whether an attachment reaches the driver at all; dropping
+		// it here would leave the composer offering an attach control whose images go nowhere.
+		let captured: RunImage[] | undefined;
+		const images: RunImage[] = [{ dataUrl: "data:image/png;base64,AAAA", mediaType: "image/png" }];
+		const a = makeAdapter({
+			async *driver(params: AgenticCliDriverParams) {
+				captured = params.images;
+				yield { kind: "done" };
+			}
+		});
+		const sink = collect();
+		a.run({ ...baseReq, images }, ctx, resolvers, sink.emit);
+		await vi.waitFor(() => expect(sink.events.at(-1)?.type).toBe("done"));
+		expect(captured).toEqual(images);
+	});
+
+	it("passes no images key for a text-only turn", async () => {
+		let seen = false;
+		const a = makeAdapter({
+			async *driver(params: AgenticCliDriverParams) {
+				seen = "images" in params;
+				yield { kind: "done" };
+			}
+		});
+		const sink = collect();
+		a.run(baseReq, ctx, resolvers, sink.emit);
+		await vi.waitFor(() => expect(sink.events.at(-1)?.type).toBe("done"));
+		expect(seen).toBe(false);
 	});
 
 	it("emits a conversation driver message as a conversation event", async () => {

@@ -14,16 +14,10 @@ import type {
 	ClaudeDriverParams
 } from "../src/adapters/types";
 import { forwardOverride, makeDrivers, sdkExecutableOverride } from "../src/drivers";
-import type { ClaudeQuery, SpawnFn } from "../src/drivers";
+import { drain, fakeSpawn } from "./support/driver-fakes";
+import type { ClaudeQuery } from "../src/drivers";
 
 const cwd = join(tmpdir(), "drivers-x");
-
-/** Drains an async-iterable driver into an array of normalized messages. */
-async function drain(driver: AsyncIterable<AgenticDriverMessage>): Promise<AgenticDriverMessage[]> {
-	const out: AgenticDriverMessage[] = [];
-	for await (const m of driver) out.push(m);
-	return out;
-}
 
 function claudeParams(over: Partial<ClaudeDriverParams> = {}): ClaudeDriverParams {
 	return {
@@ -192,6 +186,103 @@ describe("claudeDriver", () => {
 					content: [
 						{ type: "text", text: "describe this" },
 						{ type: "image", source: { type: "base64", media_type: "image/png", data: "QUJD" } }
+					]
+				}
+			}
+		]);
+	});
+
+	it("sends base64 document content blocks when PDFs are attached, titled by filename", async () => {
+		// Anthropic's own PDF channel, so Claude Code never has to go open a file for one. The title is the
+		// user's filename, which is how the model matches the attachment to what their text calls it.
+		const capture: { prompt?: string | AsyncIterable<unknown> } = {};
+		const query = fakeQuery(
+			[
+				{
+					type: "result",
+					subtype: "success",
+					session_id: "s",
+					usage: { input_tokens: 0, output_tokens: 0 }
+				}
+			],
+			capture
+		);
+		const { claudeDriver } = makeDrivers({ query });
+		await drain(
+			claudeDriver(
+				claudeParams({
+					prompt: "summarize",
+					documents: [
+						{
+							dataUrl: "data:application/pdf;base64,SlZCRQ==",
+							mediaType: "application/pdf",
+							name: "q3.pdf"
+						}
+					]
+				})
+			)
+		);
+		const messages: unknown[] = [];
+		for await (const message of capture.prompt as AsyncIterable<unknown>) messages.push(message);
+		expect(messages).toEqual([
+			{
+				type: "user",
+				parent_tool_use_id: null,
+				message: {
+					role: "user",
+					content: [
+						{ type: "text", text: "summarize" },
+						{
+							type: "document",
+							source: { type: "base64", media_type: "application/pdf", data: "SlZCRQ==" },
+							title: "q3.pdf"
+						}
+					]
+				}
+			}
+		]);
+	});
+
+	it("carries images AND documents on one turn, each as its own block kind", async () => {
+		const capture: { prompt?: string | AsyncIterable<unknown> } = {};
+		const query = fakeQuery(
+			[
+				{
+					type: "result",
+					subtype: "success",
+					session_id: "s",
+					usage: { input_tokens: 0, output_tokens: 0 }
+				}
+			],
+			capture
+		);
+		const { claudeDriver } = makeDrivers({ query });
+		await drain(
+			claudeDriver(
+				claudeParams({
+					prompt: "",
+					images: [{ dataUrl: "data:image/png;base64,QUJD", mediaType: "image/png" }],
+					documents: [
+						{ dataUrl: "data:application/pdf;base64,SlZCRQ==", mediaType: "application/pdf" }
+					]
+				})
+			)
+		);
+		const messages: unknown[] = [];
+		for await (const message of capture.prompt as AsyncIterable<unknown>) messages.push(message);
+		// An attachment-only turn sends NO empty text block, exactly as the image-only turn already did.
+		expect(messages).toEqual([
+			{
+				type: "user",
+				parent_tool_use_id: null,
+				message: {
+					role: "user",
+					content: [
+						{ type: "image", source: { type: "base64", media_type: "image/png", data: "QUJD" } },
+						{
+							type: "document",
+							source: { type: "base64", media_type: "application/pdf", data: "SlZCRQ==" }
+						}
 					]
 				}
 			}
@@ -522,6 +613,27 @@ describe("claudeDriver", () => {
 		]);
 	});
 
+	it("yields nothing once the run is cancelled (teardown is not a failure)", async () => {
+		// The SDK hands over whatever it has already queued, so a cancelled run that keeps reading
+		// would replay a whole finished turn after the user pressed Stop.
+		const capture: { options?: unknown } = {};
+		const query = fakeQuery(
+			[
+				{
+					type: "result",
+					subtype: "success",
+					session_id: "sess-cancelled",
+					usage: { input_tokens: 3, output_tokens: 1 }
+				}
+			],
+			capture
+		);
+		const controller = new AbortController();
+		controller.abort();
+		const { claudeDriver } = makeDrivers({ query });
+		expect(await drain(claudeDriver(claudeParams({ signal: controller.signal })))).toEqual([]);
+	});
+
 	it("leaves a user message with no tool_result blocks alone", async () => {
 		const capture: { options?: unknown } = {};
 		const query = fakeQuery(
@@ -790,29 +902,6 @@ function successNotifications(text = "hello world"): unknown[] {
 	];
 }
 
-/** Builds an injected spawnFn returning `child`, plus a recorder of the spawn call. */
-function fakeSpawn(child: EventEmitter): {
-	spawnFn: SpawnFn;
-	callArgs: () => {
-		bin: string;
-		args: string[];
-		opts: { env?: Record<string, string>; cwd?: string };
-	};
-} {
-	const fn = vi.fn(() => child);
-	return {
-		spawnFn: fn as unknown as SpawnFn,
-		callArgs: () => {
-			const call = vi.mocked(fn).mock.calls[0] as unknown as [
-				string,
-				string[],
-				{ env?: Record<string, string>; cwd?: string }
-			];
-			return { bin: call[0], args: call[1], opts: call[2] };
-		}
-	};
-}
-
 /** Reads the recorded `turn/start` request params (the structured prompt input + sandbox policy). */
 function turnStartParams(child: FakeAppServer): Record<string, unknown> {
 	const req = child.requests.find((r) => r.method === "turn/start");
@@ -992,7 +1081,7 @@ describe("codexDriver", () => {
 		const spawn1 = fakeSpawn(withHome);
 		await drain(
 			makeDrivers({ spawnFn: spawn1.spawnFn }).codexDriver(
-				cliParams({ binaryPath: "/usr/local/bin/codex", codexHome: isoHome })
+				cliParams({ binaryPath: "/usr/local/bin/codex", configHome: isoHome })
 			)
 		);
 		expect(spawn1.callArgs().opts.env?.CODEX_HOME).toBe(isoHome);
@@ -1116,6 +1205,43 @@ describe("codexDriver", () => {
 		expect(collected.some((m) => m.kind === "done")).toBe(false);
 	});
 
+	it("stops replaying buffered output once the run is cancelled (teardown is not a failure)", async () => {
+		// The app-server pushes the whole turn at once, so the rest of the answer is already sitting
+		// in the child's stdout when the abort lands. A driver that keeps reading it would go on
+		// visibly producing output - text, then a `done` - after the user pressed Stop.
+		const child = new FakeAppServer({
+			notifications: [
+				{
+					jsonrpc: "2.0",
+					method: "item/agentMessage/delta",
+					params: { itemId: "a", delta: "first" }
+				},
+				{
+					jsonrpc: "2.0",
+					method: "item/agentMessage/delta",
+					params: { itemId: "a", delta: " and the rest" }
+				},
+				...successNotifications("!")
+			]
+		});
+		const { spawnFn } = fakeSpawn(child);
+		const { codexDriver } = makeDrivers({ spawnFn });
+		const controller = new AbortController();
+		const collected: AgenticDriverMessage[] = [];
+		for await (const m of codexDriver(
+			cliParams({ binaryPath: "/usr/local/bin/codex", signal: controller.signal })
+		)) {
+			collected.push(m);
+			// Cancel on the first streamed token; every later delta is already buffered behind it.
+			if (m.kind === "text") controller.abort();
+		}
+		// The cancelled token is the LAST thing seen: no buffered deltas, no terminal `done`.
+		expect(collected).toEqual([
+			{ kind: "conversation", id: "thread-1" },
+			{ kind: "text", text: "first" }
+		]);
+	});
+
 	it("yields a stall error when no message arrives within the inactivity ceiling", async () => {
 		vi.useFakeTimers();
 		try {
@@ -1128,14 +1254,22 @@ describe("codexDriver", () => {
 					})()
 				);
 				stderr = new EventEmitter();
-				kill(): void {}
+				killed = false;
+				kill(): void {
+					this.killed = true;
+				}
 			})();
 			const { spawnFn } = fakeSpawn(child);
 			const { codexDriver } = makeDrivers({ spawnFn });
 			const collected: AgenticDriverMessage[] = [];
+			// Sampled AS the stall message is delivered, which is while the driver is still suspended at
+			// its `yield`: the teardown kill in its `finally` has not run yet, so this sees only the kill
+			// the stall path itself performed.
+			let killedAtStall: boolean | undefined;
 			const done = (async () => {
 				for await (const m of codexDriver(cliParams({ binaryPath: "/usr/local/bin/codex" }))) {
 					collected.push(m);
+					killedAtStall ??= child.killed;
 				}
 			})();
 
@@ -1147,6 +1281,9 @@ describe("codexDriver", () => {
 			expect(collected).toHaveLength(1);
 			expect(collected[0]).toMatchObject({ kind: "error" });
 			expect(collected[0]).toMatchObject({ message: expect.stringContaining("stalled") });
+			// The hung child is killed AT the stall, not left for the consumer's next pull: this one line
+			// is now the only kill guarding codex, grok and opencode alike.
+			expect(killedAtStall).toBe(true);
 		} finally {
 			vi.useRealTimers();
 		}

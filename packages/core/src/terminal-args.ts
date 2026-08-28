@@ -15,22 +15,39 @@ import {
 // that lands inside a flag's VALUE, and `claude` reads that value as a comma-separated list of
 // permission RULES - so it is charset-checked here too ({@link isSafeTerminalToolName}); nothing else a
 // caller passes can change what the CLI is allowed to do. Every flag below was spike-verified in
-// INTERACTIVE mode against the real binaries (claude 2.1.200, codex 0.142.3), which is why the shapes
-// differ from the headless drivers: `claude` takes a JSON `--mcp-config` and repeatable `--add-dir`;
-// `codex` takes `-C <cwd>` plus repeated `-c key=tomlValue` overrides. By default each CLI keeps its
-// own native, interactive approval prompts; when the session's `bypassPermissions` is set, a single
-// documented bypass flag per CLI runs it full-auto.
+// INTERACTIVE mode against the real binaries (claude 2.1.200, codex 0.142.3, grok 1.0.3, opencode
+// 1.18.17), which is why the shapes differ from the headless drivers: `claude` takes a JSON
+// `--mcp-config` and repeatable `--add-dir`; `codex` takes `-C <cwd>` plus repeated `-c key=tomlValue`
+// overrides; `grok` takes `--cwd` plus `--rules`; `opencode` takes the project directory as a
+// positional. By default each CLI keeps its own native, interactive approval prompts; when the
+// session's `bypassPermissions` is set, a single documented bypass flag per CLI runs it full-auto.
+//
+// THE MCP SEAM IS ASYMMETRIC, AND THAT IS NOT A GAP THESE BUILDERS MAY PAPER OVER. `claude` and
+// `codex` accept the app-MCP server INLINE on argv; `grok` and `opencode` have no such flag - their
+// servers come from a config FILE (`[mcp_servers]` under grok's config home, the `mcp` block under
+// opencode's config, which also reads `OPENCODE_CONFIG_CONTENT` from the environment). So those two
+// builders emit no MCP argument at all: grok REJECTS an unknown flag outright, and opencode's yargs
+// SILENTLY IGNORES one, which would be worse - a token-bearing loopback url sitting in a
+// world-readable `/proc/<pid>/cmdline` while wiring nothing. Never invent a flag a CLI does not
+// document. Those two CLIs get the app's servers through the ENVIRONMENT instead, composed by
+// `terminalCliEnv` (runtime/terminal.ts). The asymmetry is in the CHANNEL, not in what the session
+// gets, so these builders stay silent about MCP rather than growing a flag for it.
 
 /**
  * The coding CLIs that may be launched as an interactive TERMINAL session (as opposed to a one-shot
- * login or a headless run). Only `claude-code` and `codex` were spike-verified in interactive mode
- * against the real binaries (see the file header); OpenCode is intentionally absent until its
- * interactive flags are verified. Shared by every terminal host - the daemon that spawns the session
- * and the shell that offers the picker - so the allowlist has exactly one source. Declared as a const
- * tuple so {@link TerminalCliId} is DERIVED from it: a host cannot narrow to a hand-written union that
+ * login or a headless run). All four are terminal-capable: each one's interactive argv - its working
+ * directory, its model flag, and its documented full-auto lever - was verified against the real
+ * binary's own `--help` (see the file header). What still differs is the MCP seam, not the launch:
+ * `grok` and `opencode` take their servers from a config file rather than a flag, so their builders
+ * emit no MCP argument until a host writes one. Launching each authenticated TUI live remains a
+ * manual desktop check.
+ *
+ * Shared by every terminal host - the daemon that spawns the session and the shell that offers the
+ * picker - so the allowlist has exactly one source. Declared as a const tuple so
+ * {@link TerminalCliId} is DERIVED from it: a host cannot narrow to a hand-written union that
  * silently stops matching this list when an id is added.
  */
-export const TERMINAL_CLI_IDS = ["claude-code", "codex"] as const;
+export const TERMINAL_CLI_IDS = ["claude-code", "codex", "grok", "opencode"] as const;
 
 /** A CLI that may be driven as an interactive terminal session (derived from {@link TERMINAL_CLI_IDS}). */
 export type TerminalCliId = (typeof TERMINAL_CLI_IDS)[number];
@@ -168,5 +185,68 @@ export function codexTerminalArgs(input: TerminalArgsInput, cwd: string): string
 	if (input.bypassPermissions) args.push("--dangerously-bypass-approvals-and-sandbox");
 	if (input.modelId) args.push("-m", input.modelId);
 	for (const override of serializeCodexConfigOverrides(config)) args.push("-c", override);
+	return args;
+}
+
+/**
+ * Builds the argv for an interactive `grok` terminal session. Grok's TUI takes its working directory
+ * as `--cwd` and APPENDS the composed instructions through `--rules` ("extra rules to append to the
+ * system prompt") - never `--system-prompt-override`, which would REPLACE grok's own prompt and with
+ * it the guidance for its own tools. The model rides `--model` only when set. When
+ * `bypassPermissions` is set, `--permission-mode bypassPermissions` runs the CLI full-auto (grok
+ * shares Claude Code's permission-mode vocabulary); otherwise nothing is emitted and the native TUI
+ * prompts stay on. `--sandbox` is never named: its profiles are defined in the USER's config, and an
+ * unappliable one makes grok refuse to start.
+ *
+ * NO MCP ARGUMENT IS EMITTED: grok's interactive command rejects both `--mcp-config` and `--plugin-dir`
+ * as unexpected arguments. The app's servers reach the session through the ENVIRONMENT instead, so
+ * {@link TerminalArgsInput.mcpUrl}, {@link TerminalArgsInput.mcpServers} and
+ * {@link TerminalArgsInput.localToolNames} are consumed there, not dropped.
+ *
+ * NO TOOL-PERMISSION RULE IS EMITTED EITHER - and NOT because grok lacks the flag. It has one:
+ * `--allow <RULE>` (compat alias `--allowedTools`), repeatable, the direct analogue of claude's
+ * `--allowedTools`. A terminal session is a human at the keyboard, so grok's own interactive approval
+ * prompts stay on and the user answers them; the only lever this builder pulls is the documented
+ * whole-session bypass, and only when the host asked for it. Grok also has no add-dir flag, so extra
+ * {@link TerminalArgsInput.workspaces} roots are dropped rather than smuggled onto a flag that would
+ * mean something else.
+ *
+ * @param input - The host-derived session inputs.
+ * @param cwd - The session working directory (passed as `--cwd`).
+ * @returns The `grok` argv (without the binary itself).
+ */
+export function grokTerminalArgs(input: TerminalArgsInput, cwd: string): string[] {
+	const args = ["--cwd", cwd, "--rules", input.instructions];
+	if (input.bypassPermissions) args.push("--permission-mode", "bypassPermissions");
+	if (input.modelId) args.push("--model", input.modelId);
+	return args;
+}
+
+/**
+ * Builds the argv for an interactive `opencode` terminal session. OpenCode's TUI is its DEFAULT
+ * command and takes the project directory as a positional (`opencode [project]`), so the session's
+ * cwd leads the argv. The model rides `--model` (a `provider/model` id) only when set. When
+ * `bypassPermissions` is set, `--auto` auto-approves every permission that is not explicitly denied;
+ * otherwise nothing is emitted and the native approval prompts stay on. `--pure` is never emitted: it
+ * runs opencode without external plugins, which would strip the USER's own servers as well as ours.
+ *
+ * NO MCP ARGUMENT IS EMITTED, and the instructions do not ride argv either: opencode's interactive
+ * command documents no MCP or system-prompt flag - both live in its config (`mcp` and `instructions`),
+ * which `terminalCliEnv` (runtime/terminal.ts) hands over on the ENVIRONMENT as
+ * `OPENCODE_CONFIG_CONTENT`. The argv silence is deliberate: opencode parses argv with yargs, which
+ * IGNORES an unknown flag, so an invented `--mcp-config` would wire nothing while publishing the
+ * loopback token to every process on the machine. {@link TerminalArgsInput.mcpUrl},
+ * {@link TerminalArgsInput.instructions}, {@link TerminalArgsInput.mcpServers} and
+ * {@link TerminalArgsInput.localToolNames} are consumed there, not dropped. Extra
+ * {@link TerminalArgsInput.workspaces} roots ARE dropped - opencode takes one project directory.
+ *
+ * @param input - The host-derived session inputs.
+ * @param cwd - The session working directory (passed as the project positional).
+ * @returns The `opencode` argv (without the binary itself).
+ */
+export function opencodeTerminalArgs(input: TerminalArgsInput, cwd: string): string[] {
+	const args = [cwd];
+	if (input.bypassPermissions) args.push("--auto");
+	if (input.modelId) args.push("--model", input.modelId);
 	return args;
 }

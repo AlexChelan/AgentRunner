@@ -65,16 +65,16 @@ export type RuntimeRunRequest = RunRequest & {
 	 */
 	denyReadPaths?: string[];
 	/**
-	 * An ISOLATED `CODEX_HOME` for a headless chat/automation run (consumed only by the Codex adapter).
-	 * Codex reads its `config.toml` (the user's personal `mcp_servers`, profiles) from `CODEX_HOME` and
-	 * offers no strict-MCP flag, so the runner isolates a run by pointing `CODEX_HOME` at a
-	 * runner-managed home whose `config.toml` declares NO personal MCP servers - the run then sees
-	 * only the app tools plus Codex's built-ins. Subscription auth is preserved because that home's
-	 * `auth.json` is a symlink to the user's real one (keyring-auth platforms need no file and are
-	 * unaffected). Absent leaves the user's own `~/.codex` (the interactive terminal, which keeps the
-	 * full personal config). Ignored by every non-Codex adapter.
+	 * The ISOLATED config home for a headless chat/automation run - `CODEX_HOME` for codex, `GROK_HOME`
+	 * for grok, `XDG_CONFIG_HOME` for opencode - threaded through to that CLI's driver. ONE field
+	 * because a run drives ONE CLI; what the path means per CLI, which of them can be isolated any
+	 * other way, and the measured residual each one carries are documented once at `RUN_ISOLATION`
+	 * (runtime/executor.ts).
+	 *
+	 * Absent leaves the user's own personal config home (the interactive terminal, which keeps the
+	 * full personal config). Claude Code never sets it - it carries its servers and permissions on argv.
 	 */
-	codexHome?: string;
+	configHome?: string;
 };
 
 /**

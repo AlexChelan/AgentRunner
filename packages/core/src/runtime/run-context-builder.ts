@@ -6,7 +6,12 @@ import type { PermissionMode, RunPolicy, RunStart } from "@agentrunner/protocol"
 import { isLocalScope } from "./local/scope";
 import { DISPATCHED_POLICY, LOCAL_TERMINAL_POLICY } from "./policies";
 import { localDataDir, runtimeIdentityDir, secretsDir } from "./paths";
-import { codexCredentialReadDenyPaths, sensitiveHomeReadDenyPaths } from "./read-deny";
+import {
+	codexCredentialReadDenyPaths,
+	grokCredentialReadDenyPaths,
+	opencodeCredentialReadDenyPaths,
+	sensitiveHomeReadDenyPaths
+} from "./read-deny";
 import { webToolServerName } from "./tool-proxy";
 import { claudeAllowedToolsForFloor } from "./web-floor";
 import { resolveWorkFolder } from "./work-folder";
@@ -33,6 +38,18 @@ export interface BuildRunOpts {
 	 * handed to the agent identity - see {@link buildRun}.
 	 */
 	connectedFolder?: string;
+	/**
+	 * Extra absolute paths this HOST wants denied to every run it composes, appended to the fixed list
+	 * below. It exists because that list is derived from {@link BuildRunOpts.appDataRoot} alone, and a host
+	 * can hold credentials OUTSIDE that root: the desktop app keeps its own copy of the account bearer in
+	 * `<userData>/auth.json` (and, on a dev build, in PLAINTEXT in `<userData>/dev-secrets.json`) one
+	 * directory above the runtime root, where nothing here could name it.
+	 *
+	 * FILES, NOT THE TREE. A deny is a subtree deny with no carve-out, and every run's own cwd lives under
+	 * `<userData>/agent-runtime/work/`, so a host that named the enclosing directory would deny a local
+	 * chat the folder it is working in. Absent for every host that keeps nothing outside its root.
+	 */
+	hostDenyReadPaths?: readonly string[];
 	/** The dispatched run descriptor. */
 	start: RunStart;
 	/** The resolved connection (tool + auth mode) to drive. */
@@ -42,11 +59,11 @@ export interface BuildRunOpts {
 	/** Loads a connection's BYOK key, or `null` (subscription runs return `null`). */
 	loadApiKey?: (connectionId: string) => string | null;
 	/**
-	 * The isolated `CODEX_HOME` for this run, when the connection drives Codex (the caller seeds it).
-	 * Threaded onto the request so a headless Codex run loads a config with NO personal MCP servers;
-	 * absent for every other tool and for the interactive terminal (which keeps the user's `~/.codex`).
+	 * The isolated config home for this run, when the connection drives a CLI that has one (seeded from
+	 * `RUN_ISOLATION`), so a headless run reads a config carrying ONLY the app's MCP servers and the
+	 * run's posture. Absent for Claude Code, which takes both on argv, and for the interactive terminal.
 	 */
-	codexHome?: string;
+	configHome?: string;
 	/**
 	 * Container mode: the run's work folder is handed to the unprivileged agent identity, because the
 	 * daemon creates it as root while the CLI child runs as that uid. Off by default (a desktop daemon
@@ -112,8 +129,9 @@ function localLegPermission(mode: PermissionMode, ceiling: PermissionMode): Perm
  * The run is ALSO denied any read of a fixed set of credential/secret trees (`denyReadPaths`), enforced by
  * each CLI's OS-level mechanism: the daemon's OWN `secrets/` dir and local data home (`local/`), the user's
  * HOME credential stores (ssh, cloud/infra creds, macOS keychain, browser profiles - see
- * {@link sensitiveHomeReadDenyPaths}), and - for a NON-codex run - the Codex login homes (a codex run must
- * keep its own, see {@link codexCredentialReadDenyPaths}). This is NOT redundant with the work-folder cwd:
+ * {@link sensitiveHomeReadDenyPaths}), and the login homes of every coding CLI the run does NOT drive (each
+ * run keeps its OWN - see {@link codexCredentialReadDenyPaths}, {@link grokCredentialReadDenyPaths} and
+ * {@link opencodeCredentialReadDenyPaths}). This is NOT redundant with the work-folder cwd:
  * neither CLI confines READS to the cwd (Codex's `workspace-write` and `read-only` sandbox tiers both grant
  * full-filesystem read; Claude's Read tool takes any absolute path), so without the explicit deny an
  * unattended - and therefore prompt-injectable - run could exfiltrate the master key + encrypted device
@@ -189,9 +207,7 @@ export function buildRun(opts: BuildRunOpts): BuiltRun {
 			: {})
 	});
 	if (opts.connectedFolder !== undefined && !isAbsolute(opts.connectedFolder)) {
-		throw new Error(
-			`Connected folder must be an absolute path: refused "${opts.connectedFolder}"`
-		);
+		throw new Error(`Connected folder must be an absolute path: refused "${opts.connectedFolder}"`);
 	}
 	// The EFFECTIVE cwd - what the CLI is actually started in, and therefore what the run context and the
 	// audit entry record. A run in the user's own folder recorded as the managed one would be a false entry
@@ -215,10 +231,11 @@ export function buildRun(opts: BuildRunOpts): BuiltRun {
 		connection: opts.connection
 	});
 
-	// Codex runs carry an isolated CODEX_HOME (the caller seeds it); every other tool does not. The Codex
-	// credential homes are denied ONLY to a NON-codex run - a codex run must be able to follow its own
-	// CODEX_HOME/auth.json into ~/.codex, or its login breaks.
-	const isCodexRun = opts.codexHome !== undefined;
+	// Which CLI this run drives, read from the connection that states it rather than inferred from the
+	// isolated home the caller seeded. Each CLI's credential home is denied to every run EXCEPT the one
+	// that owns it: a codex run must follow its own `CODEX_HOME/auth.json` into `~/.codex` or its login
+	// breaks, and cross-denying the others stops a prompt-injected run reading the user's other logins.
+	const runsCli = (id: string): boolean => opts.connection.toolId === id;
 	const req: RuntimeRunRequest = {
 		connectionId: opts.start.connectionId,
 		prompt: opts.start.input,
@@ -228,19 +245,25 @@ export function buildRun(opts: BuildRunOpts): BuiltRun {
 		// Deny this run's CLI any read of the daemon's OWN trees (the master key + encrypted device bearer in
 		// `secrets/`, the user's chat transcripts in the local data home, the drive server's bearer token in
 		// the runtime identity home), the user's HOME credential/secret
-		// stores (ssh/cloud/keychain/browser - {@link sensitiveHomeReadDenyPaths}), and - for a non-codex run -
-		// the Codex login homes ({@link codexCredentialReadDenyPaths}). A dispatched run is UNATTENDED and
-		// therefore prompt-injectable, so these are HARD boundaries, not policy toggles or approval prompts:
-		// the cwd being a sibling of these dirs is NOT what protects them (both CLIs read by absolute path), and
-		// the deny is enforced by each CLI's OS-level mechanism INDEPENDENT of the permission mode (a `full`/
-		// bypass run keeps it). Paths absent on this OS/shape (the local data home on a paired run, a Linux
-		// browser dir on macOS) are inert.
+		// stores (ssh/cloud/keychain/browser - {@link sensitiveHomeReadDenyPaths}), and the login homes of every
+		// coding CLI this run does NOT itself drive ({@link codexCredentialReadDenyPaths},
+		// {@link grokCredentialReadDenyPaths}, {@link opencodeCredentialReadDenyPaths}). A dispatched run is
+		// UNATTENDED and therefore prompt-injectable, so these are HARD boundaries, not policy toggles or
+		// approval prompts: the cwd being a sibling of these dirs is NOT what protects them (every CLI reads by
+		// absolute path), and the deny is enforced by each CLI's OS-level mechanism INDEPENDENT of the
+		// permission mode (a `full`/bypass run keeps it). Paths absent on this OS/shape (the local data home on
+		// a paired run, a Linux browser dir on macOS) are inert. The HOST's own list
+		// ({@link BuildRunOpts.hostDenyReadPaths}) is appended LAST and is purely additive - it names files
+		// this module cannot see, outside `appDataRoot`, and nothing here ever removes an entry.
 		denyReadPaths: [
 			secretsDir(opts.appDataRoot),
 			localDataDir(opts.appDataRoot),
 			runtimeIdentityDir(opts.appDataRoot),
 			...sensitiveHomeReadDenyPaths(),
-			...(isCodexRun ? [] : codexCredentialReadDenyPaths(opts.appDataRoot))
+			...(runsCli("codex") ? [] : codexCredentialReadDenyPaths(opts.appDataRoot)),
+			...(runsCli("grok") ? [] : grokCredentialReadDenyPaths(opts.appDataRoot)),
+			...(runsCli("opencode") ? [] : opencodeCredentialReadDenyPaths()),
+			...(opts.hostDenyReadPaths ?? [])
 		],
 		...(floored
 			? {
@@ -259,7 +282,10 @@ export function buildRun(opts: BuildRunOpts): BuiltRun {
 		...(opts.start.inputImages && opts.start.inputImages.length > 0
 			? { images: opts.start.inputImages }
 			: {}),
-		...(opts.codexHome ? { codexHome: opts.codexHome } : {})
+		...(opts.start.inputDocuments && opts.start.inputDocuments.length > 0
+			? { documents: opts.start.inputDocuments }
+			: {}),
+		...(opts.configHome ? { configHome: opts.configHome } : {})
 	};
 
 	const loadApiKey = opts.loadApiKey ?? ((): null => null);

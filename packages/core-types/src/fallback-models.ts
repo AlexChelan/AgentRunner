@@ -21,5 +21,9 @@ export const FALLBACK_MODELS: Record<string, ModelInfo[]> = {
 	google: [
 		{ id: "gemini-2.5-pro", label: "Gemini 2.5 Pro", source: "fallback" },
 		{ id: "gemini-2.5-flash", label: "Gemini 2.5 Flash", source: "fallback" }
+	],
+	xai: [
+		{ id: "grok-4.6", label: "Grok 4.6", source: "fallback" },
+		{ id: "grok-4.5", label: "Grok 4.5", source: "fallback" }
 	]
 };

@@ -294,16 +294,20 @@ export function getProviderSpec(id: string): ProviderSpec | undefined {
 }
 
 /**
- * What {@link buildLanguageModel} ALWAYS returns: the V3 member of the AI SDK's wide `LanguageModel`
- * alias (`GlobalProviderModelId | LanguageModelV3 | LanguageModelV2`). Every transport here calls a
- * provider factory, so a bare model-id string and a V2 model are both unreachable - and the narrow
- * matters to callers, because the SDK's own `wrapLanguageModel` accepts a `LanguageModelV3` and
- * nothing wider, so a wide alias would force a cast at every middleware composition site.
+ * What {@link buildLanguageModel} ALWAYS returns: the V4 member of the AI SDK's wide `LanguageModel`
+ * alias (`GlobalProviderModelId | LanguageModelV4 | LanguageModelV3 | LanguageModelV2`). Every
+ * transport here calls a provider factory, so a bare model-id string and the legacy V2/V3 models are
+ * all unreachable - and the narrow matters to callers, because the SDK's own `wrapLanguageModel`
+ * returns a `LanguageModelV4`, so a wide alias would force a cast at every middleware composition site.
+ *
+ * The spec version tracks the provider packages, not this file: `ai@7` consumes V4 and every
+ * `@ai-sdk/*` provider pinned here emits it. Pinning the extract to an older version still compiles
+ * (the alias keeps the legacy members for back-compat) but matches nothing a factory returns.
  *
  * Extracted from the `ai` alias rather than imported from `@ai-sdk/provider` (not a direct dependency
  * of this package), which also keeps the type identity the exact one the SDK's own helpers expect.
  */
-export type BuiltLanguageModel = Extract<LanguageModel, { specificationVersion: "v3" }>;
+export type BuiltLanguageModel = Extract<LanguageModel, { specificationVersion: "v4" }>;
 
 /** Options for {@link buildLanguageModel}: at most one credential is sent. */
 export interface BuildLanguageModelOptions {

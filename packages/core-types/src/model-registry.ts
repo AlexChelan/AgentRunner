@@ -87,6 +87,28 @@ function parseEffortLevels(raw: unknown): string[] | undefined {
 }
 
 /**
+ * The input modalities an entry declares, lower-cased, read once from its `modalities.input` list.
+ *
+ * Returns `undefined` - not an empty list - when the entry declares no modalities at all, because the
+ * two mean different things to the composer: an entry that lists `["text"]` is KNOWN to take nothing
+ * else, while one that lists nothing is simply unstated, and the image and document gates weigh that
+ * unknown differently (see {@link ModelInfo.documents}). The tokens are folded to lower case ONCE here,
+ * so the gates and the raw list the frontend derives from can never disagree about a `"PDF"` entry.
+ *
+ * @param raw - The model entry from the registry payload.
+ * @returns The declared modality tokens, or `undefined` when the entry declares none.
+ */
+function inputModalities(raw: Record<string, unknown>): string[] | undefined {
+	const modalities = raw.modalities;
+	if (!isRecord(modalities)) return undefined;
+	const input = modalities.input;
+	if (!Array.isArray(input)) return undefined;
+	return input
+		.filter((token): token is string => typeof token === "string")
+		.map((token) => token.toLowerCase());
+}
+
+/**
  * Defensively extract a provider's models from the models.dev payload. The payload
  * is a record keyed by provider id; each provider carries a `models` record keyed
  * by model id. Unknown/missing fields are tolerated and skipped.
@@ -107,13 +129,19 @@ function parseProviderModels(payload: unknown, provider: string): ModelInfo[] {
 			isRecord(limit) && typeof limit.context === "number" ? limit.context : undefined;
 		const releaseDate = typeof raw.release_date === "string" ? raw.release_date : undefined;
 		const effortLevels = parseEffortLevels(raw.reasoning_options);
+		const modalities = inputModalities(raw);
+		const images = modalities?.includes("image");
+		const documents = modalities?.includes("pdf");
 		result.push({
 			id,
 			label,
 			contextWindow,
 			source: "registry",
 			releaseDate,
-			...(effortLevels ? { effortLevels } : {})
+			...(effortLevels ? { effortLevels } : {}),
+			...(images !== undefined ? { images } : {}),
+			...(documents !== undefined ? { documents } : {}),
+			...(modalities?.length ? { inputModalities: modalities } : {})
 		});
 	}
 	return curateModels(result);
@@ -153,20 +181,44 @@ export function curateModels(models: ModelInfo[]): ModelInfo[] {
 }
 
 /**
+ * How long a models.dev lookup may take before the caller gives up on it.
+ *
+ * {@link fetchModelRegistry} never throws and falls back to its cached or declarative list, so an
+ * expired deadline costs a slightly staler catalogue and nothing else. Without one, an offline or
+ * firewalled host holds the request open until the OS TCP timeout - tens of seconds on a route a
+ * picker blocks on.
+ *
+ * MODULE-PRIVATE, and that is the point: four modules each carried their own copy of this constant and
+ * this paragraph, and a fifth caller could have shipped with no deadline at all. The fetch below now
+ * applies it, so no caller has a value to pass, to forget, or to diverge from.
+ */
+const REGISTRY_TIMEOUT_MS = 2_000;
+
+/**
  * Fetch the raw models.dev payload, shared across providers. Returns the cached payload within the
  * TTL, joins an in-flight fetch when one is already running, and otherwise performs the single
  * network request (populating the cache on success). This is what makes a cold multi-provider
  * enumeration download and parse `api.json` exactly once.
  *
  * @param now - The current time (ms) for the TTL check.
- * @param signal - Optional abort signal for the underlying fetch.
+ * @param signal - Abort signal for the underlying fetch; defaults to {@link REGISTRY_TIMEOUT_MS}.
  * @returns The parsed models.dev payload. Rejects on a network or non-2xx error (the caller degrades).
  */
 async function fetchRawRegistry(now: number, signal?: AbortSignal): Promise<unknown> {
 	if (rawCache && now - rawCache.at < CACHE_TTL_MS) return rawCache.payload;
 	if (rawInflight) return rawInflight;
 	const inflight = (async (): Promise<unknown> => {
-		const res = await fetch(MODELS_DEV_URL, { signal });
+		// The deadline is ADDED to a caller's signal, never replaced by it. `signal ?? timeout` would let
+		// any caller that passes one - a request-abort signal, a cancellation controller, both perfectly
+		// reasonable - opt out of the deadline entirely and hold this fetch open until the OS TCP timeout
+		// on a picker's load path, which is the stall the deadline exists to prevent.
+		//
+		// Minted HERE, beside the only `fetch` in the module, so none of the paths that answer without one
+		// - either cache, or joining a request already in the air - arms a timer it will never read.
+		const deadline = AbortSignal.timeout(REGISTRY_TIMEOUT_MS);
+		const res = await fetch(MODELS_DEV_URL, {
+			signal: signal === undefined ? deadline : AbortSignal.any([signal, deadline])
+		});
 		if (!res.ok) throw new Error(`models.dev responded ${res.status}`);
 		const payload: unknown = await res.json();
 		rawCache = { at: now, payload };
@@ -186,7 +238,8 @@ async function fetchRawRegistry(now: number, signal?: AbortSignal): Promise<unkn
  * returns the cached list if present, otherwise the provider's fallback (or `[]`).
  *
  * @param opts.provider - Registry provider id, e.g. `"anthropic"` or `"openai"`.
- * @param opts.signal - Optional abort signal for the fetch.
+ * @param opts.signal - Abort signal for the fetch, COMBINED with {@link REGISTRY_TIMEOUT_MS} rather
+ *   than replacing it - a caller can cancel sooner, never later.
  * @param opts.now - Injectable clock (ms) for deterministic cache tests.
  */
 export async function fetchModelRegistry(opts: {
@@ -194,14 +247,14 @@ export async function fetchModelRegistry(opts: {
 	signal?: AbortSignal;
 	now?: number;
 }): Promise<ModelInfo[]> {
-	const { provider, signal } = opts;
+	const { provider } = opts;
 	const now = opts.now ?? Date.now();
 	const cached = cache.get(provider);
 	if (cached && now - cached.at < CACHE_TTL_MS) {
 		return cached.models;
 	}
 	try {
-		const payload = await fetchRawRegistry(now, signal);
+		const payload = await fetchRawRegistry(now, opts.signal);
 		const models = parseProviderModels(payload, provider);
 		if (models.length > 0) {
 			cache.set(provider, { at: now, models });

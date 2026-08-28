@@ -212,6 +212,8 @@ describe("createConnectedFolderStore", () => {
 			appDataRoot: join(real, "app-data"),
 			home: join(real, "home"),
 			codexHome: join(real, "home", ".codex"),
+			grokHome: join(real, "home", ".grok"),
+			opencodeDataHome: join(real, "home", ".local", "share", "opencode"),
 			appData: join(real, "home", "AppData", "Roaming"),
 			localAppData: join(real, "home", "AppData", "Local"),
 			// An overridden resolver, which is the whole point of the seam being injectable: the predicate
@@ -264,6 +266,8 @@ describe("resolveConnectedFolderDenyDeps", () => {
 			home: "/Users/tester",
 			env: {
 				CODEX_HOME: "/elsewhere/codex",
+				GROK_HOME: "/elsewhere/grok",
+				XDG_DATA_HOME: "/elsewhere/data",
 				APPDATA: "D:\\Roaming",
 				LOCALAPPDATA: "D:\\Local"
 			}
@@ -272,6 +276,8 @@ describe("resolveConnectedFolderDenyDeps", () => {
 			appDataRoot: "/app-data",
 			home: "/Users/tester",
 			codexHome: "/elsewhere/codex",
+			grokHome: "/elsewhere/grok",
+			opencodeDataHome: join("/elsewhere/data", "opencode"),
 			appData: "D:\\Roaming",
 			localAppData: "D:\\Local"
 		});
@@ -280,8 +286,21 @@ describe("resolveConnectedFolderDenyDeps", () => {
 	it("falls back to home-relative defaults when the environment says nothing", () => {
 		const deps = resolveConnectedFolderDenyDeps("/app-data", { home: "/Users/tester", env: {} });
 		expect(deps.codexHome).toBe(join("/Users/tester", ".codex"));
+		expect(deps.grokHome).toBe(join("/Users/tester", ".grok"));
+		expect(deps.opencodeDataHome).toBe(join("/Users/tester", ".local", "share", "opencode"));
 		expect(deps.appData).toBe(join("/Users/tester", "AppData", "Roaming"));
 		expect(deps.localAppData).toBe(join("/Users/tester", "AppData", "Local"));
+	});
+
+	it("reads an EMPTY $XDG_DATA_HOME as unset, so the predicate never sees a relative root", () => {
+		// opencode's own data-dir resolution is a truthiness check, so an empty variable means
+		// `~/.local/share` to it. Honouring it as SET (the `??` the other roots use) would build the
+		// relative root `opencode` and make `connectedFolderDenyEntries` throw on a config opencode accepts.
+		const deps = resolveConnectedFolderDenyDeps("/app-data", {
+			home: "/Users/tester",
+			env: { XDG_DATA_HOME: "" }
+		});
+		expect(deps.opencodeDataHome).toBe(join("/Users/tester", ".local", "share", "opencode"));
 	});
 
 	it("pins the REDIRECTED Windows profile: %APPDATA% off home entirely", () => {

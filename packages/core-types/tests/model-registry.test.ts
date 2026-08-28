@@ -15,6 +15,7 @@ interface CatalogEntry {
 	limit?: { context?: number };
 	reasoning?: boolean;
 	reasoning_options?: unknown;
+	modalities?: unknown;
 }
 
 /** Builds one models.dev payload for a single provider from partial catalog entries. */
@@ -30,12 +31,19 @@ function payload(provider: string, models: Record<string, Partial<CatalogEntry>>
 let clock = 0;
 const nextNow = (): number => (clock += 2 * 60 * 60 * 1000);
 
-/** Stubs `fetch` with a single models.dev response. */
-function stubFetch(body: unknown): void {
-	vi.stubGlobal(
-		"fetch",
-		vi.fn(async () => new Response(JSON.stringify(body), { status: 200 }))
+/**
+ * Stubs `fetch` with a single models.dev response.
+ *
+ * @param body - The payload the stub answers with.
+ * @returns A reader for the signal the stub was called with, for the deadline cases.
+ */
+function stubFetch(body: unknown): { calledWithSignal: () => AbortSignal | undefined } {
+	const mock = vi.fn(
+		async (_url: string, _init?: { signal?: AbortSignal }) =>
+			new Response(JSON.stringify(body), { status: 200 })
 	);
+	vi.stubGlobal("fetch", mock);
+	return { calledWithSignal: () => mock.mock.calls[0]?.[1]?.signal };
 }
 
 /** Reads one curated model out of a registry result by id. */
@@ -45,6 +53,47 @@ function byId(models: ModelInfo[], id: string): ModelInfo | undefined {
 
 afterEach(() => {
 	vi.unstubAllGlobals();
+});
+
+/**
+ * THE DEADLINE IS THE FETCH'S, not each caller's.
+ *
+ * Four modules used to declare their own 2s constant and their own copy of the reason for it, so a
+ * fifth caller could ship with no deadline at all - and an offline or firewalled host then holds a
+ * picker's request open until the OS TCP timeout, tens of seconds. Defaulting it here is what makes
+ * "a caller cannot forget it" true.
+ */
+describe("the models.dev deadline", () => {
+	it("bounds a lookup no caller bounded", async () => {
+		const stub = stubFetch(payload("deadline-a", {}));
+
+		await fetchModelRegistry({ provider: "deadline-a", now: nextNow() });
+
+		expect(stub.calledWithSignal()).toBeInstanceOf(AbortSignal);
+		expect(stub.calledWithSignal()?.aborted).toBe(false);
+	});
+
+	// A caller that passes a signal must not thereby OPT OUT of the deadline. `signal ?? timeout` reads
+	// as "the caller knows best", but a request-abort signal or a cancellation controller says nothing
+	// about how long models.dev may stall - and an offline host would then hold the fetch until the OS
+	// TCP timeout, on a route a picker blocks on.
+	it("adds the deadline to a caller's own signal rather than letting it replace one", async () => {
+		const controller = new AbortController();
+		const stub = stubFetch(payload("deadline-b", {}));
+
+		await fetchModelRegistry({
+			provider: "deadline-b",
+			signal: controller.signal,
+			now: nextNow()
+		});
+
+		const seen = stub.calledWithSignal();
+		expect(seen).toBeInstanceOf(AbortSignal);
+		expect(seen).not.toBe(controller.signal);
+		// The caller's own abort still reaches the fetch through the combined signal.
+		controller.abort();
+		expect(seen?.aborted).toBe(true);
+	});
 });
 
 describe("models.dev reasoning_options", () => {
@@ -152,5 +201,67 @@ describe("models.dev reasoning_options", () => {
 		expect(models.map((model) => model.id).sort()).toEqual(["model-null-option", "model-string"]);
 		expect(byId(models, "model-string")?.effortLevels).toBeUndefined();
 		expect(byId(models, "model-null-option")?.effortLevels).toBeUndefined();
+	});
+});
+
+describe("models.dev input modalities", () => {
+	it("reads image and pdf input from a model's declared modalities", async () => {
+		stubFetch(
+			payload("modal-provider", {
+				"model-pdf": {
+					name: "Reads PDFs",
+					modalities: { input: ["text", "image", "pdf"], output: ["text"] }
+				},
+				"model-image-only": {
+					name: "Image only",
+					modalities: { input: ["text", "image"], output: ["text"] }
+				},
+				"model-text-only": { name: "Text only", modalities: { input: ["text"], output: ["text"] } }
+			})
+		);
+		const models = await fetchModelRegistry({ provider: "modal-provider", now: nextNow() });
+		expect(byId(models, "model-pdf")?.documents).toBe(true);
+		expect(byId(models, "model-pdf")?.images).toBe(true);
+		// A declared list WITHOUT the token is a known no, which is what lets the composer hide the
+		// control honestly rather than offering a PDF to a model that would reject it.
+		expect(byId(models, "model-image-only")?.documents).toBe(false);
+		expect(byId(models, "model-image-only")?.images).toBe(true);
+		expect(byId(models, "model-text-only")?.documents).toBe(false);
+		expect(byId(models, "model-text-only")?.images).toBe(false);
+	});
+
+	it("carries the declared modalities VERBATIM, which is what makes the composer data-driven", async () => {
+		// The frontend derives which file types it offers from this list, so it must arrive whole rather
+		// than pre-reduced to booleans - a model that gains audio input then starts accepting audio with
+		// no code change anywhere.
+		stubFetch(
+			payload("verbatim-provider", {
+				"model-rich": {
+					name: "Rich",
+					modalities: { input: ["Text", "IMAGE", "pdf", "audio"], output: ["text"] }
+				}
+			})
+		);
+		const models = await fetchModelRegistry({ provider: "verbatim-provider", now: nextNow() });
+		// Lower-cased so one comparison works against either registry's casing, but otherwise untouched.
+		expect(byId(models, "model-rich")?.inputModalities).toEqual(["text", "image", "pdf", "audio"]);
+	});
+
+	it("leaves both flags ABSENT when the entry declares no modalities at all", async () => {
+		// Absent and `false` are different answers: the gates weigh an unknown differently per modality,
+		// so an entry that says nothing must not be recorded as a denial.
+		stubFetch(
+			payload("silent-provider", {
+				"model-silent": { name: "Silent" },
+				"model-malformed": { name: "Malformed", modalities: { input: "text" } }
+			})
+		);
+		const models = await fetchModelRegistry({ provider: "silent-provider", now: nextNow() });
+		for (const id of ["model-silent", "model-malformed"]) {
+			const model = byId(models, id);
+			expect(model).toBeDefined();
+			expect(model && "documents" in model).toBe(false);
+			expect(model && "images" in model).toBe(false);
+		}
 	});
 });

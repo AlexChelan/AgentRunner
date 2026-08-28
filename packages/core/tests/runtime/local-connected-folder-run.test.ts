@@ -35,6 +35,8 @@ function device(): {
 			appDataRoot,
 			home,
 			codexHome: join(home, ".codex"),
+			grokHome: join(home, ".grok"),
+			opencodeDataHome: join(home, ".local", "share", "opencode"),
 			appData: join(home, "AppData", "Roaming"),
 			localAppData: join(home, "AppData", "Local")
 		},

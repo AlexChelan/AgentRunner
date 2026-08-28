@@ -2,9 +2,11 @@ import { describe, expect, it } from "vitest";
 import { join } from "node:path";
 import {
 	codexCredentialReadDenyPaths,
+	grokCredentialReadDenyPaths,
+	opencodeCredentialReadDenyPaths,
 	sensitiveHomeReadDenyPaths
 } from "../../src/runtime/read-deny";
-import { codexHomeDir } from "../../src/runtime/paths";
+import { codexHomeDir, grokHomeDir } from "../../src/runtime/paths";
 
 // A fixed, fake home: the helpers are PURE string joins (no filesystem), so a synthetic root keeps the
 // assertions deterministic across machines and platforms (the list is a platform-union, inert-if-absent set).
@@ -41,9 +43,11 @@ describe("sensitiveHomeReadDenyPaths", () => {
 		for (const p of paths) expect(p.startsWith(`${HOME}/`)).toBe(true);
 	});
 
-	it("is deterministic and free of the Codex login homes (those are added only for non-codex runs)", () => {
+	it("is deterministic and free of the CLI login homes (those are added per non-owning run)", () => {
 		const paths = sensitiveHomeReadDenyPaths(HOME);
 		expect(paths).not.toContain(join(HOME, ".codex"));
+		expect(paths).not.toContain(join(HOME, ".grok"));
+		expect(paths).not.toContain(join(HOME, ".local", "share", "opencode"));
 		// No duplicates.
 		expect(new Set(paths).size).toBe(paths.length);
 	});
@@ -75,5 +79,66 @@ describe("codexCredentialReadDenyPaths", () => {
 			if (saved === undefined) delete process.env.CODEX_HOME;
 			else process.env.CODEX_HOME = saved;
 		}
+	});
+});
+
+/** Runs `body` with one environment variable forced to a value (or forced UNSET), then restores it. */
+function withEnv(name: string, value: string | undefined, body: () => void): void {
+	const saved = process.env[name];
+	if (value === undefined) delete process.env[name];
+	else process.env[name] = value;
+	try {
+		body();
+	} finally {
+		if (saved === undefined) delete process.env[name];
+		else process.env[name] = saved;
+	}
+}
+
+describe("grokCredentialReadDenyPaths", () => {
+	it("denies the real ~/.grok (default) AND the runner-managed isolated grok home", () => {
+		withEnv("GROK_HOME", undefined, () => {
+			expect(grokCredentialReadDenyPaths("/data/app", HOME)).toEqual([
+				join(HOME, ".grok"),
+				grokHomeDir("/data/app")
+			]);
+		});
+	});
+
+	it("honors $GROK_HOME as the real login the isolated home links to", () => {
+		withEnv("GROK_HOME", "/custom/grok", () => {
+			expect(grokCredentialReadDenyPaths("/data/app", HOME)).toEqual([
+				"/custom/grok",
+				grokHomeDir("/data/app")
+			]);
+		});
+	});
+});
+
+describe("opencodeCredentialReadDenyPaths", () => {
+	it("denies the real opencode DATA home, where its auth.json lives", () => {
+		withEnv("XDG_DATA_HOME", undefined, () => {
+			// NOT `~/Library/Application Support` on macOS: opencode resolves this path with no platform
+			// branch, so `~/.local/share/opencode` is where the login sits on every OS.
+			expect(opencodeCredentialReadDenyPaths(HOME)).toEqual([
+				join(HOME, ".local", "share", "opencode")
+			]);
+		});
+	});
+
+	it("honors $XDG_DATA_HOME, the base opencode resolves its data dir from", () => {
+		withEnv("XDG_DATA_HOME", "/custom/data", () => {
+			expect(opencodeCredentialReadDenyPaths(HOME)).toEqual([join("/custom/data", "opencode")]);
+		});
+	});
+
+	it("reads an EMPTY $XDG_DATA_HOME as unset, exactly as opencode itself does", () => {
+		// opencode's own resolution is a TRUTHINESS check, so an empty variable falls back to
+		// `~/.local/share`. Mirroring `??` here would deny a relative path naming no folder at all.
+		withEnv("XDG_DATA_HOME", "", () => {
+			expect(opencodeCredentialReadDenyPaths(HOME)).toEqual([
+				join(HOME, ".local", "share", "opencode")
+			]);
+		});
 	});
 });

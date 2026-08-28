@@ -53,6 +53,40 @@ export type LocalAutomation = {
 	modelId?: string;
 	/** Reasoning effort for the fire, when set; any advertised level string. */
 	effort?: string;
+	/**
+	 * The backend id of the ORG-SHARED definition this automation was ADOPTED from, when it mirrors one.
+	 * Absent for an automation authored on this machine. The daemon never contacts a backend and reads no
+	 * meaning into the value - it stores and returns it so the app can pair a local row with the shared
+	 * definition it came from, which is what makes the mirror ITSELF the adoption record.
+	 */
+	sourceId?: string;
+	/**
+	 * The definition version this mirror was adopted at. Also opaque to the daemon: only the app can see
+	 * the definition's current version, so only the app can tell that the author has since rewritten what
+	 * this machine is running. Stored here because the mirror is the only durable record of the consent.
+	 */
+	sourceVersion?: number;
+	/**
+	 * Why this automation is paused, when the APP paused it rather than the user. Opaque here like the two
+	 * stamps above: the daemon stores and returns the string and reads no meaning into it. Only the app can
+	 * see the workspace, so only the app can know that a shared definition's author switched it off.
+	 */
+	pausedReason?: string;
+	/**
+	 * Epoch milliseconds the automation was FIRST stored, stamped by {@link LocalAutomationStore.upsertUser}
+	 * on the create and carried unchanged through every later edit. It is the anchor a never-run INTERVAL
+	 * automation is due from, so a fresh one fires a full interval after it was made rather than on the very
+	 * next tick - a new hourly automation that spends the moment it is saved is a surprise, and on a metered
+	 * CLI it is a surprise with a bill.
+	 *
+	 * Daemon-owned and never accepted from a caller ({@link UserAutomationInput} carries no such field), so a
+	 * client cannot post-date an automation into silence or back-date one into firing immediately.
+	 *
+	 * Absent on a row written by a build that predates the field, which {@link computeAutomationWork} reads
+	 * exactly as it always did (due at once): inventing a creation instant for an existing automation would
+	 * silently postpone a schedule the user already relies on.
+	 */
+	createdAt?: number;
 	/** Always `false` - this is a user automation, not a built-in spec. */
 	builtIn: false;
 } & AutomationCadence;
@@ -110,6 +144,12 @@ export type UserAutomationInput = {
 	modelId?: string;
 	/** Reasoning effort for the fire, when set; any advertised level string. */
 	effort?: string;
+	/** The org-shared definition this automation mirrors, when adopted from one (see {@link LocalAutomation.sourceId}). */
+	sourceId?: string;
+	/** The definition version this mirror was adopted at (see {@link LocalAutomation.sourceVersion}). */
+	sourceVersion?: number;
+	/** Why the automation is paused, when the app paused it (see {@link LocalAutomation.pausedReason}). */
+	pausedReason?: string;
 } & AutomationCadence;
 
 /**
@@ -121,6 +161,12 @@ export type AutomationDueInput = {
 	id: string;
 	/** Whether the automation fires. */
 	enabled: boolean;
+	/**
+	 * When the automation was created, in epoch milliseconds - the dueness anchor for an INTERVAL automation
+	 * that has never run. Absent for a built-in spec (config carries no creation instant) and for a user row
+	 * written before the field existed; both then keep the original rule of being due at once.
+	 */
+	createdAt?: number;
 } & AutomationCadence;
 
 /**
@@ -142,6 +188,10 @@ export interface LocalAutomationStore {
 	 * A cadence change, or enabling a disabled automation, CLEARS any arming (`nextRunAtMs` and its `armedFor`
 	 * fingerprint; the runner re-arms from the new cadence on its next tick), leaving the rest of the run
 	 * record untouched.
+	 *
+	 * A CREATE stamps {@link LocalAutomation.createdAt} with the current instant, which is what makes a fresh
+	 * interval automation due one full interval later rather than on the next tick. An UPDATE carries the
+	 * existing stamp through unchanged, so editing a name or a model never re-anchors a schedule.
 	 *
 	 * @param input - The editable fields (plus an optional UUID id to adopt for an update or idempotent create).
 	 * @returns The persisted automation, including its id.
@@ -283,6 +333,20 @@ function sanitizeUserAutomation(id: string, value: unknown): LocalAutomation | n
 	// stored effort can be one this build has never heard of. Narrowing here would reset such an automation
 	// to the model default on the next boot - a fire at the wrong depth, from a write that looked fine.
 	if (typeof value.effort === "string" && value.effort.length > 0) automation.effort = value.effort;
+	// The adoption stamp: kept verbatim, never interpreted. A mirror missing its `sourceVersion` is read
+	// by the app as current rather than stale, so dropping a malformed one here is the safe arm - it
+	// cannot manufacture an alarm, and the pairing to the definition survives on `sourceId` alone.
+	if (typeof value.sourceId === "string" && value.sourceId.length > 0)
+		automation.sourceId = value.sourceId;
+	if (typeof value.sourceVersion === "number" && Number.isFinite(value.sourceVersion))
+		automation.sourceVersion = value.sourceVersion;
+	if (typeof value.pausedReason === "string" && value.pausedReason.length > 0)
+		automation.pausedReason = value.pausedReason;
+	// A malformed stamp is DROPPED rather than repaired, which lands the row on the legacy arm (due at
+	// once) instead of on an invented creation instant that could hold a real automation silent for an
+	// interval nobody chose.
+	if (typeof value.createdAt === "number" && Number.isFinite(value.createdAt))
+		automation.createdAt = value.createdAt;
 	return automation;
 }
 
@@ -407,6 +471,7 @@ export function createLocalAutomationStore(dir: string): LocalAutomationStore {
 				suppliedId !== undefined && isSafeKey(suppliedId) && UUID_FORMAT.test(suppliedId)
 					? suppliedId
 					: crypto.randomUUID();
+			const prior = sanitizeUserAutomation(id, map[id]);
 			const automation: LocalAutomation = {
 				id,
 				name: input.name,
@@ -416,11 +481,17 @@ export function createLocalAutomationStore(dir: string): LocalAutomationStore {
 				...(input.cli !== undefined ? { cli: input.cli } : {}),
 				...(input.modelId !== undefined ? { modelId: input.modelId } : {}),
 				...(input.effort !== undefined ? { effort: input.effort } : {}),
+				...(input.sourceId !== undefined ? { sourceId: input.sourceId } : {}),
+				...(input.sourceVersion !== undefined ? { sourceVersion: input.sourceVersion } : {}),
+				...(input.pausedReason !== undefined ? { pausedReason: input.pausedReason } : {}),
+				// Stamped on the CREATE and carried through every edit, so a rename or a model change never
+				// re-anchors a schedule. A prior row that carries no stamp keeps none: it predates the field,
+				// and dating it now would postpone an automation the user already expects to fire.
+				...(prior === null ? { createdAt: Date.now() } : prior.createdAt !== undefined ? { createdAt: prior.createdAt } : {}),
 				...cadence
 			};
 			// Re-arm BEFORE the automation write: a crash between the two then leaves the OLD cadence unarmed
 			// (re-armed within a tick), never the new cadence armed at the old cadence's instant.
-			const prior = sanitizeUserAutomation(id, map[id]);
 			if (prior === null || cadenceChanged(prior, automation) || (automation.enabled && !prior.enabled))
 				clearNextRunAt(id);
 			map[id] = automation;
@@ -476,9 +547,13 @@ export function createLocalAutomationStore(dir: string): LocalAutomationStore {
 
 /**
  * Computes the automation work due at `nowMs`, split by what the caller must DO with it. A disabled automation
- * is in neither bucket. An INTERVAL automation is due when it has either never run or its interval has fully
- * elapsed since `lastRunAt`, appearing exactly once however overdue (the caller marks `lastRunAt` after
- * firing, resetting the clock - catch-up-once, no pile-up). A CRON automation is due only once armed, when
+ * is in neither bucket. An INTERVAL automation is due when its interval has fully elapsed since its ANCHOR -
+ * its `lastRunAt`, or, before it has ever run, its {@link AutomationDueInput.createdAt} - appearing exactly
+ * once however overdue (the caller marks `lastRunAt` after firing, resetting the clock - catch-up-once, no
+ * pile-up). Anchoring a never-run automation on its creation is what stops a freshly made one firing on the
+ * very next tick: the user asked for hourly, so the first run belongs an hour out, not at the moment of
+ * saving. An automation carrying NEITHER anchor (a built-in spec, or a row from a build predating the stamp)
+ * keeps the original rule and is due at once. A CRON automation is due only once armed, when
  * its `nextRunAtMs` has arrived; an unarmed one is to-arm instead, and is never fired on the same pass.
  * ARMED means both an instant AND an `armedFor` fingerprint matching the row's CURRENT cadence: an instant
  * armed for a cadence that has since changed is read as unarmed, so the row re-arms rather than either
@@ -512,8 +587,8 @@ export function computeAutomationWork<T extends AutomationDueInput>(
 			else if (armedAt <= nowMs) due.push(automation);
 			continue;
 		}
-		const lastRunAt = state?.lastRunAt;
-		if (lastRunAt === undefined || lastRunAt + cadence.intervalMinutes * MS_PER_MINUTE <= nowMs)
+		const anchor = state?.lastRunAt ?? automation.createdAt;
+		if (anchor === undefined || anchor + cadence.intervalMinutes * MS_PER_MINUTE <= nowMs)
 			due.push(automation);
 	}
 	return { due, toArm };

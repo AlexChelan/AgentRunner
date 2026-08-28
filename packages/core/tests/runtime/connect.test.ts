@@ -387,6 +387,67 @@ describe("connectHeadless", () => {
 		expect(outcome).toEqual({ status: "failed", toolId: "codex", reason: "detect blew up" });
 		expect(h.state.getConnection(BACKEND, "codex")).toBeNull();
 	});
+
+	// This is the DESKTOP in-app connect path, and the desktop catalog is wider than the cloud-dispatch
+	// allowlist: a desktop-only CLI must reach the adapter path here, never be refused as unknown.
+	it("connects a desktop-only CLI that the dispatch allowlist excludes", async () => {
+		const h = harness();
+		const adapter = fakeAdapter(
+			"grok",
+			{ installed: true },
+			{ authenticated: true, mode: "subscription" }
+		);
+		const outcome = await connectHeadless(
+			"grok",
+			{ registry: fakeRegistry(adapter), baseDir: "/base", state: h.state, backendUrl: BACKEND },
+			{ install: false }
+		);
+		expect(outcome).toEqual({ status: "connected", toolId: "grok", authHealth: "healthy" });
+		expect(h.state.getConnection(BACKEND, "grok")?.source).toBe("reused");
+	});
+
+	it("answers a clean adapterless failure for a desktop CLI with no runtime adapter yet", async () => {
+		const h = harness();
+		const adapter = fakeAdapter(
+			"codex",
+			{ installed: true },
+			{ authenticated: true, mode: "subscription" }
+		);
+		const outcome = await connectHeadless(
+			"grok",
+			{ registry: fakeRegistry(adapter), baseDir: "/base", state: h.state, backendUrl: BACKEND },
+			{ install: false }
+		);
+		expect(outcome).toEqual({
+			status: "failed",
+			toolId: "grok",
+			reason: "no runtime adapter for this tool"
+		});
+		expect(h.state.getConnection(BACKEND, "grok")).toBeNull();
+	});
+
+	it("refuses an id outside the desktop catalog before probing any adapter", async () => {
+		const h = harness();
+		const adapter = fakeAdapter(
+			"hermes",
+			{ installed: true },
+			{ authenticated: true, mode: "subscription" }
+		);
+		const outcome = await connectHeadless(
+			// @ts-expect-error - the type already refuses a non-desktop id; the runtime guard exists for
+			// stored or wire-borne input the type never saw, and this is the only way to drive it.
+			"hermes",
+			{ registry: fakeRegistry(adapter), baseDir: "/base", state: h.state, backendUrl: BACKEND },
+			{ install: false }
+		);
+		expect(outcome).toEqual({
+			status: "failed",
+			toolId: "hermes",
+			reason: "no runtime adapter for this tool"
+		});
+		expect(adapter.detect).not.toHaveBeenCalled();
+		expect(h.state.getConnection(BACKEND, "hermes")).toBeNull();
+	});
 });
 
 describe("buildRunnerRegistry (I13)", () => {
@@ -402,6 +463,28 @@ describe("buildRunnerRegistry (I13)", () => {
 		chmodSync(bin, 0o755);
 		return baseDir;
 	}
+
+	// The host CLI set is the FOURTH positional argument, never a field on `opts`: the containment opts
+	// are asserted whole (`toEqual`) by `apps/runner/tests/serve-contained.test.ts`, so an extra key
+	// there would break the daemon's container-identity contract. Omitting it keeps every existing
+	// caller on the daemon's dispatch set.
+	it("scopes the built adapters to the host CLI set passed as the fourth argument", () => {
+		const baseDir = mkdtempSync(join(tmpdir(), "runner-registry-"));
+		expect(
+			buildRunnerRegistry(baseDir, undefined, undefined, ["codex"])
+				.getAdapters()
+				.map((adapter) => adapter.id)
+		).toEqual(["codex"]);
+	});
+
+	it("defaults to the connectable dispatch set when no CLI set is passed", () => {
+		const baseDir = mkdtempSync(join(tmpdir(), "runner-registry-"));
+		expect(
+			buildRunnerRegistry(baseDir)
+				.getAdapters()
+				.map((adapter) => adapter.id)
+		).toEqual([...CONNECTABLE_TOOL_IDS]);
+	});
 
 	it("reports UNAUTHENTICATED when the injected auth probe exits nonzero (not signed in)", async () => {
 		if (process.platform === "win32") return;
@@ -432,23 +515,27 @@ describe("buildRunnerRegistry (I13)", () => {
 		// The desktop picker reads its per-CLI catalogs from the daemon, so the daemon's registry lookup
 		// must be the real models.dev fetch - a stubbed-empty lookup would pin every picker to the tiny
 		// declarative fallback (the incomplete/outdated desktop model list bug).
+		let seenSignal: AbortSignal | undefined;
 		vi.stubGlobal(
 			"fetch",
-			vi.fn(async () => ({
-				ok: true,
-				json: async () => ({
-					anthropic: {
-						id: "anthropic",
-						models: {
-							"claude-fable-5": {
-								id: "claude-fable-5",
-								name: "Claude Fable 5",
-								release_date: "2026-05-01"
+			vi.fn(async (_url: string, init?: { signal?: AbortSignal }) => {
+				seenSignal = init?.signal;
+				return {
+					ok: true,
+					json: async () => ({
+						anthropic: {
+							id: "anthropic",
+							models: {
+								"claude-fable-5": {
+									id: "claude-fable-5",
+									name: "Claude Fable 5",
+									release_date: "2026-05-01"
+								}
 							}
 						}
-					}
-				})
-			}))
+					})
+				};
+			})
 		);
 		try {
 			const registry = buildRunnerRegistry(mkdtempSync(join(tmpdir(), "runner-registry-")));
@@ -460,6 +547,9 @@ describe("buildRunnerRegistry (I13)", () => {
 			});
 			expect(models?.map((model) => model.id)).toContain("claude-fable-5");
 			expect(models?.every((model) => model.source === "registry")).toBe(true);
+			// The daemon runs on a laptop that is regularly offline. Without a deadline the registry
+			// lookup holds the picker open until the OS TCP timeout.
+			expect(seenSignal).toBeInstanceOf(AbortSignal);
 		} finally {
 			vi.unstubAllGlobals();
 		}

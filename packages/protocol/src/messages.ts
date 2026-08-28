@@ -37,34 +37,189 @@ export function isConnectableToolId(value: string): value is ConnectableToolId {
 }
 
 /**
- * The CLIs a turn's image attachments actually reach.
+ * What an ABSENT `protocolVersion` means: the un-versioned baseline. Every device that connected before
+ * the daemon-side version echo existed reads as this, so a gate on any later version simply does not
+ * fire for it.
  *
- * This describes what OUR DRIVER SENDS, per each adapter's declared `AdapterCapabilities.images` -
- * Claude Code's Agent SDK takes a streamed user message with base64 image content blocks
- * (`adapters/claude-code.ts`), so images ride the turn natively; Codex's driver params carry no images
- * at all, so an attachment handed to it is discarded inside the adapter with nothing upstream saying so.
- * It is deliberately NOT a claim about what the underlying MODEL can see: a Codex model may well be
- * multimodal, and this list would still exclude it, because the gap is in the driver.
- *
- * Lives beside {@link CONNECTABLE_TOOL_IDS} so the ONE list is read by every layer that must agree -
- * the backend's dispatch gate, and the web composer deciding whether to offer an attach control at all.
- * A dispatcher that let an image through to a CLI outside this list would reproduce, one layer down,
- * exactly the silent drop the backend's version gate exists to prevent.
+ * Lives here, on the wire contract itself, because more than one side must read a missing version the
+ * SAME way: the backend's dispatch gate refuses by it and the web composer hides its attach control by
+ * it, and a peer that defaulted differently would offer a control the other end rejects. Deliberately
+ * BELOW every floor in {@link IMAGE_INPUT_CLI_MIN_PROTOCOL}, so a device that reported nothing can never
+ * be sent an image.
  */
-export const IMAGE_INPUT_CLIS = ["claude-code"] as const;
-
-/** A CLI tool id whose driver carries image attachments (see {@link IMAGE_INPUT_CLIS}). */
-export type ImageInputToolId = (typeof IMAGE_INPUT_CLIS)[number];
+export const UNVERSIONED_PROTOCOL_BASELINE = 1;
 
 /**
- * Whether a connection's CLI actually carries image attachments to its model, the shared predicate
- * both the backend dispatch gate and the web composer apply (see {@link IMAGE_INPUT_CLIS}).
+ * One capability gate over a per-CLI protocol-floor table: the CLIs that can EVER carry the attachment
+ * kind, the floor lookup, and the `>=` predicate the backend dispatch gate and the web composer share.
+ * Built once per attachment kind so the image and document gates can never drift apart.
+ *
+ * @param table - The per-CLI minimum protocol version; a CLI absent from it never carries the kind.
+ * @returns The gate's three faces over that table.
+ */
+function attachmentGate<const T extends Partial<Record<ConnectableToolId, number>>>(
+	table: T
+): {
+	ids: readonly (keyof T & string)[];
+	minProtocol: (value: string) => number | undefined;
+	accepts: (value: string, protocolVersion: number) => boolean;
+} {
+	const floors: Readonly<Record<string, number | undefined>> = table;
+	const minProtocol = (value: string): number | undefined => floors[value];
+	return {
+		ids: Object.keys(table) as (keyof T & string)[],
+		minProtocol,
+		accepts: (value, protocolVersion) => {
+			const floor = minProtocol(value);
+			return floor !== undefined && protocolVersion >= floor;
+		}
+	};
+}
+
+/**
+ * The wire-protocol version at which a daemon starts carrying EACH CLI's image attachments through to
+ * its model, per CLI - the ONE table read by every layer that must agree: the backend's dispatch gate,
+ * and the web composer deciding whether to offer an attach control at all. A dispatcher that let an
+ * image through to a CLI/version pair outside this table would reproduce, one layer down, exactly the
+ * silent drop the version gate exists to prevent.
+ *
+ * A FLOOR PER CLI, not one list, because the two entries were earned in different releases and a
+ * single number could only be wrong for one of them. Claude Code has carried images since v2, when
+ * `RunStart.inputImages` first existed. Codex gained them later: its driver gained native app-server
+ * `image` items in the same build that taught grok and OpenCode the file-path fallback, and NO version
+ * distinguished that build from its predecessor - both reported v7, one forwarding a Codex image turn
+ * and one parsing it away. {@link RUNNER_PROTOCOL_VERSION} v8 is the signal cut for exactly that, so
+ * `codex` floors there: a device reporting v8 PROVES its Codex adapter forwards images, and one
+ * reporting v7 proves nothing, so its image turn is refused loudly instead of dropped silently.
+ *
+ * Absence means a CLI whose driver NEVER carries images at any version - refused on the CLI alone,
+ * without reading the device. `satisfies` keeps the keys inside {@link CONNECTABLE_TOOL_IDS}, so a CLI
+ * that cannot cross this wire can never be floored here.
+ *
+ * STILL NARROWER THAN `AdapterCapabilities.images`, AND THE GAP IS STILL THE POINT: grok and OpenCode
+ * carry images on-device but are not connectable over the relay, so they have no floor here. The local
+ * desktop lane - where composer, adapters and drivers all ship in ONE build and no version skew is
+ * possible - reads each adapter's own `capabilities.images` instead. The divergence is asserted in
+ * `packages/agent-core/tests/registry.test.ts`.
+ */
+export const IMAGE_INPUT_CLI_MIN_PROTOCOL = {
+	"claude-code": 2,
+	codex: 8
+} as const satisfies Partial<Record<ConnectableToolId, number>>;
+
+/** A CLI tool id whose driver carries image attachments (see {@link IMAGE_INPUT_CLI_MIN_PROTOCOL}). */
+export type ImageInputToolId = keyof typeof IMAGE_INPUT_CLI_MIN_PROTOCOL;
+
+/**
+ * The CLIs that can EVER carry a turn's image attachments across the runner wire, on a new enough
+ * daemon. Derived from {@link IMAGE_INPUT_CLI_MIN_PROTOCOL} so the two can never disagree.
+ *
+ * Membership alone authorizes NOTHING - it answers "could this CLI ever", not "will this device". Only
+ * {@link acceptsImageInput}, which weighs a reported version against the CLI's floor, answers that.
+ */
+const imageGate = attachmentGate(IMAGE_INPUT_CLI_MIN_PROTOCOL);
+export const IMAGE_INPUT_CLIS: readonly ImageInputToolId[] = imageGate.ids;
+
+/**
+ * The protocol version a daemon must report before it carries this CLI's images, or `undefined` for a
+ * CLI whose driver never carries them at all. The free half of the capability gate: a caller can refuse
+ * on an unfloored CLI without reading the device registry.
  *
  * @param value - The candidate tool/connection id.
- * @returns True when that CLI's driver sends images.
+ * @returns The CLI's minimum protocol version, or `undefined` when it never carries images.
  */
-export function acceptsImageInput(value: string): value is ImageInputToolId {
-	return (IMAGE_INPUT_CLIS as readonly string[]).includes(value);
+export function imageInputMinProtocol(value: string): number | undefined {
+	return imageGate.minProtocol(value);
+}
+
+/**
+ * Whether a turn's images actually reach a CLI on a daemon speaking `protocolVersion` - the shared
+ * predicate both the backend dispatch gate and the web composer apply, so the composer can never offer
+ * an attach control for a turn dispatch would reject.
+ *
+ * The comparison is `>=`, so a daemon NEWER than the floor satisfies it rather than tripping an
+ * equality; a caller holding no reported version must pass the un-versioned baseline (`1`), never a
+ * guess, which floors every CLI to `false`.
+ *
+ * @param value - The candidate tool/connection id.
+ * @param protocolVersion - The wire version the target device reported.
+ * @returns True when that device's driver for that CLI sends images.
+ */
+export function acceptsImageInput(value: string, protocolVersion: number): boolean {
+	return imageGate.accepts(value, protocolVersion);
+}
+
+/**
+ * The wire-protocol version at which a daemon starts carrying EACH CLI's DOCUMENT attachments (PDFs)
+ * through to its model, per CLI - the document twin of {@link IMAGE_INPUT_CLI_MIN_PROTOCOL}, and read by
+ * the same two layers: the backend's dispatch gate and the web composer's attach control.
+ *
+ * A SEPARATE TABLE rather than a widened image one, because the two capabilities were earned in
+ * different builds and a shared floor could only be right for one of them: a daemon at v8 forwards
+ * images for both CLIs and documents for neither. `claude-code` floors at v9 because that is the version
+ * whose daemon gained `RunStart.inputDocuments` at all - a v8 daemon's non-strict parse drops the field
+ * and runs the turn on its text alone, which is the INVISIBLE loss rule 1 fences its refusal exception
+ * with (the CLI answers confidently about a document it never saw).
+ *
+ * CODEX IS DELIBERATELY ABSENT, and the reason is the sharpest illustration of what this table means.
+ * Its adapter really does deliver documents - but by STAGING the file and naming its path in the prompt,
+ * because the app-server input array has no document item. Every run that crosses this wire is a
+ * dispatched run, and a dispatched run is FLOORED: Claude's file tools are denied outright and Codex's
+ * permission profile denies filesystem root. A path handed to a floored run points at a file it cannot
+ * open, so the model would answer about a document it never read - the exact failure this table exists
+ * to refuse. Only a mechanism that survives the floor may be listed here, which today means Claude
+ * Code's native base64 `document` blocks and nothing else.
+ *
+ * The desktop LOCAL lane is unfloored and keeps its full capability, so Codex's path delivery is correct
+ * THERE and its `AdapterCapabilities.documents` stays true. That divergence is the same one the image
+ * table already carries for grok and OpenCode, and it is asserted in `agent-core/tests/registry.test.ts`.
+ *
+ * Absence means a CLI whose driver NEVER carries documents at any version, refused on the CLI alone.
+ * `satisfies` keeps the keys inside {@link CONNECTABLE_TOOL_IDS}.
+ */
+export const DOCUMENT_INPUT_CLI_MIN_PROTOCOL = {
+	"claude-code": 9
+} as const satisfies Partial<Record<ConnectableToolId, number>>;
+
+/** A CLI tool id whose driver carries PDF attachments (see {@link DOCUMENT_INPUT_CLI_MIN_PROTOCOL}). */
+export type DocumentInputToolId = keyof typeof DOCUMENT_INPUT_CLI_MIN_PROTOCOL;
+
+/**
+ * The CLIs that can EVER carry a turn's document attachments across the runner wire, on a new enough
+ * daemon. Derived from {@link DOCUMENT_INPUT_CLI_MIN_PROTOCOL} so the two can never disagree.
+ *
+ * Membership alone authorizes NOTHING - only {@link acceptsDocumentInput}, which weighs a reported
+ * version against the CLI's floor, answers whether a given device will deliver.
+ */
+const documentGate = attachmentGate(DOCUMENT_INPUT_CLI_MIN_PROTOCOL);
+export const DOCUMENT_INPUT_CLIS: readonly DocumentInputToolId[] = documentGate.ids;
+
+/**
+ * The protocol version a daemon must report before it carries this CLI's documents, or `undefined` for
+ * a CLI whose driver never carries them. The free half of the gate: a caller can refuse on an unfloored
+ * CLI without reading the device registry.
+ *
+ * @param value - The candidate tool/connection id.
+ * @returns The CLI's minimum protocol version, or `undefined` when it never carries documents.
+ */
+export function documentInputMinProtocol(value: string): number | undefined {
+	return documentGate.minProtocol(value);
+}
+
+/**
+ * Whether a turn's documents actually reach a CLI on a daemon speaking `protocolVersion` - the shared
+ * predicate the backend dispatch gate and the web composer both apply, so the composer can never offer
+ * a PDF attach control for a turn dispatch would reject.
+ *
+ * The comparison is `>=`, so a daemon newer than the floor satisfies it; a caller holding no reported
+ * version must pass the un-versioned baseline (`1`), never a guess, which floors every CLI to `false`.
+ *
+ * @param value - The candidate tool/connection id.
+ * @param protocolVersion - The wire version the target device reported.
+ * @returns True when that device's driver for that CLI delivers documents.
+ */
+export function acceptsDocumentInput(value: string, protocolVersion: number): boolean {
+	return documentGate.accepts(value, protocolVersion);
 }
 
 /**
@@ -99,6 +254,33 @@ export const MAX_RUN_IMAGE_CHARS = 4 * 1024 * 1024;
  * knocks the device's stream over on every redelivery.
  */
 export const MAX_RUN_IMAGES_TOTAL_CHARS = 16 * 1024 * 1024;
+
+/**
+ * How many documents (PDFs) one turn may carry, matching the ceiling the shipped web composer enforces
+ * client-side. Lower than {@link MAX_RUN_IMAGES} because a document is not a screenshot: three is past
+ * any real "read these and compare" turn, and each one is allowed to be far larger than an image.
+ */
+export const MAX_RUN_DOCUMENTS = 3;
+
+/**
+ * The largest single {@link RunDocument.dataUrl}, in characters.
+ *
+ * Sized from the same client-side ceiling the image bound was: the composer refuses a PDF over ~3 MiB,
+ * which base64 inflates to roughly 4 MiB of data-URL characters. 6 MiB leaves real headroom over that
+ * expansion while still bounding one attachment.
+ */
+export const MAX_RUN_DOCUMENT_CHARS = 6 * 1024 * 1024;
+
+/**
+ * The largest total document payload one turn may carry, in characters of `dataUrl`.
+ *
+ * Deliberately BELOW `MAX_RUN_DOCUMENTS * MAX_RUN_DOCUMENT_CHARS` (18 MiB) so this bound actually
+ * binds, exactly as {@link MAX_RUN_IMAGES_TOTAL_CHARS} does for images. The two bounds are independent
+ * and both apply, so the worst turn the wire admits is 16 MiB of images plus 8 MiB of documents - still
+ * inside the daemon's `MAX_BUFFERED_FRAME_CHARS` (32 MiB), above which its SSE decoder throws, with the
+ * prompt, system prompt and tool manifest that share the frame accounted for.
+ */
+export const MAX_RUN_DOCUMENTS_TOTAL_CHARS = 8 * 1024 * 1024;
 
 /**
  * `zod` schema for the universal {@link ReasoningEffort} ladder - the floor every surface offers when
@@ -189,6 +371,34 @@ export const RunImageSchema = z.object({
 	height: z.number().int().positive().optional()
 });
 
+/**
+ * One document (a PDF) attached to a chat turn, carried to a document-capable CLI in-flight. `dataUrl`
+ * is the file verbatim (`data:application/pdf;base64,<data>`) - unlike an image it is never
+ * recompressed, because a PDF has no lossy variant that stays readable.
+ *
+ * `name` is the ORIGINAL filename and is load-bearing rather than cosmetic: a driver with no native
+ * document channel stages the file and names its path in the prompt, and the transcript stores a chip
+ * built from this name. The daemon never persists the bytes.
+ *
+ * A separate type from {@link RunImage} rather than a widened one: rule 2 forbids repurposing a field,
+ * and the two carry different things (pixel dimensions against a filename) to different mechanisms.
+ */
+export interface RunDocument {
+	/** The document as a `data:` URL (the original bytes, never recompressed). */
+	dataUrl: string;
+	/** IANA media type of the document (`application/pdf`). */
+	mediaType: string;
+	/** The original filename, shown in the transcript and used when a driver stages the file. */
+	name?: string;
+}
+
+/** `zod` schema for {@link RunDocument}. */
+export const RunDocumentSchema = z.object({
+	dataUrl: z.string().min(1),
+	mediaType: z.string().min(1),
+	name: z.string().min(1).optional()
+});
+
 export interface RunStart {
 	type: "run.start";
 	/** Idempotency key; the runner acks and dedupes by this. */
@@ -208,8 +418,8 @@ export interface RunStart {
 	connectionId: string;
 	/**
 	 * The user prompt / task input. Deliberately allowed to be EMPTY (the schema has no `.min(1)`): a
-	 * turn whose content is carried entirely by {@link RunStart.inputImages} is legitimate, and rejecting
-	 * it would drop a valid dispatch.
+	 * turn whose content is carried entirely by {@link RunStart.inputImages} or
+	 * {@link RunStart.inputDocuments} is legitimate, and rejecting it would drop a valid dispatch.
 	 */
 	input: string;
 	/**
@@ -218,6 +428,18 @@ export interface RunStart {
 	 * to text-only rather than failing. Absent on scheduled/product-code dispatches.
 	 */
 	inputImages?: RunImage[];
+	/**
+	 * Documents (PDFs) attached to a chat turn, forwarded to a document-capable CLI in-flight only.
+	 *
+	 * A NEW field beside `inputImages` rather than a generalization of it: rule 2 forbids repurposing a
+	 * field, and a daemon that read documents out of `inputImages` would hand its image mechanism a PDF.
+	 * Additive under rule 3 - absent means exactly what it meant before v9, a turn with no documents.
+	 *
+	 * An older daemon's non-strict parse DROPS this field, which is why the backend refuses such a turn
+	 * rather than degrading it ({@link DOCUMENT_INPUT_CLI_MIN_PROTOCOL}): the drop would be invisible and
+	 * a text-only answer about an unseen document is wrong, not plainer. Absent on scheduled dispatches.
+	 */
+	inputDocuments?: RunDocument[];
 	/**
 	 * OPTIONAL attribution tag for a PRODUCT-CODE dispatch (`dispatchRunnerRun`'s `origin`), e.g.
 	 * "site-audit". Absent on chat and scheduled dispatches. The daemon records it in the local audit
@@ -276,6 +498,7 @@ export const RunStartSchema = z.object({
 	connectionId: z.string().min(1),
 	input: z.string(),
 	inputImages: z.array(RunImageSchema).optional(),
+	inputDocuments: z.array(RunDocumentSchema).optional(),
 	origin: z.string().min(1).optional(),
 	systemPrompt: z.string().optional(),
 	modelId: z.string().optional(),
@@ -379,7 +602,7 @@ export const AuthHealthSchema = z.enum(["healthy", "needs-reauth", "unknown"]);
 
 /**
  * One model a connected CLI advertises on the reporting device, in the picker's wire shape (the SAME
- * `{ id, name, recommended?, effortLevels?, defaultEffort? }` projection the daemon's own local drive
+ * `{ id, name, recommended?, effortLevels?, defaultEffort?, contextWindow? }` projection the daemon's own local drive
  * serves the desktop). It rides {@link CliConnectionInfo.models} so the web picker can offer a device's
  * REAL catalog rather than the fixed one the backend can guess.
  */
@@ -398,6 +621,13 @@ const MAX_EFFORT_LEVEL_CHARS = 32;
 /** The most effort levels one model may advertise - a ladder, not a catalog. */
 const MAX_EFFORT_LEVELS = 16;
 
+/**
+ * Ceiling for a reported context window, ten times the largest window shipped today (Gemini's 1M). A
+ * BOUND, not a value gate: it stops an absurd number being persisted into the durable device record
+ * without refusing a window this build has never seen.
+ */
+const MAX_CONTEXT_WINDOW_TOKENS = 10_000_000;
+
 export interface CliModelInfo {
 	/** The model id a run pins (the CLI's own id, e.g. an OpenCode `provider/model`). */
 	id: string;
@@ -412,6 +642,13 @@ export interface CliModelInfo {
 	effortLevels?: string[];
 	/** The level the model applies to a turn that sends none, when the catalog advertises one. */
 	defaultEffort?: string;
+	/**
+	 * The model's context window in tokens, as the CLI's own catalog reports it. Absent when the source
+	 * publishes none, which every consumer must read as "unknown" rather than substituting a guess: it is
+	 * the denominator a context meter divides by, and a wrong one is the single figure a user would act
+	 * on and be wrong about.
+	 */
+	contextWindow?: number;
 }
 
 /**
@@ -429,7 +666,8 @@ export const CliModelInfoSchema = z.object({
 		.array(z.string().min(1).max(MAX_EFFORT_LEVEL_CHARS))
 		.max(MAX_EFFORT_LEVELS)
 		.optional(),
-	defaultEffort: z.string().min(1).max(MAX_EFFORT_LEVEL_CHARS).optional()
+	defaultEffort: z.string().min(1).max(MAX_EFFORT_LEVEL_CHARS).optional(),
+	contextWindow: z.number().int().positive().max(MAX_CONTEXT_WINDOW_TOKENS).optional()
 }) satisfies z.ZodType<CliModelInfo>;
 
 /**
@@ -456,6 +694,10 @@ export const MAX_REPORTED_CLI_MODELS = 200;
  * route. Two copies meant a field added to the subset would be dropped on whichever side was missed,
  * silently, with both suites green.
  *
+ * A field on {@link CliConnectionInfo} does NOT automatically belong in this subset. `models` and
+ * `unavailableReason` are both deliberately excluded - a field joins only when the poll's query string
+ * can carry it and every reader actually needs it there.
+ *
  * @param connections - The connections snapshot, or `undefined` when a record has none.
  * @returns The same connections without their model lists (empty when there are none).
  */
@@ -475,6 +717,22 @@ export function toConnectionStatus(
  * and multiply every poll's read cost, which is exactly what that cap exists to prevent.
  */
 export const MAX_REPORTED_CLI_CONNECTIONS = 32;
+
+/**
+ * Length ceiling for {@link CliConnectionInfo.unavailableReason} on the wire.
+ *
+ * Declared HERE, in the module that applies it, because `CliConnectionInfoSchema` reads it at MODULE
+ * SCOPE while its schemas are built - not inside a function. A bound imported from elsewhere is a
+ * module edge a bundler may evaluate late, and this one already cost the desktop main bundle a
+ * `ReferenceError` at load while every source suite stayed green (the suites import the modules
+ * directly and never see what a bundler did to them). Defined beside its use, there is no edge to
+ * reorder.
+ *
+ * The reason lands in the DURABLE device record and in a 409 body, so the bound is what stops an
+ * unbounded string being persisted and re-read. Like every other bound here it is a LENGTH gate and
+ * never a value gate: a reason this backend has never seen still decodes.
+ */
+export const MAX_UNAVAILABLE_REASON_CHARS = 200;
 
 /**
  * One coding CLI the daemon has connected on a device, with its last observed auth-health. Reported
@@ -501,6 +759,23 @@ export interface CliConnectionInfo {
 	 * a QUERY STRING, which cannot carry a catalog of this size.
 	 */
 	models?: CliModelInfo[];
+	/**
+	 * Why this CLI cannot serve a run right now, when {@link CliConnectionInfo.authHealth} already says
+	 * it cannot - a short renderable string, at most {@link MAX_UNAVAILABLE_REASON_CHARS} characters.
+	 * DERIVED from `authHealth`, never a second source of truth for whether the CLI works: absent means
+	 * exactly what it meant before this field existed, and `needs-reauth` alone still carries the fact.
+	 *
+	 * A LOOSE bounded string rather than an enum, for the same reason `toolId` is one. The known codes
+	 * live in `UNAVAILABLE_REASON_CODES` (`./availability`), which argues that choice.
+	 *
+	 * Reported on CONNECT and on CHANGE. Deliberately ABSENT from {@link toConnectionStatus}, on the
+	 * `models` precedent: the poll re-reports connections in a QUERY STRING, and a 200-char tail per CLI
+	 * re-encoded on every reconnect is the precise cost that projection exists to avoid. Every reader
+	 * takes it from the durable device record instead.
+	 *
+	 * Rendered as TEXT and never as markup - it lands in a durable record and in a 409 body.
+	 */
+	unavailableReason?: string;
 }
 
 /**
@@ -513,7 +788,8 @@ export interface CliConnectionInfo {
 export const CliConnectionInfoSchema = z.object({
 	toolId: z.string().min(1).max(MAX_CLI_IDENTIFIER_CHARS),
 	authHealth: AuthHealthSchema,
-	models: z.array(CliModelInfoSchema).optional()
+	models: z.array(CliModelInfoSchema).optional(),
+	unavailableReason: z.string().min(1).max(MAX_UNAVAILABLE_REASON_CHARS).optional()
 }) satisfies z.ZodType<CliConnectionInfo>;
 
 /**
@@ -789,7 +1065,8 @@ export const LoginResultBodySchema = z.object({
  * 2. ADDITIVE ONLY within a major. Never remove a field, never repurpose one, never tighten a schema.
  * 3. ABSENT DECODES TO THE PREVIOUS BEHAVIOUR. Every new field's absence must mean exactly what the
  *    prior version did - that is what makes rule 2 safe rather than merely polite.
- * 4. GOLDEN FIXTURES ARE PERMANENT. `tests/fixtures/v<N>/` is append-only, and every version's
+ * 4. GOLDEN FIXTURES ARE PERMANENT. The bytes a version RESOLVES under `tests/fixtures/` are
+ *    append-only (the layout is sparse - see `wire-fixtures.test.ts`), and every version's
  *    fixtures must keep parsing under the current schema forever.
  * 5. A HARD FLOOR IS A DELIBERATE ACT - a changelog entry and an announcement, never a refactor side
  *    effect (the shape `checkCliFloor` in `packages/cli/src/utils/version-floor.ts` uses).
@@ -809,11 +1086,29 @@ export const LoginResultBodySchema = z.object({
  * refuses anything either way. Bumping would have frozen a fortieth fixture directory to advertise a
  * capability nothing gates on.
  *
+ * v8 CHANGED NO SHAPE AT ALL, and is the purest example of the paragraph above: it exists solely so a
+ * peer can know something BEFORE acting. The daemon build that taught the Codex driver native image
+ * items shipped without a bump, so v7 named two daemons in the field - one that forwards a Codex image
+ * turn and one that parses it away - and the backend could not tell them apart from anything they
+ * report. No field could carry that signal retroactively (the old daemon is already built and says
+ * nothing new), and the loss is the invisible kind rule 1 fences its refusal exception with, so the
+ * capability had to become the version number itself. v8's fixtures are therefore byte-identical to
+ * v7's, which is correct rather than lazy: rule 4 freezes what a version puts on the wire, and v8 puts
+ * exactly what v7 did. See {@link IMAGE_INPUT_CLI_MIN_PROTOCOL} for what gates on it.
+ *
+ * v9 ADDED `RunStart.inputDocuments` (PDF attachments) and the {@link DOCUMENT_INPUT_CLI_MIN_PROTOCOL}
+ * floors that gate it. Purely additive under rule 2 - `inputImages` was NOT renamed or widened to carry
+ * documents, which rule 2 forbids outright and which would also have handed a v8 daemon's image
+ * mechanism a PDF - and rule 3 holds because an absent field means what it meant at v8: a turn with no
+ * documents. It earns a bump for the same reason v3 did: a v8 daemon parses the new field AWAY, so a
+ * backend that wants to send one needs a capability signal to gate on, and leaving the number at 8 would
+ * make ONE version name two incompatible daemons in the field.
+ *
  * Rules 4 and 5 are enforced by `tests/version-baseline.test.ts`: ANY edit under `src/**` requires
  * recording a new `tests/version-baseline.json`, and bumping this constant additionally requires freezing
  * a new `tests/fixtures/v<N>/` directory - that guard fails otherwise.
  */
-export const RUNNER_PROTOCOL_VERSION = 7;
+export const RUNNER_PROTOCOL_VERSION = 9;
 
 /**
  * The `/connect` handshake response the backend returns to a pairing daemon. It carries the

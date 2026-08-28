@@ -15,7 +15,7 @@ import type { AutomationCadence } from "../../src/runtime/local/automation-caden
 const MINUTE = 60_000;
 
 /** The IANA zone this process resolves to, the zone an omitted `timezone` must be evaluated in. */
-const PROCESS_ZONE = Intl.DateTimeFormat().resolvedOptions().timeZone;
+const PROCESS_ZONE = new Intl.DateTimeFormat().resolvedOptions().timeZone;
 
 /** The local wall-clock hour an instant falls on in a zone, for asserting DST-shifted occurrences. */
 function hourIn(ms: number, timeZone: string): string {
@@ -200,12 +200,54 @@ describe("nextCronOccurrenceMs", () => {
 describe("displayNextRunAtMs", () => {
 	const now = Date.parse("2026-06-01T12:00:00.000Z");
 
-	it("shows a never-run interval automation as due NOW, which is when it really fires", () => {
-		// A fresh interval row is due on the next tick (pinned dueness), so projecting one interval out
-		// would display a time the automation will have already fired well before.
+	it("shows an interval automation with NO anchor as due NOW, which is when it really fires", () => {
+		// A built-in spec (and a user row from a build predating the creation stamp) carries no anchor, so
+		// the runner fires it on the next tick - projecting one interval out would display a time the
+		// automation will have already fired well before.
 		const cadence: AutomationCadence = { intervalMinutes: 30 };
 		expect(displayNextRunAtMs(cadence, {}, now)).toBe(now);
 		expect(displayNextRunAtMs(cadence, { armedNextRunAtMs: now + 5 * MINUTE }, now)).toBe(now);
+	});
+
+	it("projects a never-run interval automation ONE interval past its creation", () => {
+		// The pair this has to agree with is `computeAutomationWork`, which fires a never-run interval
+		// automation one interval after it was created. Showing "now" here instead is how a fresh hourly
+		// automation read "Next run now" and then did not run for an hour.
+		const cadence: AutomationCadence = { intervalMinutes: 60 };
+		expect(displayNextRunAtMs(cadence, { createdAtMs: now }, now)).toBe(now + 60 * MINUTE);
+		expect(displayNextRunAtMs(cadence, { createdAtMs: now - 20 * MINUTE }, now)).toBe(
+			now + 40 * MINUTE
+		);
+	});
+
+	it("clamps a creation anchor that has gone by to NOW, so an overdue fresh automation reads as due", () => {
+		// The daemon was down through the first interval. The automation IS due, so a projection into the
+		// past would render as "N minutes ago" beside a row that is about to fire.
+		const cadence: AutomationCadence = { intervalMinutes: 30 };
+		expect(displayNextRunAtMs(cadence, { createdAtMs: now - 90 * MINUTE }, now)).toBe(now);
+	});
+
+	it("prefers the LAST RUN over the creation stamp once the automation has run", () => {
+		// The creation stamp anchors the FIRST fire only; after that the cadence runs off the last one.
+		const cadence: AutomationCadence = { intervalMinutes: 30 };
+		expect(
+			displayNextRunAtMs(
+				cadence,
+				{ createdAtMs: now - 500 * MINUTE, lastRunAtMs: now - 10 * MINUTE },
+				now
+			)
+		).toBe(now + 20 * MINUTE);
+	});
+
+	it("ignores the creation stamp on a CRON automation, whose next fire is its expression's", () => {
+		// A cron cadence names its own instants; anchoring one on creation would fire it off-schedule.
+		expect(
+			displayNextRunAtMs(
+				{ cron: "0 9 * * *", timezone: "UTC" },
+				{ createdAtMs: now },
+				now
+			)
+		).toBe(Date.parse("2026-06-02T09:00:00.000Z"));
 	});
 
 	it("projects an interval automation from its last run, clamped to NOW when overdue", () => {

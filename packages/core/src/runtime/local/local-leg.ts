@@ -1,20 +1,21 @@
 import type { AgentRuntimeRegistry } from "../../index";
-import { CONNECTABLE_TOOL_IDS } from "@agentrunner/protocol";
+import { DESKTOP_CLI_IDS } from "@agentrunner/core-types";
 import { join } from "node:path";
+import { resolveToolBinary } from "../../binaries";
+import { installCli, managedBinaryPath, requireInstallSpec } from "../../cli-install";
 import type { AuditLog } from "../audit-log";
 import { listAdapterModels } from "../cli-models";
 import { connectHeadless } from "../connect";
+import { messageOf } from "../error-message";
 import { localDataDir, managedCliDir } from "../paths";
 import type { SecretStore } from "../storage/secret-store";
 import type { StateStore } from "../storage/state-store";
 import type { LocalAppConfig } from "./app-config";
+import { createAppToolsRegistry } from "./app-tools";
 import { createLocalChatStore } from "./chat-store";
 import { canonicalConnectedFolderPath } from "./connected-folder-deny";
 import { connectedFolderForRun } from "./connected-folder-run";
-import {
-	createConnectedFolderStore,
-	resolveConnectedFolderDenyDeps
-} from "./connected-folders";
+import { createConnectedFolderStore, resolveConnectedFolderDenyDeps } from "./connected-folders";
 import { startLocalDriveServer } from "./drive-server";
 import { createLocalSession } from "./local-session";
 import type { LocalSession } from "./local-session";
@@ -54,6 +55,11 @@ export interface LocalLegDeps {
 	audit: AuditLog;
 	/** Process-wide in-flight run count for the automation runner's cap gate (defaults to the leg's own count). */
 	totalActiveRuns?: () => number;
+	/**
+	 * Extra absolute paths this host wants denied to every run this leg composes. See
+	 * `BuildRunOpts.hostDenyReadPaths` (`run-context-builder.ts`), which owns the rule.
+	 */
+	hostDenyReadPaths?: readonly string[];
 	/**
 	 * Service-unit probe for the /v1/health `lifecycle` field. Required rather than defaulted: whether an
 	 * OS service unit is installed is a SHELL fact (the daemon shell owns `service install`), so the host
@@ -104,7 +110,8 @@ export async function startLocalLeg(deps: LocalLegDeps): Promise<LocalLeg> {
 		secrets,
 		audit,
 		config,
-		write
+		write,
+		...(deps.hostDenyReadPaths !== undefined ? { hostDenyReadPaths: deps.hostDenyReadPaths } : {})
 	});
 	// The in-flight run count the automation runner's cap gate consults: the process-wide total when the
 	// caller co-hosts another leg, else this leg's own local session count.
@@ -119,7 +126,9 @@ export async function startLocalLeg(deps: LocalLegDeps): Promise<LocalLeg> {
 	// is why an unscoped install gains no file from this), and each project workspace gets its own, created
 	// lazily on first write.
 	const taskOverrides = createWorkspaceTaskOverrideStores(localDataDir(appDataRoot));
-	const automations = createWorkspaceAutomationStores(join(localDataDir(appDataRoot), "automations"));
+	const automations = createWorkspaceAutomationStores(
+		join(localDataDir(appDataRoot), "automations")
+	);
 	// The per-project connected-folder grants, and the deny predicate's roots resolved ONCE here from THIS
 	// process's environment. This is the seam the daemon owns: every site the daemon judges a folder at (the
 	// drive PUT, and the dispatch/terminal sites that re-validate a stored grant) shares this one dep set, so
@@ -137,12 +146,20 @@ export async function startLocalLeg(deps: LocalLegDeps): Promise<LocalLeg> {
 	// (session -> stores -> runner) and started AFTER the drive server binds; stopped in the drain BEFORE
 	// the session so no new fire starts while in-flight runs are being cancelled. The cap is fresh-read
 	// per fire (like the poll client's ceiling) so a live `limits` change applies without a restart.
+	// The host's product-tools MCP server, as the host itself registers it over `PUT /v1/app-tools`. It is
+	// the automation lane's half of the seam a chat turn gets per request: a tick fires with nobody there to
+	// carry the address, so the daemon holds the last one the host published and mounts it on every fire.
+	// Nothing is persisted - the address names a port that dies with the host that opened it.
+	const appTools = createAppToolsRegistry();
 	const automationRunner = createAutomationRunner({
 		stores: automations,
 		session,
 		config,
 		getMaxConcurrentRuns: () => readState().getMaxConcurrentRuns(),
 		totalActiveRuns,
+		// Fresh per fire, so a host that has since signed out, re-scoped, or gone away is reflected on the
+		// very next automation rather than the next daemon boot.
+		appMcpServers: () => appTools.servers(),
 		// The SAME store and the SAME protected set the drive PUT judges with, so an unattended fire cannot
 		// end up in a folder the authority would have refused. Bound here rather than resolved inside the
 		// runner: one resolution per daemon, one answer.
@@ -159,20 +176,26 @@ export async function startLocalLeg(deps: LocalLegDeps): Promise<LocalLeg> {
 		connectedFolders,
 		connectedFolderDeny,
 		automationRunner,
+		appTools,
 		config,
 		// Project the LOCAL-scope CLI connections down to the wire subset the drive server serves, reading a
 		// FRESH store each call so a separate `connect --local` propagates without restarting the daemon.
 		listConnections: () =>
 			readState()
 				.listConnections(LOCAL_SCOPE)
-				.map((conn) => ({
-					toolId: conn.toolId,
-					authHealth: conn.authHealth,
-					// Static per-CLI capability (from its adapter), so the desktop composer can gate the attach
-					// control off the lightweight tools list without a live catalog probe.
-					images: registry.getAdapter(conn.toolId)?.capabilities.images ?? false
-				})),
-		// Probe the FULL connectable-CLI catalog LIVE per request: each tool's fresh install + auth state
+				.map((conn) => {
+					const adapter = registry.getAdapter(conn.toolId);
+					return {
+						toolId: conn.toolId,
+						authHealth: conn.authHealth,
+						// Static per-CLI capabilities (from its adapter), so the desktop composer can gate the
+						// attach controls off the lightweight tools list without a live catalog probe. Photos and
+						// PDFs are asked separately because a CLI can carry one and not the other.
+						images: adapter?.capabilities.images ?? false,
+						documents: adapter?.capabilities.documents ?? false
+					};
+				}),
+		// Probe the FULL desktop-CLI catalog LIVE per request: each tool's fresh install + auth state
 		// (from its runtime adapter, whose binary resolver already searches the standard user bin dirs a
 		// GUI-launched app's stripped PATH omits) plus whether it already has a LOCAL-scope connection. The
 		// Models tab renders this so a CLI installed + signed in but not yet connected here (e.g. one connected
@@ -185,7 +208,7 @@ export async function startLocalLeg(deps: LocalLegDeps): Promise<LocalLeg> {
 					.map((conn) => conn.toolId)
 			);
 			return Promise.all(
-				CONNECTABLE_TOOL_IDS.map(async (toolId) => {
+				DESKTOP_CLI_IDS.map(async (toolId) => {
 					const adapter = registry.getAdapter(toolId);
 					const base = { toolId, connected: connectedIds.has(toolId) };
 					if (!adapter)
@@ -194,9 +217,11 @@ export async function startLocalLeg(deps: LocalLegDeps): Promise<LocalLeg> {
 							displayName: toolId,
 							installed: false,
 							authenticated: false,
-							images: false
+							images: false,
+							documents: false
 						};
 					const images = adapter.capabilities.images ?? false;
+					const documents = adapter.capabilities.documents ?? false;
 					try {
 						const detected = await adapter.detect();
 						let authenticated = false;
@@ -219,7 +244,8 @@ export async function startLocalLeg(deps: LocalLegDeps): Promise<LocalLeg> {
 							displayName: adapter.displayName,
 							installed: detected.installed,
 							authenticated,
-							images
+							images,
+							documents
 						};
 					} catch {
 						return {
@@ -227,7 +253,8 @@ export async function startLocalLeg(deps: LocalLegDeps): Promise<LocalLeg> {
 							displayName: adapter.displayName,
 							installed: false,
 							authenticated: false,
-							images
+							images,
+							documents
 						};
 					}
 				})
@@ -259,6 +286,40 @@ export async function startLocalLeg(deps: LocalLegDeps): Promise<LocalLeg> {
 					return { status: "not-installed" };
 				case "failed":
 					return { status: "failed", reason: outcome.reason };
+			}
+		},
+		// Install ONE coding CLI into the app's OWN managed folder, or update it - the same call either way,
+		// because a managed install always fetches the latest version. Progress lines go straight to the
+		// route's NDJSON stream.
+		//
+		// The user's OWN install is never touched. A CLI that resolves from PATH or a curated install dir is
+		// theirs to update, and the resolver prefers it over the managed copy anyway, so installing a second
+		// copy would download a tree nothing will ever run. Only a CLI that resolves NOWHERE (or only from
+		// the managed dir, i.e. one this app installed before) is installed here.
+		//
+		// PATH is ALREADY enhanced in this process, so npm and the `#!/usr/bin/env node` launcher it writes
+		// both resolve: the app forks this runtime through `forkWithEnhancedPath`, which awaits
+		// `ensureEnhancedPath()` (the login-shell PATH merged with the curated dirs) BEFORE the fork, and the
+		// fork inherits `process.env`. Re-capturing it here would spawn a login shell per install for a PATH
+		// this process already has.
+		//
+		// The install is NOT tied to the request: the signal is this call's own, never the response's, so a
+		// user who closes the window mid-install leaves a finished install rather than a half-written tree.
+		installTool: async (toolId, onProgress) => {
+			const baseDir = managedCliDir(appDataRoot);
+			try {
+				const spec = requireInstallSpec(toolId);
+				const own = resolveToolBinary(spec.binary);
+				// `resolveToolBinary` is called with NO managed dirs, so a hit is a PATH or curated-dir install
+				// by construction; the comparison is the belt-and-braces for a user whose own PATH happens to
+				// name the managed dir, where the resolved binary is the app's own and an update is correct.
+				if (own !== null && own !== managedBinaryPath(baseDir, toolId)) {
+					return { status: "user-managed", path: own };
+				}
+				await installCli(baseDir, toolId, onProgress, new AbortController().signal);
+				return { status: "installed" };
+			} catch (err) {
+				return { status: "failed", reason: messageOf(err) };
 			}
 		},
 		// Resolve a CLI's model catalog from its runtime adapter (registry-or-fallback for Claude Code/

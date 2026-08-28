@@ -4,10 +4,10 @@ import { writeJsonFileAtomic } from "./atomic-file";
 import { isRecord } from "./is-record";
 
 /**
- * One persisted chat conversation. Mirrors ui's `StoredChatSession` (chat-session-store.ts:45)
- * field-for-field; ui is NOT imported (the daemon must not depend on a frontend package), so this
- * is a deliberate local mirror. `messages` is intentionally opaque (`unknown[]`): the daemon persists
- * the rendered transcript verbatim and never interprets it.
+ * One persisted chat conversation. Mirrors the app's `StoredChatSession`
+ * (`@repo/app-core/chat/session-store`) field-for-field; it is NOT imported (the daemon must not depend on
+ * a frontend package), so this is a deliberate local mirror. `messages` is intentionally opaque
+ * (`unknown[]`): the daemon persists the rendered transcript verbatim and never interprets it.
  */
 export interface LocalStoredChatSession {
 	/** Stable session id (minted by the caller, e.g. `crypto.randomUUID()`). */
@@ -57,6 +57,19 @@ export interface LocalChatStore {
 		messages: readonly unknown[],
 		fallbackTitle?: string
 	): void;
+	/**
+	 * Gives a session its DERIVED title at TURN START (atomic write), creating the record when none
+	 * exists. Without this, a conversation whose client detached before the app's first save lived in a
+	 * TITLE-LESS shell every list hides as a placeholder - the user switched workspaces seconds after
+	 * sending and the conversation looked lost, while the run was in fact still going and its salvage
+	 * would only land at close. A stored NON-EMPTY title always wins (a rename or a generated title is
+	 * never relabelled), messages are untouched, and the resume-handle sidecar is preserved.
+	 *
+	 * @param namespace - The owning namespace (user id, or user id + workspace).
+	 * @param id - The session id.
+	 * @param title - The derived title (the same prefix rule the app derives).
+	 */
+	seedSession(namespace: string, id: string, title: string): void;
 	/** Removes a session (no-op when absent). */
 	delete(namespace: string, id: string): void;
 	/** Renames a session's title (no-op when the id is absent). */
@@ -136,6 +149,40 @@ function isStoredRecord(value: unknown): value is StoredRecord {
 		(value.conversationId === undefined || typeof value.conversationId === "string") &&
 		(value.conversationCli === undefined || typeof value.conversationCli === "string")
 	);
+}
+
+/**
+ * The shell a write starts from when no record exists yet. A missing record is the NORMAL first-turn
+ * case for `appendMessages` and `seedSession`: `onConversation`'s sidecar write may not have fired (a
+ * CLI that mints no resume handle), so neither can assume a shell exists.
+ *
+ * @param id - The session id.
+ * @returns An empty, untitled session.
+ */
+function emptySession(id: string): LocalStoredChatSession {
+	return { id, title: "", updatedAt: 0, modelKey: null, messages: [] };
+}
+
+/**
+ * The record to write, carrying forward the resume-handle sidecar (`conversationId`/`conversationCli`)
+ * from whatever was on disk. Every write goes through this, so a field added to {@link StoredRecord} is
+ * preserved by all of them.
+ *
+ * @param session - The session to persist.
+ * @param existing - The record already on disk, when there was one.
+ * @returns The record with the sidecar preserved.
+ */
+function recordPreserving(
+	session: LocalStoredChatSession,
+	existing: StoredRecord | null
+): StoredRecord {
+	return {
+		session,
+		...(existing?.conversationId !== undefined ? { conversationId: existing.conversationId } : {}),
+		...(existing?.conversationCli !== undefined
+			? { conversationCli: existing.conversationCli }
+			: {})
+	};
 }
 
 /**
@@ -225,43 +272,33 @@ export function createLocalChatStore(
 		},
 		save(namespace, session) {
 			const existing = readRecord(fileFor(namespace, session.id));
-			writeRecord(namespace, session.id, {
-				session,
-				...(existing?.conversationId !== undefined
-					? { conversationId: existing.conversationId }
-					: {}),
-				...(existing?.conversationCli !== undefined
-					? { conversationCli: existing.conversationCli }
-					: {})
-			});
+			writeRecord(namespace, session.id, recordPreserving(session, existing));
 			pruneBeyondCap(namespace);
 		},
 		appendMessages(namespace, id, messages, fallbackTitle) {
 			if (messages.length === 0) return;
 			const existing = readRecord(fileFor(namespace, id));
-			// A missing record is the NORMAL first-turn case here: `onConversation`'s sidecar write may not
-			// have fired (a CLI that mints no resume handle), so the append cannot assume a shell exists.
-			const session = existing?.session ?? {
-				id,
-				title: "",
-				updatedAt: 0,
-				modelKey: null,
-				messages: []
+			const session = existing?.session ?? emptySession(id);
+			const appended: LocalStoredChatSession = {
+				...session,
+				title: session.title.length > 0 ? session.title : (fallbackTitle ?? ""),
+				updatedAt: Date.now(),
+				messages: [...session.messages, ...messages]
 			};
-			writeRecord(namespace, id, {
-				session: {
-					...session,
-					title: session.title.length > 0 ? session.title : (fallbackTitle ?? ""),
-					updatedAt: Date.now(),
-					messages: [...session.messages, ...messages]
-				},
-				...(existing?.conversationId !== undefined
-					? { conversationId: existing.conversationId }
-					: {}),
-				...(existing?.conversationCli !== undefined
-					? { conversationCli: existing.conversationCli }
-					: {})
-			});
+			writeRecord(namespace, id, recordPreserving(appended, existing));
+			pruneBeyondCap(namespace);
+		},
+		seedSession(namespace, id, title) {
+			if (title.length === 0) return;
+			const existing = readRecord(fileFor(namespace, id));
+			// A session that already has a name keeps it: seeding is only the shell's first label.
+			if (existing !== null && existing.session.title.length > 0) return;
+			const session = existing?.session ?? emptySession(id);
+			writeRecord(
+				namespace,
+				id,
+				recordPreserving({ ...session, title, updatedAt: Date.now() }, existing)
+			);
 			pruneBeyondCap(namespace);
 		},
 		delete(namespace, id) {

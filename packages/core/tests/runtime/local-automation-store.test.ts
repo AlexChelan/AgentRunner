@@ -42,7 +42,9 @@ function input(overrides: Partial<UserAutomationInput> = {}): UserAutomationInpu
 		enabled,
 		...(overrides.cli !== undefined ? { cli: overrides.cli } : {}),
 		...(overrides.modelId !== undefined ? { modelId: overrides.modelId } : {}),
-		...(overrides.effort !== undefined ? { effort: overrides.effort } : {})
+		...(overrides.effort !== undefined ? { effort: overrides.effort } : {}),
+		...(overrides.sourceId !== undefined ? { sourceId: overrides.sourceId } : {}),
+		...(overrides.sourceVersion !== undefined ? { sourceVersion: overrides.sourceVersion } : {})
 	};
 	if (overrides.cron !== undefined) {
 		return {
@@ -57,15 +59,18 @@ function input(overrides: Partial<UserAutomationInput> = {}): UserAutomationInpu
 /** A typed due-candidate factory (the minimal shape computeAutomationWork reads). */
 function candidate(overrides: Partial<AutomationDueInput> = {}): AutomationDueInput {
 	const { id = "c1", enabled = true } = overrides;
+	// Absent by default, which is the built-in-spec / legacy-row shape: no creation anchor at all.
+	const created = overrides.createdAt !== undefined ? { createdAt: overrides.createdAt } : {};
 	if (overrides.cron !== undefined) {
 		return {
 			id,
 			enabled,
+			...created,
 			cron: overrides.cron,
 			...(overrides.timezone !== undefined ? { timezone: overrides.timezone } : {})
 		};
 	}
-	return { id, enabled, intervalMinutes: overrides.intervalMinutes ?? 10 };
+	return { id, enabled, ...created, intervalMinutes: overrides.intervalMinutes ?? 10 };
 }
 
 /**
@@ -129,6 +134,9 @@ describe("createLocalAutomationStore - user automations", () => {
 				cli: "codex",
 				modelId: "gpt-x",
 				effort: "high",
+				// Stamped by the store, never by the caller: it is the anchor a never-run interval
+				// automation is due from, so a client could otherwise back-date one into firing at once.
+				createdAt: expect.any(Number),
 				builtIn: false
 			}
 		]);
@@ -143,6 +151,80 @@ describe("createLocalAutomationStore - user automations", () => {
 		expect(store.listUser()).toEqual([
 			expect.objectContaining({ id: created.id, effort: "ultra" })
 		]);
+	});
+
+	it("round-trips the adoption stamp of a mirror of an org-shared definition", () => {
+		// The mirror IS the adoption record - there is no per-member adoption state on any backend - so if
+		// the store dropped these two fields the app would lose track of which definition a local
+		// automation came from, and could never tell the member their machine is running a prompt whose
+		// author has since rewritten it.
+		const store = createLocalAutomationStore(automationDir());
+		const created = store.upsertUser(
+			input({ sourceId: "def-1", sourceVersion: 3, cli: "codex", modelId: "gpt-x" })
+		);
+		expect(store.listUser()).toEqual([
+			expect.objectContaining({ id: created.id, sourceId: "def-1", sourceVersion: 3 })
+		]);
+	});
+
+	it("emits no stamp for an automation authored on this machine", () => {
+		const store = createLocalAutomationStore(automationDir());
+		const created = store.upsertUser(input());
+		const stored = store.listUser()[0];
+		expect(stored?.id).toBe(created.id);
+		expect("sourceId" in (stored ?? {})).toBe(false);
+		expect("sourceVersion" in (stored ?? {})).toBe(false);
+	});
+
+	// A fresh interval automation is due one interval after it was CREATED, so the store has to write down
+	// when that was. It is stamped daemon-side and never accepted from a caller, and it survives every
+	// later edit - otherwise correcting a typo in a daily automation's name would push its next run a day
+	// out, silently, from a dialog that said nothing about the schedule.
+	it("stamps createdAt on a CREATE, from the daemon's own clock", () => {
+		// Daemon-owned by construction: `UserAutomationInput` carries no such field, so a client cannot
+		// back-date an automation into firing at once or post-date one into silence.
+		const store = createLocalAutomationStore(automationDir());
+		const before = Date.now();
+		const created = store.upsertUser(input());
+		expect(created.createdAt).toBeGreaterThanOrEqual(before);
+		expect(created.createdAt).toBeLessThanOrEqual(Date.now());
+		expect(store.listUser()[0]?.createdAt).toBe(created.createdAt);
+	});
+
+	it("carries createdAt through an UPDATE, so an edit never re-anchors the schedule", () => {
+		const store = createLocalAutomationStore(automationDir());
+		const created = store.upsertUser(input({ name: "Nightly" }));
+		const renamed = store.upsertUser(input({ id: created.id, name: "Nightly (v2)" }));
+		expect(renamed.id).toBe(created.id);
+		expect(renamed.name).toBe("Nightly (v2)");
+		expect(renamed.createdAt).toBe(created.createdAt);
+	});
+
+	it("leaves a row written before the stamp existed WITHOUT one, rather than dating it now", () => {
+		// Inventing a creation instant for an automation the user already relies on would postpone its
+		// next fire by a whole interval, from an edit that never mentioned the schedule. No stamp means
+		// the original rule - due at once - which is exactly what that row has been doing all along.
+		const dir = automationDir();
+		const store = createLocalAutomationStore(dir);
+		const created = store.upsertUser(input({ name: "Legacy" }));
+		const { createdAt: _dropped, ...legacy } = created;
+		writeUserRows(dir, { [created.id]: legacy });
+		expect(store.listUser()[0]?.createdAt).toBeUndefined();
+		const edited = store.upsertUser(input({ id: created.id, name: "Legacy renamed" }));
+		expect(edited.createdAt).toBeUndefined();
+	});
+
+	it("drops a malformed stamp rather than carrying one the app would misread", () => {
+		const dir = automationDir();
+		const store = createLocalAutomationStore(dir);
+		const created = store.upsertUser(input({ sourceId: "def-1", sourceVersion: 3 }));
+		for (const sourceVersion of [Number.NaN, "3", null]) {
+			writeUserRows(dir, { [created.id]: { ...created, sourceVersion } });
+			// Dropping the version is the SAFE arm: the app reads a stampless mirror as current, so a
+			// corrupt value can never manufacture a stale alarm - and the pairing survives on `sourceId`.
+			expect(store.listUser()[0]?.sourceVersion).toBeUndefined();
+			expect(store.listUser()[0]?.sourceId).toBe("def-1");
+		}
 	});
 
 	it("drops a non-string or empty stored effort rather than carrying an unusable one", () => {
@@ -304,6 +386,7 @@ describe("createLocalAutomationStore - cadence compatibility", () => {
 			prompt: "Do the thing",
 			cron: "0 9 * * *",
 			enabled: true,
+			createdAt: expect.any(Number),
 			builtIn: false
 		});
 		expect(read !== undefined && "timezone" in read).toBe(false);
@@ -601,7 +684,10 @@ describe("createLocalAutomationStore - traversal refusals", () => {
 });
 
 describe("computeAutomationWork - interval cadence", () => {
-	it("a fresh (never-run) enabled automation is due", () => {
+	it("a never-run automation with NO creation anchor is due (a built-in spec, or a legacy row)", () => {
+		// A built-in's cadence travels via the staged app-config, which carries no creation instant, and a
+		// user row written before the stamp existed carries none either. Inventing one would silently
+		// postpone a schedule the user already relies on, so both keep the original rule.
 		const work = computeAutomationWork([candidate({ id: "x" })], runStates({}), 0);
 		expect(work.due.map((s) => s.id)).toEqual(["x"]);
 		expect(work.toArm).toEqual([]);
@@ -680,6 +766,57 @@ describe("computeAutomationWork - interval cadence", () => {
 		);
 		expect(work.due).toEqual([]);
 		expect(work.toArm).toEqual([]);
+	});
+});
+
+// A freshly created automation used to be due on the very next tick, so saving an hourly one spent a run
+// immediately - surprising on any automation, and on a metered CLI a surprise with a bill attached. The
+// user asked for hourly; the first hour belongs to them.
+describe("computeAutomationWork - the first run after creation", () => {
+	const now = 100 * MINUTE;
+
+	it("does NOT fire an automation created this instant", () => {
+		const work = computeAutomationWork(
+			[candidate({ id: "fresh", intervalMinutes: 60, createdAt: now })],
+			runStates({}),
+			now
+		);
+		expect(work.due).toEqual([]);
+		expect(work.toArm).toEqual([]);
+	});
+
+	it("fires it once a FULL interval has passed since creation (at the exact boundary)", () => {
+		const automation = candidate({ id: "fresh", intervalMinutes: 60, createdAt: now - 60 * MINUTE });
+		expect(computeAutomationWork([automation], runStates({}), now).due.map((s) => s.id)).toEqual([
+			"fresh"
+		]);
+		// One minute short of the boundary it is still waiting - the interval is a full interval, not a
+		// rounding of one.
+		const early = candidate({ id: "fresh", intervalMinutes: 60, createdAt: now - 59 * MINUTE });
+		expect(computeAutomationWork([early], runStates({}), now).due).toEqual([]);
+	});
+
+	it("stops using the creation anchor once the automation has run", () => {
+		// The stamp anchors the FIRST fire only. Reading it forever would pin every later fire to the
+		// creation instant, which for a long-lived automation means permanently due.
+		const automation = candidate({
+			id: "ran",
+			intervalMinutes: 10,
+			createdAt: now - 500 * MINUTE
+		});
+		const work = computeAutomationWork(
+			[automation],
+			runStates({ ran: { lastRunAt: now - 9 * MINUTE } }),
+			now
+		);
+		expect(work.due).toEqual([]);
+	});
+
+	it("leaves a CRON automation alone: it arms first, so it never fired on creation anyway", () => {
+		const automation = candidate({ id: "cronny", cron: "*/5 * * * *", createdAt: now });
+		const work = computeAutomationWork([automation], runStates({}), now);
+		expect(work.due).toEqual([]);
+		expect(work.toArm.map((s) => s.id)).toEqual(["cronny"]);
 	});
 });
 

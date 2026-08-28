@@ -10,8 +10,12 @@ import type {
 	ToolSet
 } from "../index";
 import type { RunConversationMsg, RunEventMsg, RunStart, ToolCall } from "@agentrunner/protocol";
+import { isDesktopCliId } from "@agentrunner/core-types";
+import type { DesktopCliId } from "@agentrunner/core-types";
 import type { AuditLog } from "./audit-log";
 import { ensureIsolatedCodexHome } from "./codex-isolation";
+import { disposeIsolatedGrokHome, ensureIsolatedGrokHome } from "./grok-isolation";
+import { ensureIsolatedOpencodeConfigHome } from "./opencode-isolation";
 import { messageOf } from "./error-message";
 import { deriveRunKind, isRunKindDenied } from "./origin-policy";
 import type { OriginPolicy, RunKind } from "./origin-policy";
@@ -115,6 +119,12 @@ export interface ExecutorDeps {
 	agentUid?: number;
 	/** The gid a run's work folder is handed to when {@link ExecutorDeps.contained} (needs `agentUid`). */
 	agentGid?: number;
+	/**
+	 * Extra absolute paths this host wants denied to every run this executor composes. See
+	 * `BuildRunOpts.hostDenyReadPaths` (`run-context-builder.ts`), which owns the rule: files a host holds
+	 * outside its runtime root, never the enclosing tree.
+	 */
+	hostDenyReadPaths?: readonly string[];
 }
 
 /** Per-dispatch options for {@link Executor.start}, outside the frozen RunStart wire type. */
@@ -222,6 +232,98 @@ function refusalDetail(start: RunStart): Record<string, string> {
 	};
 }
 
+/** The isolated config homes one run needs, in the shape {@link buildRun} takes them. */
+interface RunIsolationHomes {
+	/**
+	 * The isolated config home this CLI is driven against - `CODEX_HOME`, `GROK_HOME`, or opencode's
+	 * `$XDG_CONFIG_HOME`. Absent for a CLI that needs none (Claude Code carries its servers on argv).
+	 */
+	configHome?: string;
+	/**
+	 * Releases whatever this run's isolation MINTED for it alone, called once on the run's close
+	 * (terminal, cancel, or a setup refusal). Only an isolation that is per-run needs one: the shared
+	 * homes are reused by the next run and must survive it.
+	 */
+	dispose?: () => void;
+}
+
+/** What an isolation seam is handed: the confined data root, the run id, plus a contained host's agent identity. */
+interface RunIsolationInput {
+	/** The confined `work/` parent the home is seeded under. */
+	appDataRoot: string;
+	/**
+	 * The run being prepared. A PER-RUN isolation keys its home on this; the shared ones ignore it.
+	 * Untrusted (it arrives on the wire), so any seam that puts it in a path confines it first.
+	 */
+	runId: string;
+	/** The unprivileged identity to group-share the home with, on a contained host only. */
+	agent?: { uid: number; gid: number };
+}
+
+/**
+ * How each locally driven CLI's HEADLESS run is isolated from the user's PERSONAL configuration -
+ * their own MCP servers, model default and permission prefs - which a bare `<cli> run` would
+ * otherwise read straight out of the home directory. The interactive terminal is a separate spawn
+ * that never reaches here, so it deliberately keeps the user's full config.
+ *
+ * EXHAUSTIVE BY TYPE, which is the whole point: keyed on the union derived from
+ * {@link DESKTOP_CLI_IDS}, so adding a CLI id without deciding its isolation fails to COMPILE here.
+ * The three `toolId === "..."` equality checks this replaces failed OPEN instead - a new id matched
+ * none of them, silently took no isolation at all, and ran headless against the user's own servers
+ * and permission prefs with nothing in the types or at runtime to say so.
+ *
+ * `claude-code` is the one deliberate no-op: the SDK isolates it through `query` options rather than
+ * a config home. It is spelled out rather than left out, because an absent key is exactly the
+ * silence this map exists to prevent.
+ */
+export const RUN_ISOLATION: Readonly<
+	Record<DesktopCliId, (input: RunIsolationInput) => RunIsolationHomes>
+> = {
+	"claude-code": () => ({}),
+	// A headless Codex run is isolated from the user's personal `~/.codex` (which has no strict-MCP
+	// flag) by pointing CODEX_HOME at a runner-managed home whose config declares no personal MCP
+	// servers; its auth.json symlinks the user's real login, so subscription auth is preserved. On a
+	// contained host the home is group-shared with the agent identity - root seeds it, but the
+	// unprivileged child writes its session state there. A half-set identity is refused (same rule the
+	// work folder uses).
+	codex: (input) => ({
+		configHome: ensureIsolatedCodexHome(
+			input.appDataRoot,
+			input.agent ? { agent: input.agent } : {}
+		)
+	}),
+	// A headless Grok run is isolated the same way, and for a sharper reason: grok's headless command
+	// has NO inline MCP flag, so the isolated home's `config.toml` is the ONLY seam the app's MCP
+	// servers reach the run through - and rewriting that file per run is also what drops the user's
+	// personal servers, model default and permission prefs, and (via its `[compat.*]` cells) grok's
+	// discovery of the user's Claude/Cursor servers, skills, rules and shell hooks. Grok's
+	// Claude-PLUGIN discovery has no switch in 1.0.3 and stays a documented residual - see
+	// `ensureIsolatedGrokHome`.
+	//
+	// The ONE isolation minted PER RUN, and the only one with a `dispose`. Because that config file is
+	// the whole MCP surface, a home shared with a second run is a file the second run rewrites while
+	// the first run's child is still booting - so grok gets its own home and its own config, and the
+	// home is released when the run closes. Codex and Claude Code pass their servers on argv and are
+	// immune, so their homes stay shared.
+	grok: (input) => ({
+		configHome: ensureIsolatedGrokHome(input.appDataRoot, {
+			runId: input.runId,
+			...(input.agent ? { agent: input.agent } : {})
+		}),
+		dispose: () => disposeIsolatedGrokHome(input.appDataRoot, input.runId)
+	}),
+	// A headless OpenCode run is isolated by moving only its CONFIG scope: opencode reads its global
+	// `mcp` servers, model default and instructions from `$XDG_CONFIG_HOME/opencode`, and `opencode
+	// run` has no inline MCP or permission flag, so the config the runner writes there (and hands over
+	// inline as opencode's last merge) is the only seam for the app's servers AND the run's permission
+	// posture. Auth needs no seeding at all here: the data scope stays the user's, so the provider
+	// logins and the session store are untouched. The connected workspace's own `opencode.json` still
+	// loads - a documented residual, see `ensureIsolatedOpencodeConfigHome`.
+	opencode: (input) => ({
+		configHome: ensureIsolatedOpencodeConfigHome(input.appDataRoot)
+	})
+};
+
 /**
  * Builds the {@link Executor} over the runtime session manager. Each `start` resolves the
  * connection, builds the isolated {@link RunContext} + clamped
@@ -289,10 +391,22 @@ export function createExecutor(deps: ExecutorDeps): Executor {
 			// reflects the true lifecycle (start -> onClose) whichever branch closes the run.
 			active.add(start.runId);
 			let closed = false;
+			/**
+			 * Releases this run's per-run isolation (grok's own `GROK_HOME`), assigned as soon as the
+			 * isolation is prepared. Undefined until then, and for every CLI whose home is shared.
+			 */
+			let releaseIsolation: (() => void) | undefined;
 			const finish = (): void => {
 				if (closed) return;
 				closed = true;
 				active.delete(start.runId);
+				try {
+					releaseIsolation?.();
+				} catch (err) {
+					// Best-effort cleanup: a home that will not delete is collected by the next stale sweep,
+					// and must never keep an already-finished run's `onClose` from firing.
+					deps.log?.(`run ${start.runId} isolation cleanup failed: ${messageOf(err)}\n`);
+				}
 				hooks.onClose();
 			};
 
@@ -344,38 +458,52 @@ export function createExecutor(deps: ExecutorDeps): Executor {
 					return;
 				}
 
-				// A headless Codex run is isolated from the user's personal `~/.codex` (which has no strict-MCP
-				// flag) by pointing CODEX_HOME at a runner-managed home whose config declares no personal MCP
-				// servers; its auth.json symlinks the user's real login, so subscription auth is preserved. Only
-				// Codex needs this (Claude Code isolates via SDK options); the interactive terminal is a separate
-				// spawn that never reaches here, so it keeps the user's full config. On a contained host the
-				// home is group-shared with the agent identity - root seeds it, but the unprivileged child writes its
-				// session state there. A half-set identity is refused (same rule the work folder uses).
+				// Prepare this CLI's config isolation from {@link RUN_ISOLATION} - a map keyed on the desktop
+				// CLI union, so a CLI added without an isolation decision breaks the build rather than
+				// running headless against the user's own MCP servers and permission prefs.
 				const containerAgent =
 					deps.contained && deps.agentUid !== undefined && deps.agentGid !== undefined
 						? { uid: deps.agentUid, gid: deps.agentGid }
 						: undefined;
-				const codexHome =
-					connection.toolId === "codex"
-						? ensureIsolatedCodexHome(
-								deps.appDataRoot,
-								containerAgent ? { agent: containerAgent } : {}
-							)
-						: undefined;
+				// FAIL CLOSED on a tool id outside that catalog. Every reachable connection is created
+				// through `connect`, which gates on this same catalog, and the registry builds an adapter
+				// only for these ids - so an id that is not one has no isolation recipe AND no adapter, and
+				// letting it through would spawn a headless CLI over the user's personal configuration.
+				if (!isDesktopCliId(connection.toolId)) {
+					hooks.onEvent({
+						type: "run.event",
+						runId: start.runId,
+						event: { type: "error", message: `Unsupported tool "${connection.toolId}"` }
+					});
+					finish();
+					return;
+				}
+				const isolation = RUN_ISOLATION[connection.toolId]({
+					appDataRoot: deps.appDataRoot,
+					runId: start.runId,
+					...(containerAgent ? { agent: containerAgent } : {})
+				});
+				// Registered the moment the isolation exists, so EVERY close path below releases it - the
+				// refusals, the cancel, the terminal event, and the setup `catch` that a throw after this
+				// point lands in. A per-run home that outlives its run is a leak the stale sweep only
+				// collects a day later.
+				releaseIsolation = isolation.dispose;
+				const { configHome } = isolation;
 				const { ctx, req, resolvers, effectivePolicy } = buildRun({
 					appDataRoot: deps.appDataRoot,
 					backendKey: deps.backendKey,
 					...(opts?.workKey !== undefined ? { workKey: opts.workKey } : {}),
-					...(opts?.connectedFolder !== undefined
-						? { connectedFolder: opts.connectedFolder }
-						: {}),
+					...(opts?.connectedFolder !== undefined ? { connectedFolder: opts.connectedFolder } : {}),
 					start,
 					connection,
 					resolveBinary: deps.resolveBinary,
-					...(codexHome ? { codexHome } : {}),
+					...(configHome ? { configHome } : {}),
 					...(deps.contained ? { contained: true } : {}),
 					...(deps.agentUid !== undefined ? { agentUid: deps.agentUid } : {}),
-					...(deps.agentGid !== undefined ? { agentGid: deps.agentGid } : {})
+					...(deps.agentGid !== undefined ? { agentGid: deps.agentGid } : {}),
+					...(deps.hostDenyReadPaths !== undefined
+						? { hostDenyReadPaths: deps.hostDenyReadPaths }
+						: {})
 				});
 
 				const toolSet = manifestToToolSet(start.webToolManifest, start.runId, hooks.onToolCall);
@@ -476,6 +604,16 @@ export function createExecutor(deps: ExecutorDeps): Executor {
 							}
 							if (event.type === "permission-request") {
 								deps.sessionManager.respondToPermission(runId, event.requestId, "allow");
+								// DISCLOSE what was just allowed. The decision is unchanged - chat runs auto-approve,
+								// and an interactive prompt is a separate piece of work - but answering on the user's
+								// behalf and telling them nothing is the part that was wrong. The disclosure rides the
+								// run's own event channel, so it lands in the transcript and is persisted with it: a
+								// reopened conversation still shows what the runtime allowed while it ran.
+								hooks.onEvent({
+									type: "run.event",
+									runId,
+									event: { type: "permission", toolName: event.toolName, decision: "auto-approved" }
+								});
 								return;
 							}
 							// Record the terminal outcome locally before forwarding it up: a `done` completed the run,

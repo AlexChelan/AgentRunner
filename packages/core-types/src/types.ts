@@ -99,6 +99,34 @@ export interface ModelInfo {
 	effortLevels?: string[];
 	/** The level the model applies to a turn that sends none, when the source advertises one. */
 	defaultEffort?: string;
+	/**
+	 * Whether the model accepts IMAGE input, when its source declares the modality (`undefined` when the
+	 * source says nothing). Read permissively by the composer - only an explicit `false` hides the photo
+	 * attach control - because image input is the norm and a wrongly-hidden control costs a common
+	 * capability.
+	 */
+	images?: boolean;
+	/**
+	 * Whether the model accepts DOCUMENT (PDF) input, when its source declares the modality.
+	 *
+	 * Read STRICTLY, the inverse of {@link images}, and the asymmetry is deliberate: PDF input is the
+	 * exception rather than the norm (models.dev declares it for roughly a fifth of its catalog), so an
+	 * unknown treated permissively would offer the control on mostly text-only models and the turn would
+	 * fail at the provider. The registry declares the modality wherever it exists, so strictness costs
+	 * almost nothing real and buys an honest control.
+	 */
+	documents?: boolean;
+	/**
+	 * The input modalities this model DECLARES, verbatim from its source (`text`, `image`, `pdf`,
+	 * `audio`, `video` - both registries use a closed five-token vocabulary, differing only in that
+	 * OpenRouter names the document one `file`).
+	 *
+	 * Carried raw rather than as more booleans because it is what makes the composer's attach control
+	 * DATA-DRIVEN: a model that gains audio input starts accepting audio without a line of UI changing,
+	 * and no list of accepted types is written anywhere in the frontend. Absent means the source declared
+	 * none, which is NOT an empty list - see `capabilityFromModalities`.
+	 */
+	inputModalities?: readonly string[];
 }
 
 /**
@@ -166,6 +194,24 @@ export interface RunImage {
 	height?: number;
 }
 
+/**
+ * One document (a PDF) attached to a chat turn, sent to a document-capable agentic CLI in-flight only.
+ * `dataUrl` carries the file verbatim (`data:application/pdf;base64,<data>`) - a PDF has no lossy
+ * variant that stays readable, so unlike an image it is never recompressed. The daemon never persists
+ * it (the transcript stores only a name + size chip).
+ *
+ * `name` is load-bearing rather than cosmetic: a driver with no native document channel stages the file
+ * on disk under this name and points the CLI's own file tool at the path.
+ */
+export interface RunDocument {
+	/** The document as a `data:` URL (the original bytes). */
+	dataUrl: string;
+	/** IANA media type of the document (`application/pdf`). */
+	mediaType: string;
+	/** The original filename, used when a driver stages the file for its CLI to read. */
+	name?: string;
+}
+
 /** One streamed run request. */
 export interface RunRequest {
 	connectionId: string;
@@ -175,6 +221,12 @@ export interface RunRequest {
 	 * true (Claude Code). Adapters without the capability ignore them. Chat-only; absent otherwise.
 	 */
 	images?: RunImage[];
+	/**
+	 * Documents (PDFs) attached to the turn, forwarded to an adapter whose
+	 * {@link AdapterCapabilities.documents} is true. Adapters without the capability never receive them -
+	 * the session gate refuses the turn rather than dropping the attachment. Chat-only; absent otherwise.
+	 */
+	documents?: RunDocument[];
 	/**
 	 * Typed multi-turn history for a completion run, preferred over `prompt` when
 	 * present and non-empty. The chat handler builds it from the session's turns so
@@ -236,16 +288,37 @@ export interface AdapterCapabilities {
 	/** True if selecting subscription mode must show a blocking ToS risk disclosure first. */
 	subscriptionRequiresDisclosure: boolean;
 	/**
-	 * True when this agentic adapter can accept image attachments on a chat turn (forwarded as native
-	 * image content to the CLI). Claude Code sets it (the Agent SDK takes base64 image content blocks).
-	 * Omitted (falsy) for adapters whose turn input is text-only ON THE DRIVEN PATH, so the desktop
-	 * composer hides the attach control for them - which is a statement about what OUR driver sends,
-	 * not about what the tool could accept. Codex is text-only end to end. OpenCode and Hermes both
-	 * ADVERTISE `promptCapabilities.image` over ACP, but this client's `session/prompt` sends text
-	 * parts only and its driver params carry no images, so declaring it for them would offer an attach
-	 * control whose attachments are silently discarded. Irrelevant to completion adapters; omitted.
+	 * True when an image attached to a chat turn actually REACHES this adapter's model - the question
+	 * the composer asks before offering an attach control. It is a statement about what OUR driver
+	 * sends, not about what the tool could accept, and it deliberately does NOT say by which mechanism:
+	 * every driver uses the best one its CLI really has, all verified against the installed binaries.
+	 *
+	 * Claude Code passes base64 image content blocks to the Agent SDK. Codex sends native `image` items
+	 * on the app-server's `turn/start` input array. OpenCode stages the files and passes `opencode run
+	 * -f <path>`. Grok has no image channel of any kind on its headless transport, so its driver stages
+	 * the files and names the paths in the prompt for grok's own file tool to open - a fallback, but one
+	 * that still puts the image in front of the model, which is what this flag promises.
+	 *
+	 * What a falsy value means is the thing this flag exists to prevent: an attachment that would be
+	 * SILENTLY DISCARDED. Nothing in the desktop CLI catalog is falsy any more; the dispatch gates that
+	 * read it stay in place for an adapter that has no image route at all. Irrelevant to completion
+	 * adapters; omitted.
 	 */
 	images?: boolean;
+	/**
+	 * True when a DOCUMENT (a PDF) attached to a chat turn actually REACHES this adapter's model. The
+	 * same promise {@link images} makes, about a different payload, and equally silent on the mechanism.
+	 *
+	 * Claude Code passes base64 `document` blocks to the Agent SDK, which is Anthropic's native PDF
+	 * channel. The other three CLIs have no document channel at all, so their drivers stage the file and
+	 * put its path in front of the model: OpenCode through `opencode run -f <path>`, Codex and Grok by
+	 * naming the path in the prompt for their own file-reading tools to open.
+	 *
+	 * SEPARATE FROM {@link images} rather than folded into one "attachments" flag, because the two are
+	 * genuinely independent - a model can read a screenshot and not a PDF - and one flag would have to be
+	 * wrong for one of them. Irrelevant to completion adapters; omitted.
+	 */
+	documents?: boolean;
 	/**
 	 * True when this agentic adapter can OS-enforce `network: 'off'` (actually cut all egress)
 	 * for the run it drives. Codex sets it: its SDK exposes `networkAccessEnabled: false`, an

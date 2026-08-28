@@ -1,0 +1,5 @@
+{
+  "toolId": "claude-code",
+  "authHealth": "needs-reauth",
+  "unavailableReason": "needs-reauth: this CLI needs to be signed in again on this computer"
+}

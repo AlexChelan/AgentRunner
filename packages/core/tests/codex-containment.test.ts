@@ -66,7 +66,7 @@ function recordingSpawn(): { spawnFn: SpawnFn; options: () => RecordedSpawnOptio
 /** The minimum driver params a run needs; `floored` marks it as backend-dispatched. */
 function runParams(
 	floored: boolean,
-	codexHome?: string
+	configHome?: string
 ): Parameters<ReturnType<typeof makeDrivers>["codexDriver"]>[0] {
 	return {
 		binaryPath: "/usr/local/bin/codex",
@@ -75,7 +75,7 @@ function runParams(
 		permissionMode: "read-only",
 		signal: new AbortController().signal,
 		...(floored ? { floored: true } : {}),
-		...(codexHome ? { codexHome } : {})
+		...(configHome ? { configHome } : {})
 	};
 }
 
@@ -83,9 +83,9 @@ function runParams(
 async function drive(
 	drivers: AgentDriversLike,
 	floored: boolean,
-	codexHome?: string
+	configHome?: string
 ): Promise<void> {
-	for await (const _ of drivers.codexDriver(runParams(floored, codexHome))) {
+	for await (const _ of drivers.codexDriver(runParams(floored, configHome))) {
 		// consumed for the side effect only
 	}
 }

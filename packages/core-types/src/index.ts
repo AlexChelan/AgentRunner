@@ -15,6 +15,8 @@
 
 export { cadenceOf, toCadence } from "./automation-cadence";
 export type { AutomationCadence } from "./automation-cadence";
+export { DESKTOP_CLI_IDS, isDesktopCliId } from "./desktop-clis";
+export type { DesktopCliId } from "./desktop-clis";
 export { FALLBACK_MODELS } from "./fallback-models";
 export { curateModels, fetchModelRegistry, MODELS_DEV_URL } from "./model-registry";
 export { isSafeTerminalToolName, TERMINAL_TOOL_NAME_PATTERN } from "./tool-names";

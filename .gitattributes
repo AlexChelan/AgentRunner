@@ -1,0 +1,6 @@
+# Normalize all text files to LF on checkout. The protocol version-baseline guard
+# (packages/protocol/tests/version-baseline.test.ts) hashes the source tree against a
+# committed baseline captured on LF; a CRLF checkout (Windows with core.autocrlf=true)
+# would shift every hash and fail CI on windows-latest while nothing changed. Binary
+# files are auto-detected and left untouched.
+* text=auto eol=lf

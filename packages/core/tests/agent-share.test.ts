@@ -43,7 +43,20 @@ function modeOf(path: string): number {
 	return statSync(path).mode & 0o7777;
 }
 
-describe.skipIf(process.platform === "win32")(
+/** Whether this platform has the POSIX ownership and mode bits every case below asserts on. */
+const posix = process.platform !== "win32";
+
+/**
+ * Registers a suite only on a platform with POSIX ownership and mode bits.
+ *
+ * @param name - The suite title.
+ * @param body - The suite body.
+ */
+function describePosix(name: string, body: () => void): void {
+	if (posix) describe(name, body);
+}
+
+describePosix(
 	"shareWithAgent - the happy path it exists for",
 	() => {
 		it("moves the GROUP and sets the mode, leaving the owner where it was", () => {
@@ -85,7 +98,7 @@ describe.skipIf(process.platform === "win32")(
 	}
 );
 
-describe.skipIf(process.platform === "win32")(
+describePosix(
 	"shareWithAgent - NEGATIVE: a planted symlink",
 	() => {
 		it("refuses a symlink to a directory, leaving the target's mode untouched", () => {
@@ -144,7 +157,7 @@ describe.skipIf(process.platform === "win32")(
 	}
 );
 
-describe.skipIf(process.platform === "win32")(
+describePosix(
 	"shareDirNoFollow - throws rather than following",
 	() => {
 		it("throws for a symlink (the caller decides; shareWithAgent swallows)", () => {
@@ -171,3 +184,13 @@ describe.skipIf(process.platform === "win32")(
 		});
 	}
 );
+
+if (!posix) {
+	describe("shareWithAgent", () => {
+		it("has no POSIX group or mode to move on this platform", () => {
+			// The premise every suite above turns on. `chown`/`chmod` and the no-follow discipline are
+			// POSIX facts; Windows has no equivalent for these assertions to read.
+			expect(posix).toBe(false);
+		});
+	});
+}

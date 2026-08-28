@@ -1,6 +1,7 @@
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { codexHomeDir } from "./paths";
+import { realCodexHome, realGrokHome, realOpencodeDataHome } from "./cli-homes";
+import { codexHomeDir, grokHomeDir } from "./paths";
 
 /**
  * Home-relative credential + secret trees a DISPATCHED run's CLI is denied any read of, ON TOP OF the
@@ -51,11 +52,6 @@ export function sensitiveHomeReadDenyPaths(home: string = homedir()): string[] {
 	];
 }
 
-/** The user's real Codex home (`$CODEX_HOME` or `~/.codex`) - a codex run's login source. */
-function realCodexHome(home: string): string {
-	return process.env.CODEX_HOME ?? join(home, ".codex");
-}
-
 /**
  * The Codex credential homes denied to a NON-codex run. A prompt-injected Claude (or any non-codex) run
  * must not reach the user's Codex login, so it is denied BOTH the user's real `~/.codex` (or `$CODEX_HOME`)
@@ -73,4 +69,44 @@ export function codexCredentialReadDenyPaths(
 	home: string = homedir()
 ): string[] {
 	return [realCodexHome(home), codexHomeDir(appDataRoot)];
+}
+
+/**
+ * The Grok credential homes denied to a NON-grok run, the exact counterpart of
+ * {@link codexCredentialReadDenyPaths}. Grok stores its x.ai OAuth tokens in `<GROK_HOME>/auth.json`,
+ * so a prompt-injected Claude/Codex/OpenCode run is denied BOTH the user's real `~/.grok` (or
+ * `$GROK_HOME`) AND the runner-managed isolated home ({@link grokHomeDir}) - whose `auth.json` is a
+ * symlink to the real login on a plain POSIX desktop but a plaintext COPY on a contained host and on
+ * the symlink-forbidden Windows fallback, so that copy is denied too. A GROK run itself must NOT deny
+ * these (its `GROK_HOME/auth.json` is its login), so callers add this list ONLY for non-grok runs.
+ *
+ * @param appDataRoot - The daemon's app-data root (locates the isolated grok home).
+ * @param home - The user's home dir (defaults to {@link homedir}); injectable for tests.
+ * @returns The Grok credential homes to deny a non-grok run.
+ */
+export function grokCredentialReadDenyPaths(
+	appDataRoot: string,
+	home: string = homedir()
+): string[] {
+	return [realGrokHome(home), grokHomeDir(appDataRoot)];
+}
+
+/**
+ * The opencode credential home denied to a NON-opencode run. opencode keeps its provider logins - the
+ * OAuth tokens and API keys of every provider the user signed into - in `auth.json` under its DATA
+ * home, so a prompt-injected Claude/Codex/Grok run is denied that whole tree.
+ *
+ * ONE entry, deliberately, where the Codex and Grok helpers carry two: the runner's opencode isolation
+ * repoints `XDG_CONFIG_HOME` ONLY, leaving the data base the user's own, so no credential is ever
+ * copied or symlinked into a managed home and there is no second location to deny. The managed config
+ * home holds no credential (it is a config document) and already sits inside the app-data root.
+ *
+ * An OPENCODE run itself must NOT deny this (that `auth.json` is its login), so callers add this list
+ * ONLY for non-opencode runs.
+ *
+ * @param home - The user's home dir (defaults to {@link homedir}); injectable for tests.
+ * @returns The opencode credential home to deny a non-opencode run.
+ */
+export function opencodeCredentialReadDenyPaths(home: string = homedir()): string[] {
+	return [realOpencodeDataHome(home)];
 }

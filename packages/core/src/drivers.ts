@@ -6,11 +6,40 @@ import { join } from "node:path";
 import { createInterface } from "node:readline";
 import { query as realQuery } from "@anthropic-ai/claude-agent-sdk";
 import type { Options, SDKUserMessage } from "@anthropic-ai/claude-agent-sdk";
-import type { RunImage } from "@agentrunner/core-types";
+import type { RunDocument, RunImage } from "@agentrunner/core-types";
 import { buildCliEnv } from "./env-scrub";
+import {
+	promptForDocumentOnlyTurn,
+	promptWithStagedDocuments,
+	stageRunDocuments
+} from "./run-documents";
+import { promptForImageOnlyTurn, promptWithStagedImages, stageRunImages } from "./run-images";
+import { base64FromDataUrl } from "./run-attachments";
 import { reseedIsolatedCodexConfig } from "./runtime/codex-isolation";
+import { reseedIsolatedGrokConfig } from "./runtime/grok-isolation";
+import {
+	opencodeIsolatedConfigJson,
+	opencodeIsolationEnv,
+	reseedIsolatedOpencodeConfig
+} from "./runtime/opencode-isolation";
 import { isWindowsShimPath, resolveToolBinary } from "./binaries";
 import { nodeDirOnPath, stripInspectorEnv } from "./shell-path";
+import { runTool } from "./exec";
+import { makeGrokModelLister } from "./adapters/grok";
+import { buildGrokRunArgs } from "./adapters/grok-args";
+import {
+	grokFrameToMessages,
+	newGrokStreamState,
+	parseGrokStreamLine
+} from "./adapters/grok-frames";
+import { makeOpencodeModelLister } from "./adapters/opencode";
+import type { OpencodeModelLister } from "./adapters/opencode";
+import { buildOpencodeRunArgs } from "./adapters/opencode-args";
+import {
+	newOpencodeStreamState,
+	opencodeFrameToMessages,
+	parseOpencodeStreamLine
+} from "./adapters/opencode-frames";
 import {
 	buildCodexAppServerArgs,
 	buildCodexPermissionProfileOverrides,
@@ -115,10 +144,23 @@ export interface AgentDrivers {
 	claudeDriver: ClaudeDriver;
 	/** Drives the user's installed Codex via `codex app-server` (JSON-RPC over stdio). */
 	codexDriver: AgenticCliDriver;
+	/** Drives the user's installed Grok via its headless `grok -p` command (NDJSON over stdout). */
+	grokDriver: AgenticCliDriver;
+	/** Drives the user's installed OpenCode via its headless `opencode run` command. */
+	opencodeDriver: AgenticCliDriver;
 	/** Asks the user's installed Codex app-server which models (and efforts) it advertises. */
 	codexModelLister: AdvertisedModelLister;
 	/** Asks the user's installed Claude Code which models (and effort levels) it advertises. */
 	claudeModelLister: AdvertisedModelLister;
+	/** Asks the user's installed Grok (`grok models`) which models it advertises. */
+	grokModelLister: AdvertisedModelLister;
+	/**
+	 * Asks the user's installed OpenCode (`opencode models --verbose`) which models it offers. Its
+	 * type differs from the other three: opencode addresses models as `provider/model` across
+	 * whichever providers that machine authenticated, so the probe IS the catalog rather than an
+	 * effort enrichment onto a registry one.
+	 */
+	opencodeModelLister: OpencodeModelLister;
 }
 
 /**
@@ -223,27 +265,29 @@ function toClaudeImageMediaType(mediaType: string): (typeof CLAUDE_IMAGE_MEDIA_T
 	return CLAUDE_IMAGE_MEDIA_TYPES.find((type) => type === mediaType) ?? "image/jpeg";
 }
 
-/** The base64 payload of a `data:` URL (everything after the comma), or the input when it has none. */
-function base64FromDataUrl(dataUrl: string): string {
-	const comma = dataUrl.indexOf(",");
-	return comma === -1 ? dataUrl : dataUrl.slice(comma + 1);
-}
-
 /**
  * Builds the Claude Agent SDK `query` prompt input for a turn. A text-only turn passes the prompt string
- * (the SDK's simple form); a turn WITH images passes a one-message async stream whose user message carries
- * the prompt text plus one base64 image content block per attachment, which is how the Agent SDK accepts
- * images. The stream yields exactly one message and completes, so the SDK runs a single turn.
+ * (the SDK's simple form); a turn WITH attachments passes a one-message async stream whose user message
+ * carries the prompt text plus one content block per attachment - a base64 `image` block per photo and a
+ * base64 `document` block per PDF, which are the two channels the Agent SDK accepts natively. The stream
+ * yields exactly one message and completes, so the SDK runs a single turn.
  *
- * @param prompt - The composed prompt text (may be empty for an image-only turn).
- * @param images - The attached images, or undefined/empty for a text-only turn.
- * @returns The prompt string, or an async iterable of one user message with image blocks.
+ * A document block carries the ORIGINAL filename as its `title` when the turn had one, so the model can
+ * match the attachment to whatever the user's text calls it.
+ *
+ * @param prompt - The composed prompt text (may be empty for an attachment-only turn).
+ * @param images - The attached images, or undefined/empty when none.
+ * @param documents - The attached PDFs, or undefined/empty when none.
+ * @returns The prompt string, or an async iterable of one user message with the attachment blocks.
  */
 function claudePromptInput(
 	prompt: string,
-	images: RunImage[] | undefined
+	images: RunImage[] | undefined,
+	documents: RunDocument[] | undefined
 ): string | AsyncIterable<SDKUserMessage> {
-	if (!images || images.length === 0) return prompt;
+	const photos = images ?? [];
+	const files = documents ?? [];
+	if (photos.length === 0 && files.length === 0) return prompt;
 	async function* one(): AsyncGenerator<SDKUserMessage> {
 		yield {
 			type: "user",
@@ -252,13 +296,22 @@ function claudePromptInput(
 				role: "user",
 				content: [
 					...(prompt ? [{ type: "text" as const, text: prompt }] : []),
-					...images!.map((image) => ({
+					...photos.map((image) => ({
 						type: "image" as const,
 						source: {
 							type: "base64" as const,
 							media_type: toClaudeImageMediaType(image.mediaType),
 							data: base64FromDataUrl(image.dataUrl)
 						}
+					})),
+					...files.map((document) => ({
+						type: "document" as const,
+						source: {
+							type: "base64" as const,
+							media_type: "application/pdf" as const,
+							data: base64FromDataUrl(document.dataUrl)
+						},
+						...(document.name ? { title: document.name } : {})
 					}))
 				]
 			}
@@ -269,7 +322,7 @@ function claudePromptInput(
 
 /**
  * INACTIVITY ceiling for a Claude run, in milliseconds - the exact counterpart of
- * {@link CODEX_STALL_TIMEOUT_MS}, which the SDK path went without. It resets on EVERY message the SDK
+ * {@link CLI_STALL_TIMEOUT_MS}, which the SDK path went without. It resets on EVERY message the SDK
  * yields (a text/thinking delta, a tool use, a tool result), so a run that keeps making visible progress
  * streams for arbitrarily long; the ceiling only fires when the CLI goes fully SILENT for the whole
  * window, which is a wedged process. Unbounded, that run holds its in-flight slot forever - the daemon
@@ -357,7 +410,10 @@ function makeClaudeDriver(query: ClaudeQuery, stallTimeoutMs: number): ClaudeDri
 		const openToolUses = new Map<string, { name: string; detail?: string }>();
 		// Iterated by hand rather than with `for await`, so each read can be raced against the inactivity
 		// ceiling; `stream.return()` in the `finally` keeps the early-exit teardown `for await` gave us.
-		const stream = query({ prompt: claudePromptInput(p.prompt, p.images), options });
+		const stream = query({
+			prompt: claudePromptInput(p.prompt, p.images, p.documents),
+			options
+		});
 		const iterator = stream[Symbol.asyncIterator]();
 		// Whether the turn's `result` message has landed. Past it the run is already reported, so a CLI
 		// slow to close its stream is just teardown - ending cleanly, never turning a finished run into a
@@ -365,6 +421,10 @@ function makeClaudeDriver(query: ClaudeQuery, stallTimeoutMs: number): ClaudeDri
 		let sawTerminal = false;
 		try {
 			while (true) {
+				// A cancelled run stops STREAMING here, not merely at the end: the SDK stream can
+				// already hold queued messages when the abort lands, and replaying them would keep a
+				// stopped run visibly producing output after the user pressed Stop.
+				if (p.signal.aborted) return;
 				const read = iterator.next();
 				const next = await withTimeout(read, stallTimeoutMs);
 				if (next === "timeout") {
@@ -376,8 +436,7 @@ function makeClaudeDriver(query: ClaudeQuery, stallTimeoutMs: number): ClaudeDri
 					if (p.signal.aborted || sawTerminal) return;
 					yield {
 						kind: "error",
-						message:
-							"The model run stalled - no activity for 15 minutes. Try again; if it persists, update your Claude Code CLI."
+						message: stallMessage("Claude Code", stallTimeoutMs)
 					};
 					return;
 				}
@@ -438,10 +497,7 @@ function makeClaudeDriver(query: ClaudeQuery, stallTimeoutMs: number): ClaudeDri
 			}
 		} catch (error) {
 			if (p.signal.aborted) return;
-			yield {
-				kind: "error",
-				message: withStderr(error instanceof Error ? error.message : String(error), stderrDetail)
-			};
+			yield { kind: "error", message: failureMessage(error, stderrDetail) };
 		} finally {
 			// Closes the SDK query on EVERY exit - the stall, a consumer that stops reading mid-run, or a
 			// normal end. `for await` did this implicitly; hand-iterating means doing it explicitly, or a
@@ -452,7 +508,7 @@ function makeClaudeDriver(query: ClaudeQuery, stallTimeoutMs: number): ClaudeDri
 }
 
 /**
- * INACTIVITY ceiling for a Codex run, in milliseconds. It resets on EVERY output line, so a run that
+ * INACTIVITY ceiling for one NDJSON CLI run (codex, grok, opencode), in milliseconds. It resets on EVERY output line, so a run that
  * keeps emitting (tool calls, reasoning, text) streams for arbitrarily long - a task can run for
  * hours as long as it makes visible progress. The ceiling only fires when the child goes fully
  * SILENT for the whole window, which is a genuinely hung process (the sole guard the unattended
@@ -462,10 +518,22 @@ function makeClaudeDriver(query: ClaudeQuery, stallTimeoutMs: number): ClaudeDri
  * chat also has a Stop button, so a user can always cancel sooner. After a terminal event a stall is
  * just the child being slow to close, so it is treated as a clean end, not an error.
  */
-const CODEX_STALL_TIMEOUT_MS = 900_000;
+const CLI_STALL_TIMEOUT_MS = 900_000;
 
 /**
- * Races the next stdout-line read against {@link CODEX_STALL_TIMEOUT_MS}. Resolves to the iterator
+ * The recoverable error a stalled run surfaces, with the ceiling spelled from the constant that enforces
+ * it, so no driver can name a number its own watchdog no longer uses.
+ *
+ * @param cliName - The CLI as the user knows it, for the "update your X CLI" advice.
+ * @param ms - The inactivity ceiling that just elapsed, in milliseconds.
+ * @returns The user-facing stall message.
+ */
+function stallMessage(cliName: string, ms: number): string {
+	return `The model run stalled - no activity for ${Math.round(ms / 60_000)} minutes. Try again; if it persists, update your ${cliName} CLI.`;
+}
+
+/**
+ * Races the next stdout-line read against {@link CLI_STALL_TIMEOUT_MS}. Resolves to the iterator
  * result when a line arrives, or the sentinel `'stalled'` when the ceiling elapses first. The timer
  * is always cleared so a completed read never leaks a pending timeout.
  *
@@ -477,11 +545,119 @@ export function raceLineAgainstStall(
 ): Promise<IteratorResult<string> | "stalled"> {
 	let timer: ReturnType<typeof setTimeout> | undefined;
 	const stall = new Promise<"stalled">((resolve) => {
-		timer = setTimeout(resolve, CODEX_STALL_TIMEOUT_MS, "stalled");
+		timer = setTimeout(resolve, CLI_STALL_TIMEOUT_MS, "stalled");
 	});
 	return Promise.race([read, stall]).finally(() => {
 		if (timer) clearTimeout(timer);
 	});
+}
+
+/** The spawned CLI child one headless turn drives, named once for the helpers below. */
+type CliChild = ReturnType<SpawnFn>;
+
+/** What a CLI turn accumulates from its child while the stream is read. */
+interface CliChildIo {
+	/** Everything the child has written to stderr, appended to whatever error the turn reports. */
+	stderr: string;
+	/** A non-abort spawn failure (e.g. ENOENT); an aborted spawn is swallowed as teardown. */
+	spawnError?: Error;
+}
+
+/**
+ * Wires the plumbing every NDJSON CLI turn here shares, so the four rules live in ONE place rather
+ * than once per driver: stdin errors are swallowed (stdin can be torn down mid-run by a cancel, and a
+ * lost write is not a run failure), stderr is accumulated for the error messages, a non-abort spawn
+ * error is captured, and the run's cancel reaches the child.
+ *
+ * @param child - The spawned CLI.
+ * @param signal - The run's cancel signal; an ALREADY-aborted run cancels synchronously.
+ * @param onAbort - What cancel does; defaults to the kill a headless single-turn CLI has no protocol
+ *   to improve on.
+ * @returns The live stderr/spawn-error the turn's outcome is reported from.
+ */
+function attachCliChild(
+	child: CliChild,
+	signal: AbortSignal,
+	onAbort: () => void = () => {
+		child.kill();
+	}
+): CliChildIo {
+	const io: CliChildIo = { stderr: "" };
+	child.stdin?.on("error", () => {});
+	child.stderr?.on("data", (chunk: Buffer) => {
+		io.stderr += chunk.toString();
+	});
+	child.on("error", (err: Error) => {
+		io.spawnError = isAbortError(err) ? undefined : err;
+	});
+	if (signal.aborted) onAbort();
+	else signal.addEventListener("abort", onAbort, { once: true });
+	return io;
+}
+
+/** What {@link pumpCliLines} yields when the inactivity ceiling fired instead of a line arriving. */
+const CLI_STALLED = { stalled: true } as const;
+
+/**
+ * Pumps a CLI child's stdout as lines, under the two rules every NDJSON driver here shares.
+ *
+ * A CANCELLED run stops STREAMING immediately rather than merely at the end: the child's stdout can
+ * already hold buffered lines when the kill lands, and replaying them would keep a stopped run visibly
+ * producing output after the user pressed Stop. A run that goes fully SILENT for
+ * {@link CLI_STALL_TIMEOUT_MS} is a genuinely hung one (a healthy run resets the ceiling on every
+ * streamed delta), so the child is killed and the pending read's late rejection swallowed.
+ *
+ * Neither ending throws. The generator simply ENDS on cancel and on stdout EOF, which drops each
+ * driver into the `signal.aborted` guard and the terminal-outcome rule it already runs after the loop;
+ * a stall on a run that was NOT cancelled yields {@link CLI_STALLED} first, so a driver's whole stall
+ * handling is one `if`. The readline interface is owned here and closed on every exit, including the
+ * consumer breaking out of the loop.
+ *
+ * @param child - The spawned CLI, killed when the ceiling fires.
+ * @param signal - The run's cancel signal.
+ * @param onStall - Called before the kill, for a driver that traces where a run hung.
+ * @yields Each stdout line, or {@link CLI_STALLED} when the inactivity ceiling fired first.
+ */
+async function* pumpCliLines(
+	child: CliChild,
+	signal: AbortSignal,
+	onStall?: () => void
+): AsyncGenerator<string | typeof CLI_STALLED> {
+	if (!child.stdout) return;
+	const rl = createInterface({ input: child.stdout, crlfDelay: Infinity });
+	try {
+		const iterator = rl[Symbol.asyncIterator]();
+		while (true) {
+			if (signal.aborted) return;
+			const read = iterator.next();
+			const result = await raceLineAgainstStall(read);
+			if (result === "stalled") {
+				onStall?.();
+				child.kill();
+				void read.catch(() => {});
+				if (signal.aborted) return;
+				yield CLI_STALLED;
+				return;
+			}
+			if (result.done) return;
+			yield result.value;
+		}
+	} finally {
+		rl.close();
+	}
+}
+
+/**
+ * The text a thrown run failure surfaces: the thrown value's own message with the child's stderr
+ * appended when it said anything. One reading for every driver here, so a caught failure never reads
+ * differently on one CLI than on another.
+ *
+ * @param error - The thrown value.
+ * @param stderr - What the child printed on stderr.
+ * @returns The message to report.
+ */
+function failureMessage(error: unknown, stderr: string): string {
+	return withStderr(error instanceof Error ? error.message : String(error), stderr);
 }
 
 /**
@@ -575,7 +751,7 @@ function makeCodexDriver(
 		// deep-merges them into the file config instead of replacing it. Doing it here leaves only the
 		// child's own startup between the write and Codex's read; it narrows the window, it does not close
 		// it (see `reseedIsolatedCodexConfig`). Fail-closed: a config we cannot author refuses the RUN.
-		if (p.codexHome) reseedIsolatedCodexConfig(p.codexHome);
+		if (p.configHome) reseedIsolatedCodexConfig(p.configHome);
 		const child = spawnFn(p.binaryPath, args, {
 			stdio: ["pipe", "pipe", "pipe"],
 			// Run inside the per-product work folder so process-relative file operations stay confined.
@@ -583,29 +759,18 @@ function makeCodexDriver(
 			...privilegeDrop,
 			// Inherit an allowlisted env (PATH, proxy, CA, locale, ...) with the node dir on PATH, then add
 			// the BYOK key as `CODEX_API_KEY`; subscription mode reads the user's `~/.codex` login instead.
-			// When an isolated `codexHome` is supplied (a headless chat/automation run), point `CODEX_HOME` at
+			// When an isolated `configHome` is supplied (a headless chat/automation run), point `CODEX_HOME` at
 			// it so codex loads that home's config.toml (NO personal MCP servers) and its seeded auth.json
-			// instead of the user's `~/.codex` - the terminal path passes no `codexHome` and keeps the user's.
+			// instead of the user's `~/.codex` - the terminal path passes no `configHome` and keeps the user's.
 			// A contained host also repoints HOME at the unprivileged user's own home: the child runs as
 			// that uid and could not write the daemon user's home anyway. `extra` is applied last, so it
 			// wins over the allowlisted HOME the host inherited.
 			env: childEnvFor({
 				...(p.apiKey ? { CODEX_API_KEY: p.apiKey } : {}),
-				...(p.codexHome ? { CODEX_HOME: p.codexHome } : {}),
+				...(p.configHome ? { CODEX_HOME: p.configHome } : {}),
 				...(containment.contained && containment.homeDir ? { HOME: containment.homeDir } : {})
 			})
 		});
-		child.stdin?.on("error", () => {});
-		let stderr = "";
-		child.stderr?.on("data", (chunk: Buffer) => {
-			stderr += chunk.toString();
-		});
-		// Capture a non-abort spawn error (e.g. ENOENT); an aborted spawn is swallowed as teardown.
-		let spawnError: Error | undefined;
-		child.on("error", (err: Error) => {
-			spawnError = isAbortError(err) ? undefined : err;
-		});
-
 		let nextId = 1;
 		const writeMessage = (message: Record<string, unknown>): void => {
 			try {
@@ -639,8 +804,7 @@ function makeCodexDriver(
 			// Give the interrupt a tick to flush, then force teardown so a hung server cannot strand cancel.
 			setImmediate(() => child.kill());
 		};
-		if (p.signal.aborted) onAbort();
-		else p.signal.addEventListener("abort", onAbort, { once: true });
+		const io = attachCliChild(child, p.signal, onAbort);
 
 		const state = newCodexAppServerTurnState();
 		let phase: "init" | "thread" | "turn" | "stream" = "init";
@@ -649,106 +813,106 @@ function makeCodexDriver(
 		let turnReqId: number | undefined;
 		let sawTerminal = false;
 
-		const rl = child.stdout
-			? createInterface({ input: child.stdout, crlfDelay: Infinity })
-			: undefined;
+		// CODEX HAS NO DOCUMENT ITEM. Its `turn/start` input array takes `text` and `image` only, so a PDF
+		// takes the same fallback grok's images do: staged as a file, with the path named in the prompt for
+		// codex's own file tool to open. Images still ride the native item beside it, which is why the two
+		// arrive here by different routes on the same CLI.
+		//
+		// Staged LAST - after the config re-author and the spawn, immediately before the `try` whose
+		// `finally` removes it. Both of those steps can still refuse the run (`reseedIsolatedCodexConfig`
+		// is deliberately fail-closed, and the spawn itself can throw), and a file written before a throw
+		// that never reaches the `finally` is a leaked attachment in the user's temp directory. It cannot
+		// move INSIDE the `try` for the same reason it must sit this late: the `finally` has to see it.
+		const documents = stageRunDocuments(p.documents);
 		try {
-			if (rl) {
-				const iterator = rl[Symbol.asyncIterator]();
-				while (true) {
-					const read = iterator.next();
-					const result = await raceLineAgainstStall(read);
-					if (result === "stalled") {
-						// No message for the inactivity ceiling - a genuinely hung run (a healthy run resets this
-						// on every streamed delta). Kill the child, swallow the pending read's late rejection, and
-						// surface a recoverable stall error (unless the run was already cancelled).
-						codexTrace("stall", `phase=${phase}`);
-						child.kill();
-						void read.catch(() => {});
+			for await (const line of pumpCliLines(child, p.signal, () =>
+				codexTrace("stall", `phase=${phase}`)
+			)) {
+				if (typeof line !== "string") {
+					yield { kind: "error", message: stallMessage("Codex", CLI_STALL_TIMEOUT_MS) };
+					return;
+				}
+				const incoming = parseCodexAppServerLine(line);
+				if (!incoming) continue;
+				if (incoming.kind === "serverRequest") {
+					// Non-interactive product run: acknowledge any server-side approval/tool request with an
+					// empty result so the turn never blocks on an unanswered prompt (sandbox + approvalPolicy
+					// never means none fire in practice; this is belt-and-suspenders).
+					writeMessage({ jsonrpc: "2.0", id: incoming.id, result: {} });
+					continue;
+				}
+				if (incoming.kind === "response") {
+					if (incoming.error) {
 						if (p.signal.aborted) return;
-						yield {
-							kind: "error",
-							message:
-								"The model run stalled - no activity for 15 minutes. Try again; if it persists, update your Codex CLI."
-						};
+						yield { kind: "error", message: withStderr(incoming.error, io.stderr) };
 						return;
 					}
-					if (result.done) break;
-					const incoming = parseCodexAppServerLine(result.value);
-					if (!incoming) continue;
-					if (incoming.kind === "serverRequest") {
-						// Non-interactive product run: acknowledge any server-side approval/tool request with an
-						// empty result so the turn never blocks on an unanswered prompt (sandbox + approvalPolicy
-						// never means none fire in practice; this is belt-and-suspenders).
-						writeMessage({ jsonrpc: "2.0", id: incoming.id, result: {} });
-						continue;
+					if (phase === "init" && incoming.id === initId) {
+						writeMessage({ jsonrpc: "2.0", method: "initialized", params: {} });
+						threadReqId = p.resume
+							? sendRequest("thread/resume", buildCodexThreadResumeParams(p.resume))
+							: sendRequest(
+									"thread/start",
+									buildCodexThreadStartParams({
+										cwd: runCwd,
+										sandboxMode: posture.sandboxMode,
+										approvalPolicy: posture.approvalPolicy,
+										permissionProfileActive: confined,
+										...(p.model ? { model: p.model } : {})
+									})
+								);
+						phase = "thread";
+					} else if (phase === "thread" && incoming.id === threadReqId) {
+						threadId = extractCodexThreadId(incoming.result);
+						// Surface the thread id so a follow-up turn can resume (spike-D).
+						if (threadId) yield { kind: "conversation", id: threadId };
+						turnReqId = sendRequest(
+							"turn/start",
+							buildCodexTurnStartParams({
+								threadId: threadId ?? "",
+								cwd: runCwd,
+								prompt: promptWithStagedDocuments(p.prompt, documents.staged),
+								// Images ride the structured `input` array as native `image` items; no file is written
+								// for them. Documents cannot: they were staged above and named in the prompt instead.
+								...(p.images && p.images.length > 0 ? { images: p.images } : {}),
+								sandboxMode: posture.sandboxMode,
+								networkAccessEnabled: networkEnabled,
+								...(effort ? { effort } : {}),
+								// The model rides EVERY turn, not just `thread/start`. A resumed thread carried
+								// only its id, so switching models mid-conversation moved the picker and billed
+								// the model the thread opened with.
+								...(p.model ? { model: p.model } : {})
+							})
+						);
+						phase = "turn";
+					} else if (phase === "turn" && incoming.id === turnReqId) {
+						turnId = extractCodexTurnId(incoming.result);
+						phase = "stream";
 					}
-					if (incoming.kind === "response") {
-						if (incoming.error) {
-							if (p.signal.aborted) return;
-							yield { kind: "error", message: withStderr(incoming.error, stderr) };
-							return;
-						}
-						if (phase === "init" && incoming.id === initId) {
-							writeMessage({ jsonrpc: "2.0", method: "initialized", params: {} });
-							threadReqId = p.resume
-								? sendRequest("thread/resume", buildCodexThreadResumeParams(p.resume))
-								: sendRequest(
-										"thread/start",
-										buildCodexThreadStartParams({
-											cwd: runCwd,
-											sandboxMode: posture.sandboxMode,
-											approvalPolicy: posture.approvalPolicy,
-											permissionProfileActive: confined,
-											...(p.model ? { model: p.model } : {})
-										})
-									);
-							phase = "thread";
-						} else if (phase === "thread" && incoming.id === threadReqId) {
-							threadId = extractCodexThreadId(incoming.result);
-							// Surface the thread id so a follow-up turn can resume (spike-D).
-							if (threadId) yield { kind: "conversation", id: threadId };
-							turnReqId = sendRequest(
-								"turn/start",
-								buildCodexTurnStartParams({
-									threadId: threadId ?? "",
-									cwd: runCwd,
-									prompt: p.prompt,
-									sandboxMode: posture.sandboxMode,
-									networkAccessEnabled: networkEnabled,
-									...(effort ? { effort } : {})
-								})
-							);
-							phase = "turn";
-						} else if (phase === "turn" && incoming.id === turnReqId) {
-							turnId = extractCodexTurnId(incoming.result);
-							phase = "stream";
-						}
-						continue;
-					}
-					// notification
-					codexTrace("event", incoming.method);
-					const { messages, outcome } = codexAppServerNotificationToMessages(
-						incoming.method,
-						incoming.params,
-						state
-					);
-					for (const message of messages) yield message;
-					if (outcome) {
-						sawTerminal = true;
-						// A failed turn already emitted its error; a completed/interrupted turn breaks to `done`.
-						if (outcome === "failed") return;
-						break;
-					}
+					continue;
+				}
+				// notification
+				codexTrace("event", incoming.method);
+				const { messages, outcome } = codexAppServerNotificationToMessages(
+					incoming.method,
+					incoming.params,
+					state
+				);
+				for (const message of messages) yield message;
+				if (outcome) {
+					sawTerminal = true;
+					// A failed turn already emitted its error; a completed/interrupted turn breaks to `done`.
+					if (outcome === "failed") return;
+					break;
 				}
 			}
 			if (p.signal.aborted) return;
 			codexTrace(
 				"end",
-				`sawTerminal=${sawTerminal} emittedText=${state.emittedText} stderr=${stderr.trim().slice(-200)}`
+				`sawTerminal=${sawTerminal} emittedText=${state.emittedText} stderr=${io.stderr.trim().slice(-200)}`
 			);
-			if (spawnError) {
-				yield { kind: "error", message: withStderr(spawnError.message, stderr) };
+			if (io.spawnError) {
+				yield { kind: "error", message: withStderr(io.spawnError.message, io.stderr) };
 				return;
 			}
 			if (sawTerminal) {
@@ -757,7 +921,7 @@ function makeCodexDriver(
 				// stdout EOF before a terminal event = the app-server died mid-run.
 				yield {
 					kind: "error",
-					message: withStderr("Codex app-server exited before completing the turn", stderr)
+					message: withStderr("Codex app-server exited before completing the turn", io.stderr)
 				};
 			}
 		} catch (error) {
@@ -765,13 +929,307 @@ function makeCodexDriver(
 			// not a run failure, so swallow it silently - the other drivers do the same. A genuine
 			// (non-abort) failure still surfaces as an error.
 			if (p.signal.aborted || isAbortError(error)) return;
+			yield { kind: "error", message: failureMessage(error, io.stderr) };
+		} finally {
+			child.kill();
+			// The child is dead, so it has read whatever it opened; a cancelled or failed turn lands here
+			// too, so no staged document outlives the run that staged it.
+			documents.cleanup();
+		}
+	};
+}
+
+/**
+ * Builds the Grok driver, driving the user's OWN installed `grok` with a PER-TURN headless spawn:
+ * `grok -p <prompt> --output-format streaming-messages-json --include-partial-messages`. That format
+ * is NDJSON in the Claude-Code stream-json envelope, which this repo already parses, so no ACP
+ * (`grok agent stdio`) is involved and no pinned SDK talks to a foreign binary - the user's own CLI
+ * decides its own protocol version. Every frame goes through one normalizer
+ * ({@link grokFrameToMessages}), so a divergence between the assumed and real wire shape is a
+ * single-file fix.
+ *
+ * Continuity is per-turn, since each turn is its own process: turn 1 claims `--session-id <uuid>` and
+ * surfaces it as a `conversation` message; turn N passes `--resume <id>` instead, so the CLI reloads
+ * its own transcript rather than having it replayed in the prompt.
+ *
+ * ISOLATION RIDES THE CONFIG HOME, NOT ARGV. Grok's headless command has NO inline MCP flag, so an
+ * isolated `GROK_HOME` whose `config.toml` is re-authored immediately before the spawn is the ONLY
+ * way the app's MCP servers reach the run - and the same rewrite is what drops the user's personal
+ * servers, model default and permission prefs, and closes grok's discovery of the user's
+ * Claude/Cursor servers, skills, rules and SHELL HOOKS (which it reads from `$HOME`, so repointing
+ * `GROK_HOME` alone does not stop them). Grok's Claude-PLUGIN discovery has no switch in 1.0.3 and
+ * remains a documented residual - see `ensureIsolatedGrokHome`. A BYOK key rides `XAI_API_KEY` in the
+ * child env; subscription mode reads the login in that home's symlinked `auth.json`. Neither ever
+ * touches argv.
+ *
+ * NOTHING HERE IS OS-ENFORCED. `--sandbox` is never named (its profiles live in the user's own config
+ * and an unappliable one makes grok refuse to start), so `network` and `denyReadPaths` are NOT
+ * honoured by this driver - the adapter declares `enforcesNetworkOff: false` and the run-loop emits
+ * the honest per-run `network-not-enforced` signal instead of a silent false guarantee. The run's
+ * posture is what grok's own `--permission-mode` / `--allow` / `--deny` rules can apply.
+ *
+ * @param spawnFn - The process spawner (injected for tests).
+ * @returns The Grok agentic-CLI driver.
+ */
+export function makeGrokDriver(spawnFn: SpawnFn): AgenticCliDriver {
+	return async function* (p) {
+		// A chat with no connected workspace has an empty `p.cwd`; grok needs a real directory, so fall
+		// back to the OS temp dir (a valid, writable, throwaway directory) - the run is chat-only.
+		const runCwd = p.cwd && p.cwd.length > 0 ? p.cwd : tmpdir();
+		// A NEW conversation claims its id up front, so a follow-up turn can resume even if the stream
+		// never echoes one back. A resuming turn claims nothing (grok rejects both at once).
+		const sessionId = p.resume ? undefined : crypto.randomUUID();
+		// GROK HAS NO IMAGE MECHANISM - no flag, no attachment channel, nothing on `-p` (probed against
+		// grok 1.0.3). So rather than refuse the turn or drop the attachment, the images are staged as
+		// files and the prompt tells grok where to read them; its file tool opens them and it answers
+		// about the image (verified end to end on the real binary). This is a genuine fallback, not
+		// native support - what makes it honest is that the model is TOLD the images exist.
+		const images = stageRunImages(p.images);
+		// Documents take the SAME route for the same reason, and it suits them better than it suits
+		// images: grok has no document channel either, and reading a PDF from a path is exactly what its
+		// file tool is for. Staged and named separately from the images so the prompt can say which is
+		// which, and cleaned up beside them.
+		const documents = stageRunDocuments(p.documents);
+		const args = buildGrokRunArgs({
+			prompt: promptWithStagedDocuments(
+				promptWithStagedImages(p.prompt, images.staged),
+				documents.staged
+			),
+			cwd: runCwd,
+			permissionMode: p.permissionMode,
+			...(p.floored ? { floored: true } : {}),
+			...(p.model ? { model: p.model } : {}),
+			...(p.effort ? { effort: p.effort } : {}),
+			...(p.mcpServers ? { mcpServerNames: Object.keys(p.mcpServers) } : {}),
+			...(p.resume ? { resume: p.resume } : {}),
+			...(sessionId ? { sessionId } : {})
+		});
+		// LAST thing before the spawn: re-author the isolated home's config.toml with THIS run's MCP
+		// servers. Grok has no argv override to undo a wrong table with, because it has no inline MCP
+		// flag at all, so these bytes decide the run's whole tool surface. The home belongs to this run
+		// alone (`ensureIsolatedGrokHome` mints one per run), so no concurrent run's setup can rewrite
+		// the file between this write and grok's read - the reason that split exists. What the home
+		// being agent-writable still permits is the RUN replacing its own config, which is why the
+		// write is no-follow. Fail-closed: a config we cannot author refuses the RUN.
+		if (p.configHome) reseedIsolatedGrokConfig(p.configHome, p.mcpServers ?? {});
+		const child = spawnFn(p.binaryPath, args, {
+			stdio: ["pipe", "pipe", "pipe"],
+			cwd: runCwd,
+			// Inherit an allowlisted env (PATH, proxy, CA, locale, ...) with the node dir on PATH, then add
+			// the BYOK key as `XAI_API_KEY` and, for a headless run, the isolated config home as
+			// `GROK_HOME`. The terminal path passes no `configHome` and keeps the user's own `~/.grok`.
+			env: childEnvFor({
+				...(p.apiKey ? { XAI_API_KEY: p.apiKey } : {}),
+				...(p.configHome ? { GROK_HOME: p.configHome } : {})
+			})
+		});
+		// The cancel is the kill: a headless `-p` turn has no interrupt protocol.
+		const io = attachCliChild(child, p.signal);
+		// Nothing is written to the child: the prompt rides argv and grok exits after the single turn.
+		child.stdin?.end();
+
+		const state = newGrokStreamState();
+		let outcome: "completed" | "failed" | undefined;
+		try {
+			for await (const line of pumpCliLines(child, p.signal)) {
+				if (typeof line !== "string") {
+					yield { kind: "error", message: stallMessage("Grok", CLI_STALL_TIMEOUT_MS) };
+					return;
+				}
+				const frame = parseGrokStreamLine(line);
+				if (!frame) continue;
+				const mapped = grokFrameToMessages(frame, state);
+				for (const message of mapped.messages) yield message;
+				if (mapped.outcome) {
+					outcome = mapped.outcome;
+					break;
+				}
+			}
+			if (p.signal.aborted) return;
+			if (outcome === "failed") {
+				yield {
+					kind: "error",
+					message: withStderr(state.errorMessage ?? "Grok ended the turn with an error", io.stderr)
+				};
+				return;
+			}
+			if (io.spawnError) {
+				yield { kind: "error", message: withStderr(io.spawnError.message, io.stderr) };
+				return;
+			}
+			if (outcome === "completed") {
+				// The stream carries the session id on its own frames, but a turn that never echoed one
+				// still has the id THIS driver claimed (or resumed), so continuity never depends on the
+				// echo landing.
+				const conversationId = state.conversationId ?? p.resume ?? sessionId;
+				if (!state.emittedConversation && conversationId) {
+					yield { kind: "conversation", id: conversationId };
+				}
+				yield { kind: "done", ...(state.usage ? { usage: state.usage } : {}) };
+				return;
+			}
+			// stdout EOF before a terminal frame = grok died mid-turn.
 			yield {
 				kind: "error",
-				message: withStderr(error instanceof Error ? error.message : String(error), stderr)
+				message: withStderr("Grok exited before completing the turn", io.stderr)
 			};
+		} catch (error) {
+			// A cancelled run kills the child, which rejects the pending read; that is expected teardown,
+			// not a run failure, so swallow it silently - the other drivers do the same.
+			if (p.signal.aborted || isAbortError(error)) return;
+			yield { kind: "error", message: failureMessage(error, io.stderr) };
 		} finally {
-			rl?.close();
 			child.kill();
+			// The child is dead, so it has finished reading whatever it opened; a cancelled or failed turn
+			// lands here too, so no staged attachment outlives the run that staged it.
+			images.cleanup();
+			documents.cleanup();
+		}
+	};
+}
+
+/**
+ * Builds the OpenCode driver: one `opencode run --format json` spawn per turn, parsed from the JSON
+ * events it prints on stdout.
+ *
+ * WHY THIS TRANSPORT. `opencode acp` was driven here until 2026-08-02 and was removed because ACP
+ * exposes no tool-restriction control of any kind. `run` does: its `permission` config is a real
+ * allow/deny table, and it FAILS CLOSED headlessly - with no approver attached, opencode
+ * auto-REJECTS anything the posture did not name.
+ *
+ * THE PROMPT RIDES STDIN, NOT ARGV. `opencode run` takes its message as a positional, and opencode
+ * re-quotes any positional token containing a space before sending it to the model; more importantly
+ * a process argv is world-readable on Linux (`/proc/<pid>/cmdline`) and the prompt carries the
+ * composed system prompt. opencode reads stdin whenever it is not a TTY, so the prompt is written
+ * there and the stream closed.
+ *
+ * ISOLATION RIDES CONFIG AND ENV, NEVER ARGV. `opencode run` has no inline MCP flag and no
+ * permission flag, so one config document carries both: it is re-authored into the isolated config
+ * base immediately before the spawn AND handed over as `OPENCODE_CONFIG_CONTENT`, which is
+ * opencode's LAST config merge and therefore the only layer a checked-in workspace `opencode.json`
+ * cannot override. The same env carries the plugin/skill-discovery cells - see
+ * `opencodeIsolationEnv` for what each was measured to close. There is no credential to pass:
+ * opencode owns its provider logins and keeps reading them from the user's own data directory.
+ *
+ * NOTHING HERE IS OS-ENFORCED. `opencode run` has no sandbox, no egress switch and no read-deny, so
+ * `network` and `denyReadPaths` are NOT honoured by this driver - the adapter declares
+ * `enforcesNetworkOff: false` and the run-loop emits the honest per-run `network-not-enforced`
+ * signal instead of a silent false guarantee.
+ *
+ * Continuity is per-turn, since each turn is its own process: a NEW turn takes the session id
+ * opencode reports on its own frames (opencode has no flag to pre-claim one), and turn N passes
+ * `--session <id>` so the CLI reloads its own transcript rather than having it replayed.
+ *
+ * @param spawnFn - The process spawner (injected for tests).
+ * @returns The OpenCode agentic-CLI driver.
+ */
+export function makeOpencodeDriver(spawnFn: SpawnFn): AgenticCliDriver {
+	return async function* (p) {
+		// A chat with no connected workspace has an empty `p.cwd`; opencode needs a real directory, so
+		// fall back to the OS temp dir (a valid, writable, throwaway directory) - the run is chat-only.
+		const runCwd = p.cwd && p.cwd.length > 0 ? p.cwd : tmpdir();
+		const configInput = {
+			...(p.mcpServers ? { mcpServers: p.mcpServers } : {}),
+			permissionMode: p.permissionMode,
+			...(p.floored ? { floored: true } : {})
+		};
+		// LAST thing before the spawn: re-author the isolated base's `opencode.json` with THIS run's
+		// servers and posture, so the global config scope can never be read with a prior run's table in
+		// it. Fail-closed: a config we cannot author refuses the RUN.
+		if (p.configHome) reseedIsolatedOpencodeConfig(p.configHome, configInput);
+		// Attachments become real files: `-f` takes PATHS, so this is opencode's native image mechanism
+		// (verified against the installed binary - it answers about the image). Staged outside the working
+		// directory so a user's checkout never gains stray files; removed in this driver's `finally`.
+		const images = stageRunImages(p.images);
+		// `-f` takes a path and does not care what is behind it, so a PDF rides the exact same mechanism
+		// as an image here - no prompt note needed, unlike the CLIs that have no attachment channel.
+		const documents = stageRunDocuments(p.documents);
+		const args = buildOpencodeRunArgs({
+			cwd: runCwd,
+			...(p.model ? { model: p.model } : {}),
+			...(p.effort ? { effort: p.effort } : {}),
+			...(p.resume ? { resume: p.resume } : {}),
+			...(images.staged.length > 0
+				? { imagePaths: images.staged.map((image) => image.path) }
+				: {}),
+			...(documents.staged.length > 0
+				? { documentPaths: documents.staged.map((document) => document.path) }
+				: {})
+		});
+		const child = spawnFn(p.binaryPath, args, {
+			stdio: ["pipe", "pipe", "pipe"],
+			cwd: runCwd,
+			// Inherit an allowlisted env (PATH, proxy, CA, locale, ...) with the node dir on PATH, then
+			// add the isolation cells. The terminal path passes no `configHome` and keeps the
+			// user's own `~/.config/opencode`.
+			env: childEnvFor(
+				opencodeIsolationEnv(p.configHome, opencodeIsolatedConfigJson(configInput))
+			)
+		});
+		// The cancel is the kill: a headless `run` turn has no interrupt protocol.
+		const io = attachCliChild(child, p.signal);
+		// The prompt is the ONLY thing written to the child; opencode reads stdin to EOF and then runs
+		// the single turn, so the stream is closed immediately after. An image-only turn substitutes a
+		// stand-in message: `opencode run` refuses an empty one outright ("You must provide a message or a
+		// command"), so a caption-less attachment would fail at the CLI without ever reaching a model.
+		child.stdin?.end(
+			promptForDocumentOnlyTurn(
+				promptForImageOnlyTurn(p.prompt, images.staged.length),
+				documents.staged.length
+			)
+		);
+
+		const state = newOpencodeStreamState();
+		try {
+			for await (const line of pumpCliLines(child, p.signal)) {
+				if (typeof line !== "string") {
+					yield { kind: "error", message: stallMessage("OpenCode", CLI_STALL_TIMEOUT_MS) };
+					return;
+				}
+				const frame = parseOpencodeStreamLine(line);
+				if (!frame) continue;
+				for (const message of opencodeFrameToMessages(frame, state)) yield message;
+			}
+			if (p.signal.aborted) return;
+			// STDOUT EOF IS THE END OF THE TURN. Unlike every other driver here, opencode's JSON stream
+			// carries no terminal frame at all: its printer stops when the session goes idle and the
+			// process exits. So the outcome is decided from what the turn accumulated.
+			if (state.errorMessage) {
+				yield { kind: "error", message: withStderr(state.errorMessage, io.stderr) };
+				return;
+			}
+			if (io.spawnError) {
+				yield { kind: "error", message: withStderr(io.spawnError.message, io.stderr) };
+				return;
+			}
+			// No decodable frame at all means the CLI never got as far as the turn - a rejected
+			// `--session`, an unreadable config, a missing binary. Reporting `done` there would render a
+			// silent empty answer, which is worse than an error because nothing surfaces it.
+			if (!state.sawFrame) {
+				yield {
+					kind: "error",
+					message: withStderr("OpenCode exited before producing any output", io.stderr)
+				};
+				return;
+			}
+			// The stream carries the session id on its own frames; a resuming turn whose frames were all
+			// dropped still has the id it was given, so continuity never depends on the echo landing.
+			const conversationId = state.conversationId ?? p.resume;
+			if (!state.emittedConversation && conversationId) {
+				yield { kind: "conversation", id: conversationId };
+			}
+			yield { kind: "done", ...(state.usage ? { usage: state.usage } : {}) };
+		} catch (error) {
+			// A cancelled run kills the child, which rejects the pending read; that is expected teardown,
+			// not a run failure, so swallow it silently - the other drivers do the same.
+			if (p.signal.aborted || isAbortError(error)) return;
+			yield { kind: "error", message: failureMessage(error, io.stderr) };
+		} finally {
+			child.kill();
+			// The child has read its attachments by now (it is dead); a cancelled or failed turn lands here
+			// too, so no staged attachment outlives the run that staged it.
+			images.cleanup();
+			documents.cleanup();
 		}
 	};
 }
@@ -943,8 +1401,12 @@ function makeClaudeModelLister(query: ClaudeQuery): AdvertisedModelLister {
  * it is the one that spawns a child this package owns. Claude runs go through the Agent SDK's own
  * spawn, which exposes no uid seam, so a contained host confines it by other means.
  *
+ * The Grok and OpenCode model probes are plain `<cli> models` reads rather than a handshake, so they
+ * ride the shared no-shell {@link runTool} instead of a seam of their own. Both host registries pass
+ * that same runner, so the probe a driven adapter gets is the one it would have built for itself.
+ *
  * @param deps - The injected SDK/CLI seams (each defaults to the real import) plus host containment.
- * @returns The Claude, Codex, OpenCode, and Hermes drivers, plus the model/session probes.
+ * @returns The Claude, Codex, Grok, and OpenCode drivers, plus their model probes.
  */
 export function makeDrivers(deps: DriverDeps = {}): AgentDrivers {
 	const query = deps.query ?? realQuery;
@@ -959,7 +1421,11 @@ export function makeDrivers(deps: DriverDeps = {}): AgentDrivers {
 			...(deps.agentGid !== undefined ? { agentGid: deps.agentGid } : {}),
 			...(deps.homeDir !== undefined ? { homeDir: deps.homeDir } : {})
 		}),
+		grokDriver: makeGrokDriver(spawnFn),
+		opencodeDriver: makeOpencodeDriver(spawnFn),
 		codexModelLister: makeCodexModelLister(spawnFn),
-		claudeModelLister: makeClaudeModelLister(query)
+		claudeModelLister: makeClaudeModelLister(query),
+		grokModelLister: makeGrokModelLister(runTool),
+		opencodeModelLister: makeOpencodeModelLister(runTool)
 	};
 }

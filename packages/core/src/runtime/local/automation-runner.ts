@@ -1,3 +1,5 @@
+import type { McpServerSpec } from "@agentrunner/protocol";
+import { effectiveBuiltInEnabled } from "./app-config";
 import type { BuiltInAutomationSpec, LocalAppConfig } from "./app-config";
 import type { LocalSession } from "./local-session";
 import { cadenceOf, cronFingerprint, nextCronOccurrenceMs } from "./automation-cadence";
@@ -13,8 +15,9 @@ const DEFAULT_TICK_MS = 60_000;
 
 /**
  * An automation reduced to the fields the runner needs to test dueness and fire it. Built-in specs and user
- * automations both normalize to this shape; a built-in carries no per-fire cli/model/effort (the fire falls
- * back to the app-config default), a user automation carries whatever it stored.
+ * automations both normalize to this shape; a built-in carries a per-fire cli/model only when the product
+ * PINNED one (otherwise the fire falls back to the app-config default), a user automation carries whatever
+ * it stored.
  */
 type FireableAutomation = {
 	/** The automation id (run state + enabled-override are keyed by it). */
@@ -29,6 +32,12 @@ type FireableAutomation = {
 	modelId?: string;
 	/** Reasoning effort for the fire, when set; a discovered level may be any advertised string. */
 	effort?: string;
+	/**
+	 * When the automation was created, in epoch milliseconds - the dueness anchor an interval automation uses
+	 * before it has ever run, so a freshly created one waits a full interval. Absent for a built-in spec,
+	 * which the config carries no creation instant for.
+	 */
+	createdAt?: number;
 } & AutomationCadence;
 
 /** Injected dependencies for {@link createAutomationRunner}. */
@@ -74,6 +83,19 @@ export interface AutomationRunnerDeps {
 	 * aggregate so a local automation cannot exceed the machine-global cap by ignoring the backend's load.
 	 */
 	totalActiveRuns?: () => number;
+	/**
+	 * The APP's own MCP servers to mount on each fire, read FRESH per fire - the host's product-tools
+	 * loopback server ({@link import('./app-tools').AppToolsRegistry.servers}). This is what makes an
+	 * unattended run as capable as a local chat: without it a device automation asked anything about the
+	 * user's account has no app tools mounted at all and answers that the app is unreachable, while a
+	 * chat on the same device answers from the tools.
+	 *
+	 * DEGRADES exactly as the chat lane does: a host that serves no tools (signed out, backend down, or
+	 * simply not running - an automation can fire with the app closed) registers nothing, and the fire
+	 * composes with no app tools rather than failing. A THROW is logged and treated as none, because a
+	 * fire without tools is worth far more than a tick that dies reading them.
+	 */
+	appMcpServers?: () => Record<string, McpServerSpec>;
 	/** Coarse tick cadence in ms (default {@link DEFAULT_TICK_MS}); a test seam for a shortened tick. */
 	tickMs?: number;
 	/** Sink for the runner's diagnostic lines (config/store failures); defaults to `process.stdout.write`. */
@@ -113,13 +135,38 @@ function userToFireable(automation: LocalAutomation): FireableAutomation {
 		...cadenceOf(automation),
 		...(automation.cli !== undefined ? { cli: automation.cli } : {}),
 		...(automation.modelId !== undefined ? { modelId: automation.modelId } : {}),
-		...(automation.effort !== undefined ? { effort: automation.effort } : {})
+		...(automation.effort !== undefined ? { effort: automation.effort } : {}),
+		...(automation.createdAt !== undefined ? { createdAt: automation.createdAt } : {})
 	};
 }
 
-/** Normalizes a built-in spec to a {@link FireableAutomation} with its effective enabled (override applied). */
-function builtInToFireable(spec: BuiltInAutomationSpec, enabled: boolean): FireableAutomation {
-	return { id: spec.id, prompt: spec.prompt, enabled, ...cadenceOf(spec) };
+/**
+ * Normalizes a built-in spec to a {@link FireableAutomation}, resolving the workspace's stored
+ * enabled-override through {@link effectiveBuiltInEnabled} - so a `toggleable: false` spec fires at the
+ * product's forced state even when an override says otherwise. The drive server refuses to WRITE such an
+ * override, and this ignores one already on disk: the same clamp-and-sweep pairing the server lane uses,
+ * because an override written by an older build (or by hand) must not outlive the product's decision.
+ *
+ * A PINNED cli/model rides along, which is what makes a fixed model actually reach the fire: with the pin
+ * absent, `startAutomated` falls back to the app-config device default, so the pin has to travel on the
+ * fireable rather than merely being staged.
+ *
+ * @param spec - The staged built-in spec.
+ * @param override - The workspace's stored enabled-override, or `undefined` when it holds none.
+ * @returns The built-in as a fireable.
+ */
+function builtInToFireable(
+	spec: BuiltInAutomationSpec,
+	override: boolean | undefined
+): FireableAutomation {
+	return {
+		id: spec.id,
+		prompt: spec.prompt,
+		enabled: effectiveBuiltInEnabled(spec, override),
+		...cadenceOf(spec),
+		...(spec.cli !== undefined ? { cli: spec.cli } : {}),
+		...(spec.modelId !== undefined ? { modelId: spec.modelId } : {})
+	};
 }
 
 /**
@@ -177,7 +224,11 @@ function carryOver(prior: LocalAutomationRunState): LocalAutomationRunState {
  * ({@link AutomationRunnerDeps.connectedFolder}), re-judged per fire; a grant that cannot be honoured
  * records a `failed` outcome rather than running anywhere else.
  *
- * @param deps - The per-workspace stores, session, fresh config + cap readers, and optional folder/tick/write seams.
+ * Every fire also carries the host's product-tools MCP server when one is registered
+ * ({@link AutomationRunnerDeps.appMcpServers}), so an unattended run reaches the app's own tools - and
+ * speaks with the capability voice that rides them - exactly like a local chat turn.
+ *
+ * @param deps - The per-workspace stores, session, fresh config + cap readers, and optional folder/app-tools/tick/write seams.
  * @returns The automation runner.
  */
 export function createAutomationRunner(deps: AutomationRunnerDeps): AutomationRunner {
@@ -210,7 +261,7 @@ export function createAutomationRunner(deps: AutomationRunnerDeps): AutomationRu
 		try {
 			// ONE parse of the override document per pass, however many built-ins the product ships.
 			const overrides = deps.stores.forWorkspace(projectId).readAllBuiltInEnabled();
-			return specs.map((spec) => builtInToFireable(spec, overrides.get(spec.id) ?? spec.enabled));
+			return specs.map((spec) => builtInToFireable(spec, overrides.get(spec.id)));
 		} catch (err) {
 			write(
 				`automation runner: reading built-in automations failed, skipping them this pass: ${messageOf(err)}\n`
@@ -311,7 +362,7 @@ export function createAutomationRunner(deps: AutomationRunnerDeps): AutomationRu
 
 	/**
 	 * Fires one automation if a slot is free and it is not already in flight: cap gate -> single-flight ->
-	 * connected folder -> merge-preserving mark -> `session.startAutomated`. FULLY GUARDED so nothing it touches
+	 * connected folder -> app tools -> merge-preserving mark -> `session.startAutomated`. FULLY GUARDED so nothing it touches
 	 * can escape the tick/run-now or wedge the flight set: a throwing cap read DEFERS (`'busy'`); an unusable
 	 * connected folder FAILS the fire before anything is marked or claimed; a mark failure -
 	 * the write, or a cron whose next occurrence will not compute - aborts the fire (a fire without a mark
@@ -368,6 +419,19 @@ export function createAutomationRunner(deps: AutomationRunnerDeps): AutomationRu
 			return "failed";
 		}
 
+		// The app's own tools for this fire, read FRESH so a host that signed in, signed out, or re-served
+		// since the last fire is reflected. GUARDED and NON-FATAL, unlike the folder above: tools make a run
+		// more capable, while a folder decides WHERE it writes - so a tools read that throws costs this fire
+		// its app tools (and, with them, the capability nudge) rather than the fire itself.
+		let appMcpServers: Record<string, McpServerSpec> = {};
+		try {
+			appMcpServers = deps.appMcpServers?.() ?? {};
+		} catch (err) {
+			write(
+				`automation runner: reading the app's tools for ${automation.id} failed, firing without them: ${messageOf(err)}\n`
+			);
+		}
+
 		flight.add(key);
 
 		try {
@@ -403,6 +467,10 @@ export function createAutomationRunner(deps: AutomationRunnerDeps): AutomationRu
 				...(projectId !== null ? { workKey: workspaceWorkKey(projectId) } : {}),
 				// ...unless that workspace has connected a real folder, which replaces the cwd outright.
 				...(connectedFolder !== null ? { connectedFolder } : {}),
+				// The app's tools ride the fire exactly as they ride a local chat turn, and only when the host
+				// is actually serving them: an empty record is passed as an ABSENT field, so a fire with no app
+				// tools composes byte-identically to the pre-seam one (no request servers, no capability nudge).
+				...(Object.keys(appMcpServers).length > 0 ? { mcpServers: appMcpServers } : {}),
 				onDone: (outcome, outputText) => {
 					flight.delete(key);
 					// A null outcome (drain/cancel with no terminal event) leaves the prior run state - the mark's

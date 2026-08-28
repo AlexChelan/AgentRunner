@@ -1,22 +1,10 @@
-import {
-	closeSync,
-	existsSync,
-	fchmodSync,
-	fchownSync,
-	constants as fsConstants,
-	lstatSync,
-	mkdirSync,
-	openSync,
-	readFileSync,
-	readlinkSync,
-	rmSync,
-	symlinkSync,
-	writeFileSync
-} from "node:fs";
-import { homedir } from "node:os";
+import { existsSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { AGENT_WRITE_MODE, shareWithAgent } from "../agent-share";
 import type { AgentIdentity, AgentShareSeams } from "../agent-share";
+import { realCodexHome } from "./cli-homes";
+import { linkOrCopyAuth, seedContainedAuth } from "./isolated-home";
+import { writeNoFollow } from "./no-follow-write";
 import { codexHomeDir } from "./paths";
 
 /**
@@ -56,65 +44,6 @@ export interface CodexHomeOwnerOpts extends AgentShareSeams {
 	agent?: AgentIdentity;
 }
 
-/** The user's real Codex home (`$CODEX_HOME` or `~/.codex`) - the source of the login a run authenticates with. */
-function realCodexHome(): string {
-	return process.env.CODEX_HOME ?? join(homedir(), ".codex");
-}
-
-/**
- * Writes `contents` to `path` WITHOUT ever following a symlink, replacing a hostile or corrupt entry.
- *
- * Once the isolated home is group-shared, everything in it is agent-writable - so a plain
- * `writeFileSync` here is a confused deputy: a run that replaces `config.toml` with a symlink to
- * `secrets/master.key` gets the daemon to truncate the master key for it, which is irreversible and
- * takes every stored credential with it. `O_NOFOLLOW` refuses the link (`ELOOP`) instead.
- *
- * A refused entry is then REMOVED and the write retried: `rm` unlinks the entry itself and never
- * follows it, so whatever the link pointed at is untouched, and the isolated home self-heals rather
- * than wedging. `recursive` covers the other plantable shape, a DIRECTORY named `config.toml`.
- *
- * `group` pins the result's group and mode on the DESCRIPTOR (`fchown`/`fchmod`), never on the path,
- * so the identity that lands on the file is bound to the very inode the no-follow open validated.
- *
- * @param path - The file to write.
- * @param contents - The bytes to write.
- * @param mode - The mode for a freshly created file; also FORCED on the descriptor when `group` is set.
- * @param group - Group to hand the file to (the owner stays this process). Omit to leave both alone.
- * @throws When the write fails even after the hostile entry was cleared. Fail-closed AT THIS CALL: it
- *   guarantees the bytes this function wrote were the last ones IT wrote, not that they are the bytes
- *   Codex will read - the isolated home is agent-writable, so a run can replace the file afterwards
- *   (see {@link ensureIsolatedCodexHome}'s residual note).
- */
-function writeNoFollow(
-	path: string,
-	contents: string | Uint8Array,
-	mode: number,
-	group?: number
-): void {
-	const flags =
-		fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_TRUNC | fsConstants.O_NOFOLLOW;
-	const write = (): void => {
-		const fd = openSync(path, flags, mode);
-		try {
-			if (group !== undefined) {
-				// The owner stays this process; only the GROUP moves, exactly as a directory share does.
-				fchownSync(fd, process.getuid?.() ?? 0, group);
-				// An existing file keeps its old mode through `O_CREAT`, so the mode is set explicitly.
-				fchmodSync(fd, mode);
-			}
-			writeFileSync(fd, contents);
-		} finally {
-			closeSync(fd);
-		}
-	};
-	try {
-		write();
-	} catch {
-		rmSync(path, { recursive: true, force: true });
-		write();
-	}
-}
-
 /**
  * Re-authors the isolated home's `config.toml`, for a caller that is about to spawn Codex against it.
  *
@@ -136,24 +65,6 @@ function writeNoFollow(
  */
 export function reseedIsolatedCodexConfig(home: string): void {
 	writeNoFollow(join(home, "config.toml"), ISOLATED_CONFIG_TOML, CONFIG_MODE);
-}
-
-/** True when `path` is a symlink (never throws for a missing path). */
-function isSymlink(path: string): boolean {
-	try {
-		return lstatSync(path).isSymbolicLink();
-	} catch {
-		return false;
-	}
-}
-
-/** The symlink target of `path`, or `null` when `path` is not a readable symlink. */
-function symlinkTarget(path: string): string | null {
-	try {
-		return readlinkSync(path);
-	} catch {
-		return null;
-	}
 }
 
 /**
@@ -238,31 +149,10 @@ export function ensureIsolatedCodexHome(
 	// so a symlink resolves to a file it cannot open. Copy it in group-readable instead - re-copied every
 	// call, so a token the run refreshed in place is re-synced from the real login (see the caveats).
 	if (opts.agent) {
-		try {
-			writeNoFollow(isoAuth, readFileSync(realAuth), CONTAINED_AUTH_MODE, opts.agent.gid);
-		} catch {
-			// Auth seeding is best-effort - a keyring-auth run needs no file, and a run that ends up
-			// unauthenticated reports it; it must never take the whole dispatch down.
-		}
+		seedContainedAuth(isoAuth, realAuth, opts.agent.gid, CONTAINED_AUTH_MODE);
 		return home;
 	}
 
-	// (Re)point auth.json at the user's real login. Skip when it already links there; otherwise remove
-	// any stale entry (a prior run's in-home refresh can replace the symlink with a file) and re-link.
-	if (isSymlink(isoAuth) && symlinkTarget(isoAuth) === realAuth) return home;
-	// `recursive` matters on a contained host: the isolated home is agent-writable, and a DIRECTORY
-	// planted at `auth.json` would make a non-recursive rm throw EISDIR out of every single run.
-	rmSync(isoAuth, { recursive: true, force: true });
-	try {
-		symlinkSync(realAuth, isoAuth);
-	} catch {
-		// A platform that forbids symlinks: copy so file-based auth still works (see the caveats above).
-		// Owner-only mode - this branch is the one case that puts a credential at rest.
-		try {
-			writeFileSync(isoAuth, readFileSync(realAuth), { mode: 0o600 });
-		} catch {
-			// Auth seeding is best-effort - a keyring-auth run needs no file.
-		}
-	}
+	linkOrCopyAuth(isoAuth, realAuth);
 	return home;
 }

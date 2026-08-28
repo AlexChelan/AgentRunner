@@ -3,7 +3,7 @@
 // `codexAppServerItemToMessage`/permission/posture/mcp maps; the `mcpToolCall` case below is covered
 // by a test to catch drift.
 import type { EffortLevel, McpServerConfig } from "@anthropic-ai/claude-agent-sdk";
-import type { McpServerSpec, PermissionMode, TokenUsage } from "@agentrunner/protocol";
+import type { McpServerSpec, PermissionMode, RunImage, TokenUsage } from "@agentrunner/protocol";
 import type { AdvertisedModel, AgenticDriverMessage } from "./types";
 import { isRecord } from "../runtime/local/is-record";
 
@@ -691,6 +691,8 @@ export interface CodexTurnStartParamsInput {
 	cwd: string;
 	/** The composed prompt, sent structured (never argv) so it cannot smuggle CLI flags. */
 	prompt: string;
+	/** Images attached to the turn, sent as native `image` input items alongside the prompt text. */
+	images?: readonly RunImage[];
 	/** Sandbox tier from {@link codexPosture}. */
 	sandboxMode: CodexPosture["sandboxMode"];
 	/** Whether the sandbox may reach the network (OS-enforced egress). */
@@ -700,6 +702,17 @@ export interface CodexTurnStartParamsInput {
 	 * string because Codex's own `ReasoningEffort` is an open non-empty string advertised per model.
 	 */
 	effort?: string;
+	/**
+	 * The model this turn runs on, or omit for whatever the thread was started with.
+	 *
+	 * PER TURN, not per thread, because the user can change the picker mid-conversation. A thread is
+	 * started once and then RESUMED for every later turn, and `thread/resume` was sent the thread id
+	 * alone - so a model switch moved the picker, changed nothing about the run, and billed the model
+	 * the thread happened to open with. `turn/start` accepts `model` (verified against the app-server's
+	 * own v2 schema, where it sits beside `effort`), which makes every turn state its own model rather
+	 * than inheriting one chosen for an earlier one.
+	 */
+	model?: string;
 }
 
 /**
@@ -708,18 +721,30 @@ export interface CodexTurnStartParamsInput {
  * ({@link toCodexSandboxPolicy}), so an unattended `network: 'off'` run is genuinely blocked while
  * hosted web search (a server-side tool) still works. Reasoning effort is a per-turn override.
  *
- * @param input - The thread id, cwd, prompt, sandbox tier, network flag, and optional effort.
+ * ATTACHED IMAGES RIDE THE SAME STRUCTURED `input` ARRAY, as `image` items carrying the attachment's
+ * `data:` URL. The app-server's `UserInput` union accepts both a `localImage` (a path it reads) and an
+ * `image` (a URL); this sends the URL form deliberately, because it needs no file on disk - nothing to
+ * write, nothing to clean up after a cancelled turn, and no path for a sandbox to disagree about.
+ * Verified end to end against the installed `codex app-server`: the model answers about the image.
+ * A text-only turn is byte-identical to what it was before images existed.
+ *
+ * @param input - The thread id, cwd, prompt, images, sandbox tier, network flag, and optional effort.
  * @returns The `turn/start` params object.
  */
 export function buildCodexTurnStartParams(
 	input: CodexTurnStartParamsInput
 ): Record<string, unknown> {
+	// An image-only turn sends no empty text element: the app-server takes an input array of images
+	// alone, and a blank text item would read to the model as an empty user message.
+	const text = input.prompt ? [{ type: "text", text: input.prompt }] : [];
+	const images = (input.images ?? []).map((image) => ({ type: "image", url: image.dataUrl }));
 	return {
 		threadId: input.threadId,
 		cwd: input.cwd,
-		input: [{ type: "text", text: input.prompt }],
+		input: [...text, ...images],
 		sandboxPolicy: toCodexSandboxPolicy(input.sandboxMode, input.networkAccessEnabled, input.cwd),
-		...(input.effort ? { effort: input.effort } : {})
+		...(input.effort ? { effort: input.effort } : {}),
+		...(input.model ? { model: input.model } : {})
 	};
 }
 

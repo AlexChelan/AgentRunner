@@ -63,5 +63,15 @@ export type RunEvent =
 	| { type: "reasoning"; text: string }
 	| { type: "tool"; name: string; status: "started" | "completed" | "failed"; detail?: string }
 	| { type: "permission-request"; requestId: string; toolName: string; input: unknown }
+	/**
+	 * A tool permission the RUNTIME decided on the user's behalf, disclosed so the transcript records
+	 * what was allowed.
+	 *
+	 * Chat runs answer every `permission-request` with `allow` and told the user nothing - the terminal
+	 * panel discloses its bypass posture on screen while the chat panel disclosed none of it. This is
+	 * the disclosure half: it changes no decision, it only makes the decision visible and recorded.
+	 * Purely informational, so a client that does not understand it can ignore it safely.
+	 */
+	| { type: "permission"; toolName: string; decision: "auto-approved" }
 	| { type: "done"; usage?: TokenUsage }
 	| { type: "error"; message: string };

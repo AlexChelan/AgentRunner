@@ -20,29 +20,50 @@ import {
 import { tmpdir } from "node:os";
 import { basename, dirname, join, relative, resolve, sep } from "node:path";
 import spawn from "cross-spawn";
-import type { RunTool } from "./adapters/types";
+import type { ExecResult, RunTool } from "./adapters/types";
 import { AGENT_TRAVERSE_MODE, shareWithAgent } from "./agent-share";
 import type { AgentIdentity, AgentShareSeams, ShareDir } from "./agent-share";
 import { resolveToolBinary } from "./binaries";
 import { runTool } from "./exec";
 
 /**
- * Managed coding-CLI installs: the host downloads a coding CLI's STANDALONE binary into a
- * host-owned data folder (never the user's global install) so a user WITHOUT Node/npm can
- * still run one. This module is Electron-free - the app-data directory is injected as a
- * `baseDir` rather than read from any framework, and the GitHub User-Agent is injected.
+ * Managed coding-CLI installs: the host installs a coding CLI into a host-owned data folder
+ * (never the user's global install) so a user without their own install can still run one.
+ * This module is Electron-free - the app-data directory is injected as a `baseDir` rather
+ * than read from any framework, and the GitHub User-Agent is injected.
  *
- * Each CLI is fetched as a single self-contained executable - Claude Code as a raw,
- * SHA256-verified binary and Codex as the one target binary extracted from a
- * release archive whose bytes are SHA256-verified against the GitHub-published asset
- * `digest` BEFORE anything is placed - and written DIRECTLY to
- * `<baseDir>/clis/<toolId>/<binary>`. That managed dir is appended to the
- * binary-resolution candidate set (after PATH), so the adapter `detect()` resolves the
- * managed binary as a fallback while a system install on PATH still wins. No npm and no
- * Node runtime are required to install or run.
+ * Two recipes, dispatched on the spec's {@link CliInstallRecipe}:
+ *
+ * - `binary-download` (Claude Code, Codex) - the vendor publishes a single self-contained
+ *   executable, SHA256-verified BEFORE anything is placed (Claude Code against its version
+ *   manifest, Codex against the GitHub-published asset `digest`) and written DIRECTLY to
+ *   `<baseDir>/clis/<toolId>/<binary>`. No npm and no Node runtime are required.
+ * - `npm-package` (Grok, OpenCode) - the vendor ships ONLY an npm package (the real per-platform
+ *   binaries are `optionalDependencies` npm selects), so `npm install <pkg>@<version>` runs with
+ *   the tool's managed dir as its `--prefix` and the launcher lands at
+ *   `<baseDir>/clis/<toolId>/node_modules/.bin/<binary>` (a `.cmd` shim on Windows). npm's own
+ *   registry integrity check is the verification lever here - no second hash is hand-rolled over
+ *   it - and the install then proves what landed carries the package name that was requested and
+ *   that its launcher reports that package's version. This path needs npm on PATH; without it the
+ *   install fails with a clear message and the user can install the CLI themselves (resolution
+ *   prefers their own install anyway).
+ *
+ * Whichever recipe ran, the directory the executable ends up in is appended to the
+ * binary-resolution candidate set (after PATH), so the adapter `detect()` resolves the managed
+ * binary as a fallback while a system install on PATH still wins.
  */
 
-/** Per-CLI install metadata: the executable it provides and its vendor login subcommand. */
+/**
+ * HOW a managed CLI is obtained. The source is fixed in code per tool id - a caller never supplies a
+ * URL or a package name - so an install can only ever fetch one of the vendors named here.
+ *
+ * - `binary-download` - the vendor publishes a standalone executable, fetched and SHA256-verified by
+ *   this module's per-CLI download functions (which stay the source of truth for the URL).
+ * - `npm-package` - the vendor ships only an npm package, so `pkg` is the registry name to install.
+ */
+export type CliInstallRecipe = { kind: "binary-download" } | { kind: "npm-package"; pkg: string };
+
+/** Per-CLI install metadata: the executable it provides, its vendor login subcommand, and its recipe. */
 export interface CliInstallSpec {
 	/** The executable name written into the managed dir (`.exe` is added on Windows). */
 	binary: string;
@@ -50,25 +71,46 @@ export interface CliInstallSpec {
 	 * The CLI's own login subcommand, run in the in-app terminal so the user signs in
 	 * without leaving the app. Verified against each CLI's `--help`: Codex `login` starts
 	 * an interactive browser sign-in; Claude Code's `auth login` ("Sign in to your
-	 * Anthropic account"). The terminal
+	 * Anthropic account"); Grok `login`; OpenCode `auth login`. The terminal
 	 * spawns the resolved binary with these args; the renderer never supplies the command.
 	 */
 	loginArgs: string[];
+	/** How this CLI is obtained (see {@link CliInstallRecipe}); the install dispatches on `kind`. */
+	recipe: CliInstallRecipe;
 }
 
 /**
  * Install metadata for every managed coding CLI, keyed by adapter id. Only these tool
- * ids may be installed; an unknown id is rejected by {@link installCli}. The download
- * source for each id is fixed in code (per-CLI functions below), never supplied by the
- * caller, so an install can only ever fetch one of these two known binaries.
+ * ids may be installed; an unknown id is rejected by {@link installCli}. The install
+ * source for each id is fixed in code - the download URL by the per-CLI functions below,
+ * the npm package by the spec's {@link CliInstallRecipe} - and never supplied by the caller,
+ * so an install can only ever fetch one of these known sources.
  *
- * This now covers EVERY connectable id. The system-install-only tier (`SYSTEM_CLI_SPECS`,
+ * This covers the DESKTOP CLI set (`DESKTOP_CLI_IDS`), which is WIDER than the cloud-dispatch
+ * allowlist `CONNECTABLE_TOOL_IDS`: a desktop CLI runs on the operator's own machine under their
+ * own consent, so Grok and OpenCode are installable here while staying off dispatch. Claude Code
+ * and Codex publish standalone binaries (`binary-download`); Grok and OpenCode ship only as npm
+ * packages (`npm-package`). The system-install-only tier (`SYSTEM_CLI_SPECS`,
  * `systemInstallGuidance`) existed solely for Hermes and went with it on 2026-08-02 - a tier with
  * no members is a branch every reader has to rule out and no input can reach.
  */
 export const CLI_INSTALL_SPECS: Record<string, CliInstallSpec> = {
-	"claude-code": { binary: "claude", loginArgs: ["auth", "login"] },
-	codex: { binary: "codex", loginArgs: ["login"] }
+	"claude-code": {
+		binary: "claude",
+		loginArgs: ["auth", "login"],
+		recipe: { kind: "binary-download" }
+	},
+	codex: { binary: "codex", loginArgs: ["login"], recipe: { kind: "binary-download" } },
+	grok: {
+		binary: "grok",
+		loginArgs: ["login"],
+		recipe: { kind: "npm-package", pkg: "@xai-official/grok" }
+	},
+	opencode: {
+		binary: "opencode",
+		loginArgs: ["auth", "login"],
+		recipe: { kind: "npm-package", pkg: "opencode-ai" }
+	}
 };
 
 /** True when `toolId` has managed-install metadata (a CLI the host can install). */
@@ -89,9 +131,14 @@ export function requireInstallSpec(toolId: string): CliInstallSpec {
 	return spec;
 }
 
-/** The on-disk executable name for a spec (adds `.exe` on Windows). */
+/**
+ * The on-disk executable name for a spec on `platform`. A downloaded binary is written with a
+ * `.exe` suffix on Windows; an npm launcher is whatever npm writes into `node_modules/.bin`,
+ * which on Windows is a `<binary>.cmd` shim (plus a `.ps1`) and NEVER a `.exe`.
+ */
 function binaryFileName(spec: CliInstallSpec, platform: NodeJS.Platform): string {
-	return platform === "win32" ? `${spec.binary}.exe` : spec.binary;
+	if (platform !== "win32") return spec.binary;
+	return spec.recipe.kind === "npm-package" ? `${spec.binary}.cmd` : `${spec.binary}.exe`;
 }
 
 /**
@@ -112,24 +159,42 @@ function managedRoot(baseDir: string): string {
 }
 
 /**
- * The managed install directories of every managed CLI, under `baseDir`. The binary sits
- * DIRECTLY in its tool dir (`clis/<toolId>/<binary>`), so each dir is a binary-resolution
- * candidate. Pass these to {@link resolveToolBinary}'s `managedDirs` so a managed CLI is
- * found AFTER PATH (a system install keeps precedence) and the adapter `detect()` resolves
- * the managed binary.
+ * The directory a tool's own executable ends up in, which depends on its recipe: a downloaded
+ * binary is written DIRECTLY into the tool's managed dir, while `npm install --prefix <dir>`
+ * lands its launcher shim in `<dir>/node_modules/.bin`. This is the ONE place that difference
+ * is expressed - {@link managedCliBinDirs} and {@link managedBinaryPath} both read it, so the
+ * resolver and the install agree by construction.
  *
  * @param baseDir - The host data folder the managed CLIs live under.
- * @returns One managed dir per installable CLI.
+ * @param toolId - The adapter id.
+ * @param spec - The tool's install spec (its recipe picks the layout).
+ * @returns The directory the tool's executable lives in.
  */
-export function managedCliBinDirs(baseDir: string): string[] {
-	return Object.keys(CLI_INSTALL_SPECS).map((toolId) => managedDir(baseDir, toolId));
+function managedBinDir(baseDir: string, toolId: string, spec: CliInstallSpec): string {
+	const dir = managedDir(baseDir, toolId);
+	return spec.recipe.kind === "npm-package" ? join(dir, "node_modules", ".bin") : dir;
 }
 
 /**
- * The absolute path the managed binary for a tool WOULD live at after install, or
- * `undefined` for a tool with no install metadata. The binary sits directly in the tool's
- * managed dir (`clis/<toolId>/<binary>`). Existence is not checked here - the binary
- * resolver verifies that the file is present.
+ * The directories the managed CLIs' executables live in, under `baseDir` - the tool dir itself
+ * for a downloaded binary, its `node_modules/.bin` for an npm-installed launcher. Pass these to
+ * {@link resolveToolBinary}'s `managedDirs` so a managed CLI is found AFTER PATH (a system
+ * install keeps precedence) and the adapter `detect()` resolves the managed binary.
+ *
+ * @param baseDir - The host data folder the managed CLIs live under.
+ * @returns One executable dir per installable CLI.
+ */
+export function managedCliBinDirs(baseDir: string): string[] {
+	return Object.entries(CLI_INSTALL_SPECS).map(([toolId, spec]) =>
+		managedBinDir(baseDir, toolId, spec)
+	);
+}
+
+/**
+ * The absolute path the managed executable for a tool WOULD live at after install, or
+ * `undefined` for a tool with no install metadata - `clis/<toolId>/<binary>` for a downloaded
+ * binary, `clis/<toolId>/node_modules/.bin/<binary>` for an npm-installed launcher. Existence is
+ * not checked here - the binary resolver verifies that the file is present.
  *
  * @param baseDir - The host data folder the managed CLIs live under.
  * @param toolId - The adapter id.
@@ -143,7 +208,7 @@ export function managedBinaryPath(
 ): string | undefined {
 	const spec = CLI_INSTALL_SPECS[toolId];
 	if (!spec) return undefined;
-	return join(managedDir(baseDir, toolId), binaryFileName(spec, platform));
+	return join(managedBinDir(baseDir, toolId, spec), binaryFileName(spec, platform));
 }
 
 /** Throws "Install cancelled" when the signal has fired (checked at each await boundary). */
@@ -810,8 +875,19 @@ export interface InstallDeps {
 	fetchFn?: FetchFn;
 	/** Extracts an archive into a directory (defaults to spawning the system `tar`). */
 	extractArchive?: ExtractArchive;
-	/** Runs `<binary> --version` to verify the install (defaults to {@link runTool}). */
+	/**
+	 * Runs `<binary> --version` to verify the install (defaults to {@link runTool}). An
+	 * `npm-package` recipe also runs its `npm install` through this seam when one is injected, so
+	 * a test drives the whole install without a real npm; the default install runner is
+	 * {@link runTool} with a minutes-long timeout instead of the short probe one.
+	 */
 	runToolFn?: RunTool;
+	/**
+	 * Resolves a bare binary name from PATH + the curated install dirs (defaults to
+	 * {@link resolveToolBinary}). Only an `npm-package` recipe uses it, to find `npm`; injected so
+	 * a test never depends on the machine it runs on having Node installed.
+	 */
+	resolveBinaryFn?: (name: string) => string | null;
 	/**
 	 * The User-Agent sent to GitHub for release-asset requests. GitHub requires a non-empty
 	 * User-Agent; the host injects its own branding (never an internal codename). Defaults
@@ -839,7 +915,12 @@ export interface InstallDeps {
 	share?: ShareDir;
 }
 
-/** Dispatches to the per-CLI downloader for a tool id, returning the verified binary bytes. */
+/**
+ * Dispatches to the per-CLI downloader for a tool id, returning the verified binary bytes. Only
+ * ever reached for a `binary-download` recipe ({@link runInstallCli} routes an `npm-package` one
+ * to {@link installNpmPackage}), so the fallthrough means a tool id was marked `binary-download`
+ * without a downloader being written for it.
+ */
 function downloadBinary(
 	toolId: string,
 	deps: Required<
@@ -859,19 +940,229 @@ function downloadBinary(
 	if (toolId === "codex") {
 		return downloadCodex(fetchWithUa, extractArchive, platform, arch, signal, onProgress);
 	}
-	throw new Error(`"${toolId}" is not an installable CLI`);
+	throw new Error(`"${toolId}" has no standalone binary to download`);
+}
+
+/** How long a managed `npm install` may run before it is killed (a download, not a probe). */
+const NPM_INSTALL_TIMEOUT_MS = 600_000;
+
+/** How much of a failed `npm install`'s output is quoted back in the error message. */
+const NPM_ERROR_DETAIL_CHARS = 500;
+
+/**
+ * The tail of a failed child's output, for an error message. The TAIL, because npm prints its
+ * deprecation/peer warnings first and its actual `npm error ...` block last, so the head of a
+ * noisy install is warnings while the end is the reason it failed.
+ *
+ * @param result - The failed run (stderr when it was captured, else stdout).
+ * @returns A bounded, trimmed detail string, or `""` when the child said nothing.
+ */
+function failureDetail(result: ExecResult): string {
+	const text = (result.stderr ?? result.stdout).trim();
+	if (text.length <= NPM_ERROR_DETAIL_CHARS) return text;
+	return `...${text.slice(-NPM_ERROR_DETAIL_CHARS)}`;
 }
 
 /**
- * Installs a coding CLI into the host's OWN data folder (`baseDir`) by DOWNLOADING its
- * standalone binary (no npm, no Node) - Claude Code as a raw SHA256-verified binary,
- * Codex as the one target binary extracted from a release archive - and writing it
- * atomically to `<baseDir>/clis/<toolId>/<binary>`. Installs the LATEST version by default;
- * an optional `version` pins a specific one (the caller never supplies the download source -
- * it is fixed per tool id). Streams meaningful progress phases via `onProgress`, honors the
- * abort signal at every await (rejecting "Install cancelled"), and verifies the install by
- * running `<binary> --version`. Rejects with a clear message on an unknown tool id, an
- * unsupported platform, a failed download/checksum/extraction, or a cancel.
+ * Deletes the `node_modules` tree npm wrote under a tool's managed dir and returns the error to
+ * throw, so a REFUSED install leaves NOTHING resolvable behind.
+ *
+ * This is load-bearing, not tidiness. `npm install` writes the launcher into
+ * `node_modules/.bin` BEFORE anything is verified, and {@link managedCliBinDirs} offers that dir
+ * to the resolver unconditionally - so a tree this module just refused (a squatted package name,
+ * a launcher that will not run, a version that does not match what npm placed) would still be
+ * found and RUN by the next `resolveToolBinary`/`detect()`. Worse, both `installCli` call sites in
+ * `runtime/connect.ts` early-return once a CLI detects as installed, so the refused tree would
+ * never be replaced. The download recipe has no equivalent hole: its bytes are SHA256-verified
+ * BEFORE `placeBinary` ever writes them.
+ *
+ * A cleanup failure never hides the real reason: it is folded into the returned error instead.
+ *
+ * @param dir - The tool's managed dir (npm's `--prefix`).
+ * @param cause - The refusal that triggered the cleanup.
+ * @returns The error to throw - `cause`, or `cause` plus the cleanup failure.
+ */
+function discardRefusedInstall(dir: string, cause: Error): Error {
+	try {
+		rmSync(join(dir, "node_modules"), { recursive: true, force: true, maxRetries: 3 });
+		return cause;
+	} catch (err) {
+		const detail = err instanceof Error ? err.message : String(err);
+		return new Error(
+			`${cause.message} (the refused install could NOT be removed from ${dir}: ${detail} - delete it by hand before retrying)`
+		);
+	}
+}
+
+/** The fields read off an installed package's own manifest (its identity). */
+interface InstalledPackageManifest {
+	name?: string;
+	version?: string;
+}
+
+/**
+ * Reads the manifest of the package npm just installed under `dir` and returns its version,
+ * throwing when it is missing, unreadable, or names a DIFFERENT package than the one requested.
+ *
+ * This is the name-squat guard. The registry name is fixed in code per tool id, and a squatted
+ * lookalike (`@vibe-kit/grok-cli` against the official `@xai-official/grok`) can only ever be
+ * reached by installing a different name - so proving the tree that landed carries EXACTLY the
+ * requested name, before its launcher is ever run, is what closes it.
+ *
+ * @param dir - The tool's managed dir (npm's `--prefix`).
+ * @param pkg - The registry package name that was requested.
+ * @returns The installed package's version.
+ * @throws When the package is absent, unreadable, unnamed, or named something else.
+ */
+function readInstalledPackageVersion(dir: string, pkg: string): string {
+	const manifestPath = join(dir, "node_modules", ...pkg.split("/"), "package.json");
+	let raw: string;
+	try {
+		raw = readFileSync(manifestPath, "utf8");
+	} catch {
+		throw new Error(`npm reported success but "${pkg}" is not installed in ${dir}`);
+	}
+	let parsed: unknown;
+	const unreadable = `Installed "${pkg}" has an unreadable package.json; refusing to run it.`;
+	try {
+		parsed = JSON.parse(raw);
+	} catch {
+		throw new Error(unreadable);
+	}
+	assertObject<InstalledPackageManifest>(parsed, unreadable);
+	if (parsed.name !== pkg) {
+		throw new Error(
+			`Installed package is "${parsed.name ?? "unnamed"}", not "${pkg}"; refusing to run it.`
+		);
+	}
+	if (!parsed.version) throw new Error(`Installed "${pkg}" declares no version.`);
+	return parsed.version;
+}
+
+/** What {@link installNpmPackage} needs: where to install, what to install, and its seams. */
+interface NpmInstallInput {
+	/** The tool's managed dir, passed to npm as `--prefix`. */
+	dir: string;
+	/** Where npm lands the launcher shim (`<dir>/node_modules/.bin`). */
+	binDir: string;
+	/** The CLI being installed (its `binary` is the launcher name to resolve and probe). */
+	spec: CliInstallSpec;
+	/** The registry package name, fixed in code by the spec's recipe. */
+	pkg: string;
+	/** The version to install, or `undefined` for `latest`. */
+	version: string | undefined;
+	/** The OS platform (picks the launcher's shim name). */
+	platform: NodeJS.Platform;
+	/** Runs the `npm install` itself (minutes-long; not the short-probe runner). */
+	runInstallFn: RunTool;
+	/** Runs the launcher's `--version` probe. */
+	runToolFn: RunTool;
+	/** Resolves `npm` from PATH + the curated install dirs. */
+	resolveBinaryFn: (name: string) => string | null;
+	/** Aborts the install when fired (checked at each await boundary). */
+	signal: AbortSignal;
+	/** Called with each progress line. */
+	onProgress: (line: string) => void;
+}
+
+/**
+ * Installs an `npm-package` CLI into its own managed dir and verifies what landed.
+ *
+ * `npm install <pkg>@<version> --prefix <dir>` keeps everything inside the host's data folder -
+ * the user's global `node_modules` is never touched - and npm resolves the vendor's per-platform
+ * binary (shipped as `optionalDependencies`) and writes the launcher into
+ * `<dir>/node_modules/.bin`. npm verifies registry integrity itself, so no second hash is
+ * hand-rolled over it; the verification added here is IDENTITY: the launcher resolves under the
+ * name the resolver will later look for, the installed tree carries the requested package name,
+ * and running it reports the very version npm placed.
+ *
+ * npm comes from PATH. When it is missing the install fails with a message that points at the
+ * user's own options, because binary resolution prefers a user's own install anyway.
+ *
+ * EVERY failure from the `npm install` onward deletes the tree npm wrote before it rethrows (see
+ * {@link discardRefusedInstall}) - a refused install must leave nothing the resolver can find.
+ *
+ * @param input - Where to install, what to install, and the injected runners.
+ * @throws When npm is missing or fails, no launcher appears, the package identity is wrong, or
+ *   the launcher does not run and report the installed version.
+ */
+async function installNpmPackage(input: NpmInstallInput): Promise<void> {
+	const { dir, spec, pkg, platform, signal, onProgress } = input;
+	const npm = input.resolveBinaryFn("npm");
+	if (!npm) {
+		throw new Error(
+			`Could not find npm, which ${spec.binary} needs to install (its vendor publishes it only as an npm package). Install Node.js (npm ships with it), or install ${spec.binary} yourself - your own install is always preferred over the managed one.`
+		);
+	}
+
+	throwIfAborted(signal);
+	onProgress("Installing from npm...");
+	const installed = await input.runInstallFn(npm, [
+		"install",
+		`${pkg}@${input.version ?? "latest"}`,
+		"--prefix",
+		dir
+	]);
+	if (installed.code !== 0) {
+		// A failed npm can still have written a partial tree (its launcher lands before the
+		// dependency it needs), so this branch cleans up exactly like the refusals below.
+		const detail = failureDetail(installed);
+		throw discardRefusedInstall(
+			dir,
+			new Error(
+				`npm install "${pkg}" failed (exited ${installed.code})${detail ? `: ${detail}` : ""}`
+			)
+		);
+	}
+
+	onProgress("Verifying install...");
+	try {
+		// The cancel check lives INSIDE the try, not above it: `runInstallFn` takes no signal, so a
+		// cancel that lands mid-install still lets npm finish and write the tree. Throwing from out
+		// here would skip the cleanup below and leave that unverified tree for the resolver to find.
+		throwIfAborted(signal);
+		// Resolve through the SAME resolver every consumer uses, but confined to this install's own
+		// bin dir (no PATH, no curated dirs), so a launcher npm wrote under a name the resolver will
+		// not look for fails HERE rather than surfacing later as "the CLI is not installed".
+		const binaryPath = resolveToolBinary(spec.binary, {
+			candidates: [],
+			env: { PATH: "" },
+			managedDirs: [input.binDir],
+			platform
+		});
+		if (!binaryPath) {
+			throw new Error(`npm installed "${pkg}" but no ${spec.binary} launcher appeared in ${dir}`);
+		}
+		const version = readInstalledPackageVersion(dir, pkg);
+		const probe = await input.runToolFn(binaryPath, ["--version"]);
+		if (probe.code !== 0) {
+			throw new Error(
+				`Installed ${spec.binary} but it failed to run (--version exited ${probe.code})`
+			);
+		}
+		if (!probe.stdout.includes(version)) {
+			throw new Error(
+				`Installed ${spec.binary} did not report ${pkg}@${version} (--version said "${probe.stdout.trim()}"); refusing to use it.`
+			);
+		}
+	} catch (err) {
+		throw discardRefusedInstall(dir, err instanceof Error ? err : new Error(String(err)));
+	}
+}
+
+/**
+ * Installs a coding CLI into the host's OWN data folder (`baseDir`) by the recipe fixed for its
+ * tool id. A `binary-download` CLI's standalone binary is fetched, SHA256-verified and written
+ * atomically to `<baseDir>/clis/<toolId>/<binary>` (no npm, no Node) - Claude Code as a raw
+ * verified binary, Codex as the one target binary extracted from a release archive. An
+ * `npm-package` CLI is installed with `npm install --prefix <baseDir>/clis/<toolId>`, landing its
+ * launcher at `node_modules/.bin/<binary>` and needing npm on PATH. Installs the LATEST version by
+ * default; an optional `version` pins a specific one (the caller never supplies the source - both
+ * the download URL and the registry package name are fixed per tool id). Streams meaningful
+ * progress phases via `onProgress`, honors the abort signal at every await (rejecting "Install
+ * cancelled"), and verifies the install by running `<binary> --version`. Rejects with a clear
+ * message on an unknown tool id, an unsupported platform, a failed download/checksum/extraction, a
+ * failed or missing npm, an install whose identity does not check out, or a cancel.
  *
  * `deps.agent` (contained hosts only) group-shares the verified install with the unprivileged identity
  * the CLI children run as; without it the `0700` tree is not even traversable by them, so the binary
@@ -969,6 +1260,11 @@ const installQueue = new Map<string, Promise<void>>();
  * forever with no recovery but deleting the tree. The daemon therefore also calls this at BOOT, which
  * heals every such tree. Every existing tool dir is shared, not just one, for the same reason.
  *
+ * Only the tool dir itself is shared, which is exactly what a `binary-download` CLI needs (its
+ * binary sits directly there). An `npm-package` CLI's launcher lives deeper, under
+ * `node_modules/.bin`, and is deliberately NOT shared: those CLIs are desktop-only (they are off
+ * `CONNECTABLE_TOOL_IDS`), so no contained host ever installs one.
+ *
  * @param baseDir - The managed-CLI base directory (the root of the tree the daemon installs into).
  * @param agent - The identity the CLI children run as; only its `gid` is used.
  * @param seams - Injectable share implementation (the real no-follow one by default).
@@ -998,6 +1294,15 @@ async function runInstallCli(
 	const fetchFn: FetchFn = deps.fetchFn ?? ((url, init) => globalThis.fetch(url, init));
 	const extractArchive = deps.extractArchive ?? defaultExtractArchive;
 	const runToolFn = deps.runToolFn ?? runTool;
+	// A managed `npm install` downloads a package tree, so it cannot run under the short probe
+	// timeout `runTool` defaults to, and npm writes WHY it failed to stderr, which the probe
+	// default discards. An injected runner is used verbatim (a test drives both calls through the
+	// one seam); only the default is widened.
+	const runInstallFn: RunTool =
+		deps.runToolFn ??
+		((bin, args) =>
+			runTool(bin, args, { timeoutMs: NPM_INSTALL_TIMEOUT_MS, captureStderr: true }));
+	const resolveBinaryFn = deps.resolveBinaryFn ?? ((name: string) => resolveToolBinary(name));
 	const userAgent = deps.userAgent ?? "agent-runtime";
 
 	throwIfAborted(signal);
@@ -1012,27 +1317,44 @@ async function runInstallCli(
 	// no POSIX modes (chmod is a near no-op there), so only tighten on non-Windows.
 	if (platform !== "win32") chmodSync(dir, 0o700);
 	assertNoSymlinkComponents(baseDir, dir);
-	const binaryPath = join(dir, binaryFileName(spec, platform));
 
-	const bytes = await downloadBinary(
-		toolId,
-		{ fetchFn, extractArchive, userAgent, platform, arch },
-		version,
-		signal,
-		onProgress
-	);
+	if (spec.recipe.kind === "npm-package") {
+		await installNpmPackage({
+			dir,
+			binDir: managedBinDir(baseDir, toolId, spec),
+			spec,
+			pkg: spec.recipe.pkg,
+			version,
+			platform,
+			runInstallFn,
+			runToolFn,
+			resolveBinaryFn,
+			signal,
+			onProgress
+		});
+	} else {
+		const binaryPath = join(dir, binaryFileName(spec, platform));
 
-	throwIfAborted(signal);
-	const placedSha = await placeBinary(bytes, binaryPath, platform, signal);
+		const bytes = await downloadBinary(
+			toolId,
+			{ fetchFn, extractArchive, userAgent, platform, arch },
+			version,
+			signal,
+			onProgress
+		);
 
-	throwIfAborted(signal);
-	onProgress("Verifying install...");
-	// Re-hash the placed binary immediately before running it, so a file swapped in the
-	// window between place and exec is caught rather than executed (TOCTOU guard).
-	assertPlacedUnchanged(binaryPath, placedSha);
-	const { code } = await runToolFn(binaryPath, ["--version"]);
-	if (code !== 0) {
-		throw new Error(`Installed ${spec.binary} but it failed to run (--version exited ${code})`);
+		throwIfAborted(signal);
+		const placedSha = await placeBinary(bytes, binaryPath, platform, signal);
+
+		throwIfAborted(signal);
+		onProgress("Verifying install...");
+		// Re-hash the placed binary immediately before running it, so a file swapped in the
+		// window between place and exec is caught rather than executed (TOCTOU guard).
+		assertPlacedUnchanged(binaryPath, placedSha);
+		const { code } = await runToolFn(binaryPath, ["--version"]);
+		if (code !== 0) {
+			throw new Error(`Installed ${spec.binary} but it failed to run (--version exited ${code})`);
+		}
 	}
 
 	// LAST, and only once the binary is verified: a failed install shares nothing.

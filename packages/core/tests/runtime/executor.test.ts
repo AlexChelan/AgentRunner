@@ -216,10 +216,10 @@ describe("executor", () => {
 			const root = appDataRoot();
 			// Collected rather than reassigned: a `let` (or a reset to `undefined`) narrows to its last
 			// assignment, and the reads below then run against `never`. One entry per dispatch, in order.
-			const seen: { codexHome?: string }[] = [];
+			const seen: { configHome?: string }[] = [];
 			const capturingSm = {
 				startRun: (
-					req: { codexHome?: string },
+					req: { configHome?: string },
 					_ctx: unknown,
 					_res: unknown,
 					onEvent: (e: DriveEvent, id: string) => void,
@@ -250,7 +250,7 @@ describe("executor", () => {
 				})
 			);
 			codexExec.start(start(), drive);
-			expect(seen[0]?.codexHome).toBe(codexHomeDir(root));
+			expect(seen[0]?.configHome).toBe(codexHomeDir(root));
 
 			const claudeExec = createExecutor(
 				makeDeps({
@@ -265,14 +265,14 @@ describe("executor", () => {
 			);
 			claudeExec.start(start({ connectionId: "claude-code" }), drive);
 			// The SECOND dispatch: Claude Code needs no isolated home, so it must carry none.
-			expect(seen[1]?.codexHome).toBeUndefined();
+			expect(seen[1]?.configHome).toBeUndefined();
 		} finally {
 			if (saved === undefined) delete process.env.CODEX_HOME;
 			else process.env.CODEX_HOME = saved;
 		}
 	});
 
-	it("auto-APPROVES an unattended permission-request (desktop-automated posture) so the CLI can act, off the run.event wire", () => {
+	it("auto-APPROVES an unattended permission-request, and DISCLOSES what it allowed", () => {
 		const events: RunEvent[] = [];
 		const { sm, permissionResponses } = fakeSession((onEvent, runId) => {
 			onEvent(
@@ -292,7 +292,37 @@ describe("executor", () => {
 		expect(permissionResponses).toEqual([
 			{ runId: "dispatch-perm", requestId: "perm-1", decision: "allow" }
 		]);
-		expect(events.map((e) => e.type)).toEqual(["done"]);
+		// The DECISION is unchanged; what changed is that it is no longer silent. Answering on the
+		// user's behalf and telling them nothing is what made the chat panel's posture invisible while
+		// the terminal panel disclosed its own on screen.
+		expect(events.map((e) => e.type)).toEqual(["permission", "done"]);
+		const disclosure = events.find((e) => e.type === "permission");
+		expect(disclosure).toEqual({
+			type: "permission",
+			toolName: "Bash",
+			decision: "auto-approved"
+		});
+	});
+
+	it("discloses EVERY approval, so a run that was allowed three tools says so three times", () => {
+		const events: RunEvent[] = [];
+		const { sm } = fakeSession((onEvent, runId) => {
+			for (const toolName of ["Bash", "Write", "Bash"]) {
+				onEvent({ type: "permission-request", requestId: `p-${toolName}`, toolName, input: {} }, runId);
+			}
+			onEvent({ type: "done" }, runId);
+		});
+		const exec = createExecutor(makeDeps({ sessionManager: sm }));
+		exec.start(start({ runId: "dispatch-many" }), {
+			onEvent: (m) => events.push(m.event),
+			onToolCall: async () => undefined,
+			onClose: () => {}
+		});
+
+		const disclosed = events
+			.filter((e) => e.type === "permission")
+			.map((e) => (e.type === "permission" ? e.toolName : null));
+		expect(disclosed).toEqual(["Bash", "Write", "Bash"]);
 	});
 
 	it("drives a dispatched run at the floor even under the most permissive requested policy", () => {
@@ -477,7 +507,7 @@ describe("executor", () => {
 			// Drive the served tool's execute to assert it proxies a tool.call and resolves on result.
 			const result = await tools.knowledge_search?.execute?.(
 				{ q: "x" },
-				{ toolCallId: "local", messages: [] }
+				{ toolCallId: "local", messages: [], context: undefined }
 			);
 			proxied.push(result);
 			return {

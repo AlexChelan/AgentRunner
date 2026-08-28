@@ -573,6 +573,37 @@ describe("buildCodexTurnStartParams", () => {
 		});
 	});
 
+	it("carries the MODEL on every turn, so a mid-conversation switch bills what the picker shows", () => {
+		// A thread is started once and RESUMED for every later turn, and `thread/resume` carries the
+		// thread id alone - so a model change moved the picker, changed nothing about the run, and billed
+		// the model the thread happened to open with. `turn/start` accepts `model` (app-server v2 schema,
+		// beside `effort`), so each turn states its own.
+		const params = buildCodexTurnStartParams({
+			threadId: "t1",
+			cwd: join(tmpdir(), "work"),
+			prompt: "hi",
+			sandboxMode: "workspace-write",
+			networkAccessEnabled: true,
+			model: "gpt-5.6-luna"
+		});
+
+		expect(params.model).toBe("gpt-5.6-luna");
+	});
+
+	it("omits the model entirely when none is pinned, leaving the thread's own", () => {
+		// An absent key is not the same as an empty one: the app-server reads a missing `model` as "keep
+		// what this thread runs on", which is what an unpinned selection means.
+		const params = buildCodexTurnStartParams({
+			threadId: "t1",
+			cwd: join(tmpdir(), "work"),
+			prompt: "hi",
+			sandboxMode: "workspace-write",
+			networkAccessEnabled: true
+		});
+
+		expect("model" in params).toBe(false);
+	});
+
 	it("workspace-write grants the cwd as a writable root and honors network on", () => {
 		const dir = join(tmpdir(), "work");
 		const params = buildCodexTurnStartParams({

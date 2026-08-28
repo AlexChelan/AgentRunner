@@ -135,6 +135,42 @@ describe("loadLocalAppConfig", () => {
 		);
 	});
 
+	it("parses the staged outward MCP endpoint", () => {
+		const cfg = loadLocalAppConfig(
+			writeConfig(valid({ mcpServerUrl: "https://acme.test/api/mcp" }))
+		);
+		expect(cfg.mcpServerUrl).toBe("https://acme.test/api/mcp");
+	});
+
+	it("leaves the endpoint undefined when the buyer switched the MCP server off", () => {
+		// Absent IS the switch being off, and the terminal session emits no server entry for it. A
+		// defaulted or guessed endpoint would point every CLI at a route that answers 404.
+		expect(loadLocalAppConfig(writeConfig(valid())).mcpServerUrl).toBeUndefined();
+	});
+
+	it("refuses an endpoint that is not an http(s) URL", () => {
+		// The value becomes an MCP server endpoint a spawned CLI connects to. A `file:` or `data:` URL -
+		// or a bare path the CLI would resolve on this machine - must never reach one, so the whole
+		// config is refused loudly rather than shipping the CLI a server pointed at the filesystem.
+		for (const url of [
+			"file:///etc/passwd",
+			"data:text/plain,hi",
+			"javascript:fetch(1)",
+			"/api/mcp",
+			"acme.test/api/mcp"
+		]) {
+			expect(() =>
+				loadLocalAppConfig(writeConfig({ ...valid(), mcpServerUrl: url }))
+			).toThrow(/mcpServerUrl/);
+		}
+	});
+
+	it("refuses a non-string endpoint instead of coercing it", () => {
+		expect(() => loadLocalAppConfig(writeConfig({ ...valid(), mcpServerUrl: 42 }))).toThrow(
+			/mcpServerUrl/
+		);
+	});
+
 	it("drops unknown keys (forward-compat)", () => {
 		const cfg = loadLocalAppConfig(writeConfig({ ...valid(), futureFlag: true, nested: { x: 1 } }));
 		expect(cfg).not.toHaveProperty("futureFlag");
@@ -166,7 +202,18 @@ const LONG_VALID_CRON = `${Array.from({ length: 60 }, (_, minute) => minute).joi
  */
 function spec(overrides: Partial<BuiltInAutomationSpec> = {}): BuiltInAutomationSpec {
 	const { id = "digest-desktop", name = "Digest", prompt = "Summarize", enabled = false } = overrides;
-	const common = { id, name, prompt, enabled };
+	const common = {
+		id,
+		name,
+		prompt,
+		enabled,
+		// The buyer knobs ride through only when a case sets them, so every other case's fixture stays the
+		// pre-knob document (which is what makes the "unknown keys are stripped" cases still mean something).
+		...(overrides.toggleable !== undefined ? { toggleable: overrides.toggleable } : {}),
+		...(overrides.hidden !== undefined ? { hidden: overrides.hidden } : {}),
+		...(overrides.cli !== undefined ? { cli: overrides.cli } : {}),
+		...(overrides.modelId !== undefined ? { modelId: overrides.modelId } : {})
+	};
 	if (overrides.cron !== undefined) {
 		return {
 			...common,
@@ -196,6 +243,41 @@ describe("loadLocalAppConfig - built-in automation specs", () => {
 
 	it("leaves automations undefined when the key is absent", () => {
 		expect(loadLocalAppConfig(writeConfig(valid())).automations).toBeUndefined();
+	});
+
+	it("preserves the buyer knobs, which zod would otherwise strip as unknown keys", () => {
+		// The schema strips unknown keys by design, so a knob the host stages but this schema does not
+		// declare reaches the daemon as nothing at all - the enforcement below it would then be dead code
+		// against a spec that always reads as toggleable, visible and unpinned.
+		const cfg = loadLocalAppConfig(
+			writeConfig(
+				valid({
+					automations: [
+						spec({
+							id: "forced",
+							enabled: true,
+							toggleable: false,
+							hidden: true,
+							cli: "claude-code",
+							modelId: "opus"
+						})
+					]
+				})
+			)
+		);
+		expect(cfg.automations).toEqual([
+			{
+				id: "forced",
+				name: "Digest",
+				prompt: "Summarize",
+				intervalMinutes: 60,
+				enabled: true,
+				toggleable: false,
+				hidden: true,
+				cli: "claude-code",
+				modelId: "opus"
+			}
+		]);
 	});
 
 	it("dROPS a below-floor intervalMinutes element per-element, keeping the valid siblings", () => {

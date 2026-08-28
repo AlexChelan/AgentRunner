@@ -1,10 +1,16 @@
-import type { ModelInfo, RunImage } from "@agentrunner/core-types";
+import type { ModelInfo, RunDocument, RunImage } from "@agentrunner/core-types";
 import type { McpServerSpec, PermissionMode, TokenUsage } from "@agentrunner/protocol";
 
 /** Result of running a tool binary for detection / status probes. */
 export interface ExecResult {
 	code: number;
 	stdout: string;
+	/**
+	 * The child's stderr, present ONLY when the caller opted in (`runTool`'s `captureStderr`).
+	 * Probes discard it; a command whose failure reason is written to stderr - `npm install` -
+	 * needs it to report why it failed.
+	 */
+	stderr?: string;
 }
 
 /** Runs a tool binary with an argument array (never a shell). Injected for testing. */
@@ -41,14 +47,21 @@ export interface AdvertisedModel {
 }
 
 /**
+ * Anything asked of a RESOLVED CLI binary: a model list, a version, a capability probe. The one shape
+ * `memoizeBinaryProbe` memoizes and every model lister is written against, so the `binaryPath` contract
+ * is stated once rather than restated per probe.
+ */
+export type BinaryProbe<T> = (params: {
+	/** Resolved absolute path to the user's CLI binary. */
+	binaryPath: string;
+}) => Promise<T>;
+
+/**
  * Queries a tool for the models it advertises. NEVER throws and never hangs: a missing binary, a
  * foreign CLI version, a failed handshake or a silent child all degrade to `[]`, which leaves the
  * adapter on its registry catalog and the picker on the declared floor.
  */
-export type AdvertisedModelLister = (params: {
-	/** Resolved absolute path to the user's CLI binary. */
-	binaryPath: string;
-}) => Promise<AdvertisedModel[]>;
+export type AdvertisedModelLister = BinaryProbe<AdvertisedModel[]>;
 
 /**
  * A normalized message yielded by any agentic driver, decoupled from each SDK. The
@@ -71,6 +84,11 @@ export interface ClaudeDriverParams {
 	prompt: string;
 	/** Images attached to a chat turn, sent as native base64 image content blocks alongside the prompt. */
 	images?: RunImage[];
+	/**
+	 * Documents (PDFs) attached to a chat turn, sent as native base64 `document` content blocks - the
+	 * Anthropic channel built for them, so Claude Code never has to open a file to read one.
+	 */
+	documents?: RunDocument[];
 	cwd: string;
 	model?: string;
 	/** BYOK key; absent means subscription mode (the tool resolves its own login). */
@@ -128,6 +146,22 @@ export type ClaudeDriver = (params: ClaudeDriverParams) => AsyncIterable<Agentic
  */
 export interface AgenticCliDriverParams {
 	prompt: string;
+	/**
+	 * Images attached to a chat turn. Every driver carries them, but by the mechanism its own CLI
+	 * really has (all three verified against the installed binaries): Codex sends them as structured
+	 * `image` items on the app-server's `turn/start` input, so no file is ever written; OpenCode stages
+	 * them as files and passes `-f <path>`; grok has NO image mechanism at all, so it stages them and
+	 * names the paths in the prompt for its file-reading tool. The one thing no driver does is silently
+	 * drop them.
+	 */
+	images?: RunImage[];
+	/**
+	 * Documents (PDFs) attached to a chat turn. NONE of these CLIs has a document channel - the
+	 * app-server input array takes only text and images, and `-f`/argv take paths - so every driver here
+	 * stages the file and points the CLI at it: OpenCode through `-f <path>`, Codex and grok by naming
+	 * the path in the prompt for their own file-reading tools. As with images, no driver drops them.
+	 */
+	documents?: RunDocument[];
 	cwd: string;
 	model?: string;
 	apiKey?: string;
@@ -175,16 +209,15 @@ export interface AgenticCliDriverParams {
 	 */
 	denyReadPaths?: string[];
 	/**
-	 * Only the CODEX driver consumes this: an ISOLATED `CODEX_HOME` for the run. Codex reads its
-	 * `config.toml` (personal `mcp_servers`, profiles) AND its file-based `auth.json` from `CODEX_HOME`,
-	 * and offers no strict-MCP flag or separate auth path, so a headless chat/automation run is isolated
-	 * by pointing `CODEX_HOME` at a runner-managed home whose `config.toml` declares NO personal MCP
-	 * servers. Subscription auth is preserved because that home's `auth.json` is a SYMLINK to the user's
-	 * real one (so no credential is copied at rest, and a keyring-auth platform - which has no auth.json -
-	 * is unaffected since the keyring is global). Absent = the user's own `~/.codex` (the interactive
-	 * terminal path, which keeps the full personal config). Ignored by OpenCode.
+	 * The ISOLATED config home this run drives its CLI against - `CODEX_HOME` for codex, `GROK_HOME` for
+	 * grok, `XDG_CONFIG_HOME` for opencode. What the path means per CLI is documented at `RUN_ISOLATION`
+	 * (runtime/executor.ts).
+	 *
+	 * Absent leaves the user's own personal config home - the interactive terminal path, where a human
+	 * is present and their own configuration is what they want. Claude Code sets it for no run: it
+	 * takes its MCP servers and permissions on argv, so it needs no config home to isolate.
 	 */
-	codexHome?: string;
+	configHome?: string;
 	signal: AbortSignal;
 }
 

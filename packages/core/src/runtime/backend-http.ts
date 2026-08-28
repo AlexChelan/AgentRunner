@@ -332,12 +332,12 @@ export function createAuthedRequest(deps: AuthedRequestDeps): AuthedRequest {
  * tool" from "wedged". Firing first is the point: a timed-out tool call returns to the model as a failed
  * TOOL - which it can retry or route around - instead of the watchdog killing the whole run around it.
  *
- * It does NOT narrow the BACKEND's exactly-once claim window (`CLAIM_TTL_SEC`, 90s in `@repo/api`
- * `relay/tool-call-cache.ts`), whose own doc justifies that window with "web-side capability calls
- * resolve in well under that" - true of the tools this boilerplate ships, but not of the 10 minutes this
- * ceiling permits. A tool that runs past 90s can have its claim lapse and be re-executed by a concurrent
- * retry. That is a pre-existing, deliberate trade (a short claim TTL is what stops a crashed winner
- * wedging the call id), recorded here only so the two ceilings stop disagreeing in silence.
+ * The BACKEND's exactly-once claim now covers this whole ceiling. `CLAIM_TTL_SEC` (90s, `@repo/api`
+ * `relay/tool-call-cache.ts`) is far under the ten minutes permitted here, and a lapsed claim let a
+ * concurrent retry re-execute the call - a second charge on the operator's vendor key for one
+ * `web_search`. The backend re-stamps a held claim while its winner works, so that TTL now bounds only a
+ * winner that has genuinely STOPPED, and the two ceilings no longer have to agree. Recorded here because
+ * raising this one is what would put the pair back out of step if that renewal were ever removed.
  */
 export const TOOL_CALL_TIMEOUT_MS = 10 * 60 * 1000;
 

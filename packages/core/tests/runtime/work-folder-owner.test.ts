@@ -74,79 +74,85 @@ function makeDeps(over: Partial<ExecutorDeps> = {}): ExecutorDeps {
 	};
 }
 
-describe.skipIf(process.platform === "win32")("work folder agent-share threading", () => {
-	/** The mode a work folder is left at when NOTHING shared it (mkdir under the test umask). */
-	const unshared = (path: string): boolean =>
-		(modeOf(path) & 0o7770) !== 0o1770 && modeOf(path) !== 0o770;
+describe("work folder agent-share threading", () => {
+	if (process.platform !== "win32") {
+		/** The mode a work folder is left at when NOTHING shared it (mkdir under the test umask). */
+		const unshared = (path: string): boolean =>
+			(modeOf(path) & 0o7770) !== 0o1770 && modeOf(path) !== 0o770;
 
-	it("buildRun group-shares the work folder with the agent identity when contained", () => {
-		const root = appDataRoot();
-		const cwd = buildRun({
-			appDataRoot: root,
-			backendKey: "be1",
-			start: start(),
-			connection: conn,
-			resolveBinary: () => "/bin/claude",
-			contained: true,
-			agentUid: 1000,
-			agentGid: SELF_GID
-		}).ctx.cwd;
-		// Sticky parent (its entries are daemon-owned; sticky stops a run swapping one for a symlink),
-		// group-writable leaf (the run's own cwd), and ownership still on the daemon in both.
-		expect(modeOf(join(root, "work", "be1"))).toBe(0o1770);
-		expect(modeOf(cwd)).toBe(0o770);
-		expect(statSync(cwd).uid).toBe(SELF_UID);
-		expect(statSync(cwd).gid).toBe(SELF_GID);
-	});
-
-	it("buildRun leaves ownership alone off a contained host", () => {
-		const root = appDataRoot();
-		buildRun({
-			appDataRoot: root,
-			backendKey: "be1",
-			start: start(),
-			connection: conn,
-			resolveBinary: () => "/bin/claude"
+		it("buildRun group-shares the work folder with the agent identity when contained", () => {
+			const root = appDataRoot();
+			const cwd = buildRun({
+				appDataRoot: root,
+				backendKey: "be1",
+				start: start(),
+				connection: conn,
+				resolveBinary: () => "/bin/claude",
+				contained: true,
+				agentUid: 1000,
+				agentGid: SELF_GID
+			}).ctx.cwd;
+			// Sticky parent (its entries are daemon-owned; sticky stops a run swapping one for a symlink),
+			// group-writable leaf (the run's own cwd), and ownership still on the daemon in both.
+			expect(modeOf(join(root, "work", "be1"))).toBe(0o1770);
+			expect(modeOf(cwd)).toBe(0o770);
+			expect(statSync(cwd).uid).toBe(SELF_UID);
+			expect(statSync(cwd).gid).toBe(SELF_GID);
 		});
-		expect(unshared(join(root, "work", "be1"))).toBe(true);
-		expect(unshared(join(root, "work", "be1", "p1"))).toBe(true);
-	});
 
-	it("buildRun leaves ownership alone when contained resolved no agent identity", () => {
-		const root = appDataRoot();
-		buildRun({
-			appDataRoot: root,
-			backendKey: "be1",
-			start: start(),
-			connection: conn,
-			resolveBinary: () => "/bin/claude",
-			contained: true
+		it("buildRun leaves ownership alone off a contained host", () => {
+			const root = appDataRoot();
+			buildRun({
+				appDataRoot: root,
+				backendKey: "be1",
+				start: start(),
+				connection: conn,
+				resolveBinary: () => "/bin/claude"
+			});
+			expect(unshared(join(root, "work", "be1"))).toBe(true);
+			expect(unshared(join(root, "work", "be1", "p1"))).toBe(true);
 		});
-		expect(unshared(join(root, "work", "be1"))).toBe(true);
-	});
 
-	it("the executor threads its containment deps into the run's work folder", () => {
-		const root = appDataRoot();
-		const exec = createExecutor(
-			makeDeps({ appDataRoot: root, contained: true, agentUid: 1000, agentGid: SELF_GID })
-		);
-		exec.start(start({ runId: "dispatch-r1" }), {
-			onEvent: () => {},
-			onToolCall: async () => undefined,
-			onClose: () => {}
+		it("buildRun leaves ownership alone when contained resolved no agent identity", () => {
+			const root = appDataRoot();
+			buildRun({
+				appDataRoot: root,
+				backendKey: "be1",
+				start: start(),
+				connection: conn,
+				resolveBinary: () => "/bin/claude",
+				contained: true
+			});
+			expect(unshared(join(root, "work", "be1"))).toBe(true);
 		});
-		expect(modeOf(join(root, "work", "be1"))).toBe(0o1770);
-		expect(modeOf(join(root, "work", "be1", "p1"))).toBe(0o770);
-	});
 
-	it("an uncontained executor never shares the work folder", () => {
-		const root = appDataRoot();
-		const exec = createExecutor(makeDeps({ appDataRoot: root }));
-		exec.start(start({ runId: "dispatch-r2" }), {
-			onEvent: () => {},
-			onToolCall: async () => undefined,
-			onClose: () => {}
+		it("the executor threads its containment deps into the run's work folder", () => {
+			const root = appDataRoot();
+			const exec = createExecutor(
+				makeDeps({ appDataRoot: root, contained: true, agentUid: 1000, agentGid: SELF_GID })
+			);
+			exec.start(start({ runId: "dispatch-r1" }), {
+				onEvent: () => {},
+				onToolCall: async () => undefined,
+				onClose: () => {}
+			});
+			expect(modeOf(join(root, "work", "be1"))).toBe(0o1770);
+			expect(modeOf(join(root, "work", "be1", "p1"))).toBe(0o770);
 		});
-		expect(unshared(join(root, "work", "be1", "p1"))).toBe(true);
-	});
+
+		it("an uncontained executor never shares the work folder", () => {
+			const root = appDataRoot();
+			const exec = createExecutor(makeDeps({ appDataRoot: root }));
+			exec.start(start({ runId: "dispatch-r2" }), {
+				onEvent: () => {},
+				onToolCall: async () => undefined,
+				onClose: () => {}
+			});
+			expect(unshared(join(root, "work", "be1", "p1"))).toBe(true);
+		});
+	} else {
+		it("has no POSIX group or mode to thread on this platform", () => {
+			expect(process.platform).toBe("win32");
+		});
+	}
 });

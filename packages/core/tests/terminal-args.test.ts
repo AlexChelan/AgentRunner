@@ -2,8 +2,10 @@ import { describe, expect, it } from "vitest";
 import {
 	claudeTerminalArgs,
 	codexTerminalArgs,
+	grokTerminalArgs,
 	isSafeTerminalToolName,
 	isTerminalCliId,
+	opencodeTerminalArgs,
 	TERMINAL_CLI_IDS
 } from "../src/terminal-args";
 import type { TerminalArgsInput } from "../src/terminal-args";
@@ -26,13 +28,15 @@ function input(overrides: Partial<TerminalArgsInput> = {}): TerminalArgsInput {
 }
 
 describe("tERMINAL_CLI_IDS", () => {
-	it("allows exactly the two interactive-verified CLIs", () => {
-		expect(TERMINAL_CLI_IDS).toEqual(["claude-code", "codex"]);
+	it("allows exactly the four interactive-verified CLIs", () => {
+		expect(TERMINAL_CLI_IDS).toEqual(["claude-code", "codex", "grok", "opencode"]);
 	});
 	it("narrows a tool id against that same list (never a hand-written union that can drift)", () => {
 		expect(isTerminalCliId("claude-code")).toBe(true);
 		expect(isTerminalCliId("codex")).toBe(true);
-		expect(isTerminalCliId("opencode")).toBe(false);
+		expect(isTerminalCliId("grok")).toBe(true);
+		expect(isTerminalCliId("opencode")).toBe(true);
+		expect(isTerminalCliId("cursor")).toBe(false);
 	});
 });
 
@@ -162,5 +166,108 @@ describe("codexTerminalArgs", () => {
 		const args = codexTerminalArgs(input({ instructions: 'line "quoted"\nnext' }), "/ws");
 		const dev = args.find((a) => a.startsWith("developer_instructions="));
 		expect(dev).toBe(`developer_instructions=${JSON.stringify('line "quoted"\nnext')}`);
+	});
+});
+
+describe("grokTerminalArgs", () => {
+	it("sets the session cwd and APPENDS the composed instructions as extra rules", () => {
+		const args = grokTerminalArgs(input(), "/ws/main");
+		expect(args.slice(0, 2)).toEqual(["--cwd", "/ws/main"]);
+		expect(args[args.indexOf("--rules") + 1]).toBe("BASE INSTRUCTIONS");
+		// `--system-prompt-override` REPLACES grok's own system prompt (losing its tool guidance);
+		// `--rules` appends, which is what `claude --append-system-prompt` does on the incumbent path.
+		expect(args).not.toContain("--system-prompt-override");
+	});
+	it("passes multi-line instructions as ONE argv element", () => {
+		const args = grokTerminalArgs(input({ instructions: 'line "quoted"\nnext' }), "/ws");
+		expect(args[args.indexOf("--rules") + 1]).toBe('line "quoted"\nnext');
+	});
+	it("passes the model via --model when given and omits it otherwise", () => {
+		expect(grokTerminalArgs(input({ modelId: "grok-code-fast-1" }), "/ws")).toContain(
+			"grok-code-fast-1"
+		);
+		expect(grokTerminalArgs(input(), "/ws")).not.toContain("--model");
+	});
+	it("emits no permission or sandbox override by default (native prompts stay on)", () => {
+		const args = grokTerminalArgs(input(), "/ws");
+		expect(args).not.toContain("--permission-mode");
+		expect(args).not.toContain("--always-approve");
+		// An unknown/unappliable `--sandbox` profile makes grok REFUSE to start, and the profiles live in
+		// the user's own config - so the session never names one.
+		expect(args).not.toContain("--sandbox");
+	});
+	it("runs full-auto when bypass is enabled", () => {
+		const args = grokTerminalArgs(input({ bypassPermissions: true }), "/ws");
+		expect(args[args.indexOf("--permission-mode") + 1]).toBe("bypassPermissions");
+	});
+	// grok's INTERACTIVE command has no inline MCP flag at all (`--mcp-config`/`--plugin-dir` are both
+	// rejected as unexpected arguments): its servers come from `[mcp_servers]` in the config home. So the
+	// loopback url - a 128-bit path token in a world-readable `/proc/<pid>/cmdline` - must never be argv'd
+	// onto a flag the CLI would ignore anyway. The host's config write wires it instead.
+	it("keeps the token-bearing app-MCP url OUT of argv (no inline MCP flag exists to carry it)", () => {
+		const serialized = JSON.stringify(
+			grokTerminalArgs(
+				input({ mcpServers: { linear: { type: "http", url: "https://mcp.linear.app/mcp" } } }),
+				"/ws"
+			)
+		);
+		expect(serialized).not.toContain("127.0.0.1");
+		expect(serialized).not.toContain("/tok/mcp");
+		expect(serialized).not.toContain("--mcp-config");
+		expect(serialized).not.toContain("--plugin-dir");
+		expect(serialized).not.toContain("mcp.linear.app");
+	});
+	// grok DOES have the flag - `--allow <RULE>` (alias `--allowedTools`), repeatable. None is emitted
+	// because this builder emits no MCP argument either, so there is no app server whose tools a rule
+	// could name; a rule for a server the session never receives grants a tool that is not there.
+	it("emits no tool-permission rules (no app MCP server reaches an interactive grok session yet)", () => {
+		const serialized = JSON.stringify(grokTerminalArgs(input(), "/ws"));
+		expect(serialized).not.toContain("--allow");
+		expect(serialized).not.toContain("knowledge_search");
+	});
+	it("names no extra workspace root (grok's interactive command has no add-dir flag)", () => {
+		const args = grokTerminalArgs(input({ workspaces: ["/ws/main", "/ws/two"] }), "/ws/main");
+		expect(args).not.toContain("/ws/two");
+	});
+});
+
+describe("opencodeTerminalArgs", () => {
+	it("starts the TUI in the session directory (opencode takes it as the project positional)", () => {
+		const args = opencodeTerminalArgs(input(), "/ws/main");
+		expect(args[0]).toBe("/ws/main");
+	});
+	it("passes the model via --model when given and omits it otherwise", () => {
+		expect(opencodeTerminalArgs(input({ modelId: "anthropic/claude-sonnet-4" }), "/ws")).toContain(
+			"anthropic/claude-sonnet-4"
+		);
+		expect(opencodeTerminalArgs(input(), "/ws")).not.toContain("--model");
+	});
+	it("emits no approval override by default (native prompts stay on)", () => {
+		expect(opencodeTerminalArgs(input(), "/ws")).not.toContain("--auto");
+	});
+	it("runs full-auto when bypass is enabled", () => {
+		expect(opencodeTerminalArgs(input({ bypassPermissions: true }), "/ws")).toContain("--auto");
+	});
+	// opencode parses argv with yargs, which SILENTLY IGNORES an unknown flag - so a `--mcp-config` that
+	// looked wired would be a no-op that leaked the loopback token into `/proc/<pid>/cmdline` for nothing.
+	// Its MCP block is config-only (`OPENCODE_CONFIG_CONTENT` / the config dir), which the host writes.
+	it("keeps the token-bearing app-MCP url OUT of argv (opencode takes MCP from config only)", () => {
+		const serialized = JSON.stringify(
+			opencodeTerminalArgs(
+				input({ mcpServers: { linear: { type: "http", url: "https://mcp.linear.app/mcp" } } }),
+				"/ws"
+			)
+		);
+		expect(serialized).not.toContain("127.0.0.1");
+		expect(serialized).not.toContain("/tok/mcp");
+		expect(serialized).not.toContain("--mcp-config");
+		expect(serialized).not.toContain("mcp.linear.app");
+	});
+	it("never emits --pure (it would strip the user's OWN plugins and MCP servers too)", () => {
+		expect(opencodeTerminalArgs(input(), "/ws")).not.toContain("--pure");
+	});
+	it("names no extra workspace root (opencode takes exactly one project directory)", () => {
+		const args = opencodeTerminalArgs(input({ workspaces: ["/ws/main", "/ws/two"] }), "/ws/main");
+		expect(args).not.toContain("/ws/two");
 	});
 });

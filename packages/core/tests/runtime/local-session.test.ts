@@ -17,7 +17,11 @@ import { createLocalSession } from "../../src/runtime/local/local-session";
 import type { LocalAutomationOutcome } from "../../src/runtime/local/automation-store";
 import { LOCAL_SCOPE } from "../../src/runtime/local/scope";
 import { localDataDir, runtimeIdentityDir, secretsDir, workRoot } from "../../src/runtime/paths";
-import { sensitiveHomeReadDenyPaths } from "../../src/runtime/read-deny";
+import {
+	grokCredentialReadDenyPaths,
+	opencodeCredentialReadDenyPaths,
+	sensitiveHomeReadDenyPaths
+} from "../../src/runtime/read-deny";
 import { createFileSecretStore } from "../../src/runtime/storage/secret-store";
 import type { SecretStore } from "../../src/runtime/storage/secret-store";
 import { createStateStore } from "../../src/runtime/storage/state-store";
@@ -158,10 +162,10 @@ function imageCapabilityRegistry(): {
 	runReqs: RuntimeRunRequest[];
 } {
 	const runReqs: RuntimeRunRequest[] = [];
-	const make = (toolId: string, images: boolean): RuntimeToolAdapter => ({
+	const make = (toolId: string, images: boolean, documents = images): RuntimeToolAdapter => ({
 		id: toolId,
 		displayName: toolId,
-		capabilities: { ...CAPS, images },
+		capabilities: { ...CAPS, images, documents },
 		detect: async () => ({ installed: true }),
 		authStatus: async () => ({ authenticated: true, mode: "subscription" }),
 		listModels: async () => [],
@@ -213,13 +217,16 @@ describe("createLocalSession", () => {
 		expect(handle).toEqual({ runId: expect.any(String) });
 		const req = runReqs[0];
 		expect(req?.cwd).toBe(join(workRoot(appDataRoot), LOCAL_SCOPE, "demo"));
-		// A codex run: the daemon dirs + the user's HOME credential stores are denied, but NOT the Codex login
-		// homes (the run's isolated CODEX_HOME/auth.json resolves into ~/.codex, so denying it breaks auth).
+		// A codex run: the daemon dirs, the user's HOME credential stores and the OTHER CLIs' login homes are
+		// denied, but NOT the Codex ones (the run's isolated CODEX_HOME/auth.json resolves into ~/.codex, so
+		// denying it breaks auth).
 		expect(req?.denyReadPaths).toEqual([
 			secretsDir(appDataRoot),
 			localDataDir(appDataRoot),
 			runtimeIdentityDir(appDataRoot),
-			...sensitiveHomeReadDenyPaths()
+			...sensitiveHomeReadDenyPaths(),
+			...grokCredentialReadDenyPaths(appDataRoot),
+			...opencodeCredentialReadDenyPaths()
 		]);
 		expect(req?.denyReadPaths).toContain(join(homedir(), ".ssh"));
 		expect(req?.denyReadPaths).not.toContain(join(homedir(), ".codex"));
@@ -378,6 +385,137 @@ describe("createLocalSession", () => {
 			{ type: "delta", text: "partial" },
 			{ type: "error", message: "crashed mid-run" }
 		]);
+	});
+
+	it("refuses attached documents when the selected CLI cannot accept them", () => {
+		const { appDataRoot, readState, secrets } = fixtures();
+		connect(readState, "codex");
+		const { registry, runReqs } = imageCapabilityRegistry();
+		const session = createLocalSession({
+			appDataRoot,
+			registry,
+			readState,
+			secrets,
+			audit: recordingAudit().audit,
+			config: () => ({ productId: "demo", productName: "Demo" }),
+			write: () => {}
+		});
+		const result = session.startChat({
+			prompt: "read this",
+			cli: "codex",
+			documents: [{ dataUrl: "data:application/pdf;base64,SlZC", mediaType: "application/pdf" }],
+			hooks: noopHooks()
+		});
+		expect(result).toEqual({ refused: expect.stringContaining("document") });
+		// Refused BEFORE any dispatch: the whole point is that the PDF is never quietly dropped.
+		expect(runReqs).toHaveLength(0);
+	});
+
+	it("gates documents on the DOCUMENT capability, not the image one", () => {
+		// The two are independent, so a CLI that takes photos and not PDFs must refuse the PDF while its
+		// image turns keep working. One merged capability would let exactly this turn drop its attachment.
+		const { appDataRoot, readState, secrets } = fixtures();
+		connect(readState, "claude-code");
+		const runReqs: RuntimeRunRequest[] = [];
+		const adapter: RuntimeToolAdapter = {
+			id: "claude-code",
+			displayName: "claude-code",
+			capabilities: { ...CAPS, images: true, documents: false },
+			detect: async () => ({ installed: true }),
+			authStatus: async () => ({ authenticated: true, mode: "subscription" }),
+			listModels: async () => [],
+			run: (req, _ctx, _resolvers, emit) => {
+				runReqs.push(req);
+				emit({ type: "done" });
+				return { cancel: () => undefined, respondToPermission: () => undefined };
+			}
+		};
+		const registry: AgentRuntimeRegistry = {
+			getAdapters: () => [adapter],
+			getAdapter: (id) => (id === "claude-code" ? adapter : undefined),
+			requireAdapter: () => adapter
+		};
+		const session = createLocalSession({
+			appDataRoot,
+			registry,
+			readState,
+			secrets,
+			audit: recordingAudit().audit,
+			config: () => ({ productId: "demo", productName: "Demo" }),
+			write: () => {}
+		});
+		expect(
+			session.startChat({
+				prompt: "read this",
+				cli: "claude-code",
+				documents: [{ dataUrl: "data:application/pdf;base64,SlZC", mediaType: "application/pdf" }],
+				hooks: noopHooks()
+			})
+		).toEqual({ refused: expect.stringContaining("document") });
+		expect(runReqs).toHaveLength(0);
+		// The same CLI still takes an image turn, which is what makes this a per-kind gate.
+		expect(
+			session.startChat({
+				prompt: "look",
+				cli: "claude-code",
+				images: [{ dataUrl: "data:image/png;base64,QUJD", mediaType: "image/png" }],
+				hooks: noopHooks()
+			})
+		).not.toHaveProperty("refused");
+		expect(runReqs).toHaveLength(1);
+		expect(runReqs[0]?.images).toHaveLength(1);
+	});
+
+	it("threads attached documents into the run request for a document-capable CLI", () => {
+		const { appDataRoot, readState, secrets } = fixtures();
+		connect(readState, "claude-code");
+		const { registry, runReqs } = imageCapabilityRegistry();
+		const session = createLocalSession({
+			appDataRoot,
+			registry,
+			readState,
+			secrets,
+			audit: recordingAudit().audit,
+			config: () => ({ productId: "demo", productName: "Demo" }),
+			write: () => {}
+		});
+		const documents = [
+			{ dataUrl: "data:application/pdf;base64,SlZC", mediaType: "application/pdf", name: "q3.pdf" }
+		];
+		session.startChat({
+			prompt: "summarize",
+			cli: "claude-code",
+			documents,
+			hooks: noopHooks()
+		});
+		expect(runReqs).toHaveLength(1);
+		expect(runReqs[0]?.documents).toEqual(documents);
+	});
+
+	it("sUPPRESSES the fallback for a DOCUMENT turn when the fallback CLI cannot take one", () => {
+		const { appDataRoot, readState, secrets } = fixtures();
+		// Only the fallback (codex, no document capability in this fixture) is connected, so the primary
+		// fails pre-execution. Ungated, codex would run and answer from the prompt with the PDF dropped.
+		connect(readState, "codex");
+		const { registry, runReqs } = imageCapabilityRegistry();
+		const events: RunEvent[] = [];
+		const session = createLocalSession({
+			appDataRoot,
+			registry,
+			readState,
+			secrets,
+			audit: recordingAudit().audit,
+			config: () => ({ productId: "demo", productName: "Demo", fallbackCli: "codex" }),
+			write: () => {}
+		});
+		session.startChat({
+			prompt: "what does this contract say?",
+			cli: "claude-code",
+			documents: [{ dataUrl: "data:application/pdf;base64,SlZC", mediaType: "application/pdf" }],
+			hooks: noopHooks({ onEvent: (msg) => events.push(msg.event) })
+		});
+		expect(runReqs).toHaveLength(0);
+		expect(events).toEqual([{ type: "error", message: "Unknown connection" }]);
 	});
 
 	it("sUPPRESSES the fallback for an image turn when the fallback CLI is text-only (surfaces the primary error)", () => {
@@ -1053,5 +1191,73 @@ describe("createLocalSession.startAutomated", () => {
 		expect(done.calls).toHaveLength(0);
 		await session.stop();
 		expect(done.calls).toEqual([[null, ""]]);
+	});
+	it("mounts the caller's app tools on a fire and rides the capability nudge with them", () => {
+		const { appDataRoot, readState, secrets } = fixtures();
+		connect(readState, "codex");
+		const { registry, runReqs } = recordingRegistry("codex", (_req, emit) =>
+			emit({ type: "done" })
+		);
+		const { audit } = recordingAudit();
+		const session = createLocalSession({
+			appDataRoot,
+			registry,
+			readState,
+			secrets,
+			audit,
+			config: () => ({
+				productId: "demo",
+				productName: "Demo",
+				toolsNudge: "You can act in Demo through your tools."
+			}),
+			write: () => {}
+		});
+		const done = collector();
+		session.startAutomated({
+			automationId: "sched-1",
+			prompt: "what is my name",
+			cli: "codex",
+			mcpServers: { "app-tools": { type: "http", url: "http://127.0.0.1:51789/mcp" } },
+			onDone: done.onDone
+		});
+		const req = runReqs[0];
+		expect(req?.mcpServers?.["app-tools"]).toEqual({
+			type: "http",
+			url: "http://127.0.0.1:51789/mcp"
+		});
+		// The tools and the voice that explains them travel together, exactly as they do on a chat turn.
+		expect(req?.systemPrompt).toContain("You can act in Demo through your tools.");
+	});
+
+	it("composes a fire with NO app tools exactly as it did before the seam existed", () => {
+		const { appDataRoot, readState, secrets } = fixtures();
+		connect(readState, "codex");
+		const { registry, runReqs } = recordingRegistry("codex", (_req, emit) =>
+			emit({ type: "done" })
+		);
+		const { audit } = recordingAudit();
+		const session = createLocalSession({
+			appDataRoot,
+			registry,
+			readState,
+			secrets,
+			audit,
+			config: () => ({
+				productId: "demo",
+				productName: "Demo",
+				toolsNudge: "You can act in Demo through your tools."
+			}),
+			write: () => {}
+		});
+		const done = collector();
+		session.startAutomated({
+			automationId: "sched-1",
+			prompt: "go",
+			cli: "codex",
+			onDone: done.onDone
+		});
+		const req = runReqs[0];
+		expect(req).not.toHaveProperty("mcpServers");
+		expect(req?.systemPrompt).not.toContain("You can act in Demo through your tools.");
 	});
 });

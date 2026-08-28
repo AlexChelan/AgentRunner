@@ -6,7 +6,7 @@ import {
 	shouldServeLocalTools
 } from "../../index";
 import type { AgentRuntimeRegistry, McpServerSpec } from "../../index";
-import type { RunImage, RunStart } from "@agentrunner/protocol";
+import type { RunDocument, RunImage, RunStart } from "@agentrunner/protocol";
 import type { AuditLog } from "../audit-log";
 import { toConnectionRef } from "../backend-session";
 import { brand } from "../brand";
@@ -67,6 +67,8 @@ export interface StartLocalChatOpts {
 	conversationId?: string;
 	/** Images attached to a chat turn; refused when the resolved CLI cannot accept images. */
 	images?: RunImage[];
+	/** Documents (PDFs) attached to a chat turn; refused when the resolved CLI cannot accept them. */
+	documents?: RunDocument[];
 	/**
 	 * The workspace work-tree key this run is confined under; absent means the LOCAL scope (the
 	 * no-project bucket).
@@ -78,6 +80,14 @@ export interface StartLocalChatOpts {
 	 * ({@link connectedFolderForRun}) - the session neither reads the grant store nor judges a path.
 	 */
 	connectedFolder?: string;
+	/**
+	 * Extra MCP servers for THIS turn, merged onto the user's stored LOCAL-scope servers (the request's
+	 * win a name collision). This is the desktop app's product-tools seam: the app serves the signed-in
+	 * user's app capabilities over its own loopback MCP and passes the URL here, so a local CLI chat
+	 * gets the same tools the in-app chat has. The drive route validates the shape (`http`, loopback
+	 * host only) before it reaches this option - a stdio spec can never arrive through it.
+	 */
+	mcpServers?: Record<string, McpServerSpec>;
 	/** The executor hooks each run event / conversation id / close flows through. */
 	hooks: RunHooks;
 }
@@ -105,6 +115,16 @@ export interface StartAutomatedOpts {
 	 * ({@link connectedFolderForRun}); a fire whose grant could not be honoured never reaches here.
 	 */
 	connectedFolder?: string;
+	/**
+	 * Extra MCP servers for THIS fire, merged onto the user's stored LOCAL-scope servers (the fire's win a
+	 * name collision) - the SAME product-tools seam a local chat turn carries, so an unattended run can
+	 * answer from the app's own tools instead of guessing about the account it is acting for. The runner
+	 * reads them from the host's registration ({@link import('./app-tools').AppToolsRegistry}); an absent
+	 * or stale registration passes nothing, and the fire composes exactly as it did before the seam
+	 * existed. Carrying them is also what earns the run the capability instruction, since
+	 * {@link composeLocalRun} rides the nudge on the presence of request servers.
+	 */
+	mcpServers?: Record<string, McpServerSpec>;
 	/**
 	 * Settles the fire EXACTLY ONCE with its terminal outcome and the collected assistant text. `outcome`
 	 * is `null` when the run closed without a terminal event (a drain/cancel), meaning the caller should
@@ -138,7 +158,11 @@ export interface LocalSession {
 	 * any other `error` -> `failed`; a close with no terminal event (drain/cancel) -> `null` (leave the
 	 * prior run state). `onDone` fires EXACTLY ONCE, including when no CLI can be resolved (`failed`).
 	 *
-	 * @param opts - The automation id, prompt, optional CLI/model/effort/folder overrides, and the settle callback.
+	 * A fire carries the host's product-tools MCP server exactly as a chat turn does when the caller passes
+	 * one ({@link StartAutomatedOpts.mcpServers}), which also rides the capability instruction, so the two
+	 * local lanes speak with the same tools and the same voice.
+	 *
+	 * @param opts - The automation id, prompt, optional CLI/model/effort/folder/MCP overrides, and the settle callback.
 	 */
 	startAutomated(opts: StartAutomatedOpts): void;
 	/**
@@ -177,6 +201,11 @@ export interface LocalSessionDeps {
 	config: () => LocalAppConfig;
 	/** Sink for this session's diagnostic lines (defaults to `process.stdout.write`). */
 	write?: (line: string) => void;
+	/**
+	 * Extra absolute paths this host wants denied to every run this session composes. See
+	 * `BuildRunOpts.hostDenyReadPaths` (`run-context-builder.ts`), which owns the rule.
+	 */
+	hostDenyReadPaths?: readonly string[];
 }
 
 /**
@@ -232,7 +261,10 @@ export function createLocalSession(deps: LocalSessionDeps): LocalSession {
 		// Branded server name; never actually fires in local mode (an empty manifest -> `shouldServe` false).
 		serveTools: (tools) => serveToolsOverHttp(tools, undefined, `${brand().binary}-tools`),
 		shouldServe: (caps, tools) => shouldServeLocalTools(caps, tools),
-		localMcpServers: (productId) => pendingLocalServers.get(productId) ?? {}
+		localMcpServers: (productId) => pendingLocalServers.get(productId) ?? {},
+		...(deps.hostDenyReadPaths !== undefined
+			? { hostDenyReadPaths: deps.hostDenyReadPaths }
+			: {})
 	});
 
 	// A dispatcher that publishes one run's composed local MCP servers to the executor's per-product dep for
@@ -267,11 +299,19 @@ export function createLocalSession(deps: LocalSessionDeps): LocalSession {
 			if (!cli) {
 				return { refused: "No CLI selected: pass a cli or set defaultCli in the local config." };
 			}
-			// Images ride the turn only for a CLI whose adapter declares the capability (Claude Code). Refuse
-			// rather than silently drop when a text-only CLI is asked to take an image (defence in depth behind
-			// the desktop composer, which already hides the attach control for a text-only CLI).
-			if (opts.images && opts.images.length > 0 && !registry.getAdapter(cli)?.capabilities.images) {
+			const adapter = registry.getAdapter(cli);
+			// Images ride the turn for any CLI whose adapter declares the capability - which, since each
+			// driver gained the mechanism its own CLI really has, is EVERY CLI in the desktop catalog. So
+			// this no longer fires for a shipped selection; it stays as the fail-closed backstop for an
+			// adapter with no image route at all, where the only honest answers are refuse or drop, and
+			// dropping is the one this whole path exists to prevent.
+			if (opts.images && opts.images.length > 0 && !adapter?.capabilities.images) {
 				return { refused: `The selected CLI (${cli}) cannot accept image attachments.` };
+			}
+			// The same fail-closed backstop for documents, against the adapter's OWN document capability
+			// rather than its image one: the two are independent, and a CLI could gain one without the other.
+			if (opts.documents && opts.documents.length > 0 && !adapter?.capabilities.documents) {
+				return { refused: `The selected CLI (${cli}) cannot accept document attachments.` };
 			}
 			const modelId = opts.modelId ?? config.defaultModel;
 
@@ -283,7 +323,9 @@ export function createLocalSession(deps: LocalSessionDeps): LocalSession {
 				...(opts.effort !== undefined ? { effort: opts.effort } : {}),
 				...(opts.conversationId !== undefined ? { conversationId: opts.conversationId } : {}),
 				...(opts.images !== undefined ? { images: opts.images } : {}),
-				localMcpServers: readState().listMcpServers(LOCAL_SCOPE)
+				...(opts.documents !== undefined ? { documents: opts.documents } : {}),
+				localMcpServers: readState().listMcpServers(LOCAL_SCOPE),
+				...(opts.mcpServers !== undefined ? { requestMcpServers: opts.mcpServers } : {})
 			});
 
 			if (composed.refusedServers.length > 0) {
@@ -297,23 +339,25 @@ export function createLocalSession(deps: LocalSessionDeps): LocalSession {
 			// executor's per-product dep for the duration of its SYNCHRONOUS request build, then clears them.
 			// Wrapping per-dispatch (rather than once) means a fallback re-dispatch - which can fire after this
 			// call returns - still sees the servers, instead of an empty map a single up-front set would leave.
-			// Gate the fallback by the same image capability the primary is held to above: never fall an
-			// image-bearing turn back onto a text-only CLI, which would drop the images and answer from the
-			// prompt alone, silently violating the "refuse rather than drop" invariant. Suppress the fallback
-			// so the primary's honest start-failure surfaces instead of a blind text-only answer.
+			// Gate the fallback by the same capabilities the primary is held to above, PER ATTACHMENT KIND:
+			// never fall a turn back onto a CLI that cannot carry what it carries, which would drop the
+			// attachment and answer from the prompt alone, silently violating "refuse rather than drop".
+			// Suppress the fallback so the primary's honest start-failure surfaces instead of a blind
+			// text-only answer. Like the check above, no shipped CLI trips this today; it is what keeps
+			// that true if one ever loses the capability.
 			const fallback = resolveFallback(config);
-			const imageSafeFallback =
-				opts.images &&
-				opts.images.length > 0 &&
-				fallback &&
-				!registry.getAdapter(fallback.cli)?.capabilities.images
-					? null
-					: fallback;
+			const fallbackAdapter = fallback ? registry.getAdapter(fallback.cli) : undefined;
+			const dropsImages =
+				Boolean(opts.images && opts.images.length > 0) && !fallbackAdapter?.capabilities.images;
+			const dropsDocuments =
+				Boolean(opts.documents && opts.documents.length > 0) &&
+				!fallbackAdapter?.capabilities.documents;
+			const attachmentSafeFallback = fallback && (dropsImages || dropsDocuments) ? null : fallback;
 			const dispatcher = withLocalServers(composed.mcpServers);
 			// An absent work key (or connected folder) is passed through as an undefined field rather than an
 			// absent options object: the executor reads `opts?.<field> !== undefined`, so the two are the same
 			// dispatch.
-			dispatchWithFallback(dispatcher, composed.start, opts.hooks, imageSafeFallback, {
+			dispatchWithFallback(dispatcher, composed.start, opts.hooks, attachmentSafeFallback, {
 				workKey: opts.workKey,
 				connectedFolder: opts.connectedFolder
 			});
@@ -336,7 +380,8 @@ export function createLocalSession(deps: LocalSessionDeps): LocalSession {
 				cli,
 				...(modelId !== undefined ? { modelId } : {}),
 				...(opts.effort !== undefined ? { effort: opts.effort } : {}),
-				localMcpServers: readState().listMcpServers(LOCAL_SCOPE)
+				localMcpServers: readState().listMcpServers(LOCAL_SCOPE),
+				...(opts.mcpServers !== undefined ? { requestMcpServers: opts.mcpServers } : {})
 			});
 
 			if (composed.refusedServers.length > 0) {

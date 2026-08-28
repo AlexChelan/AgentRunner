@@ -5,14 +5,18 @@ import { createServer } from "node:http";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { connect } from "node:net";
 import { isAbsolute } from "node:path";
-import { isConnectableToolId, RunImageSchema } from "@agentrunner/protocol";
-import type { ConnectableToolId, RunConversationMsg, RunEventMsg } from "@agentrunner/protocol";
+import { RunDocumentSchema, RunImageSchema } from "@agentrunner/protocol";
+import type { RunConversationMsg, RunEventMsg } from "@agentrunner/protocol";
+import { isDesktopCliId } from "@agentrunner/core-types";
+import type { DesktopCliId } from "@agentrunner/core-types";
 import { z } from "zod";
 import type { RunHooks } from "../executor";
+import { effectiveBuiltInEnabled } from "./app-config";
 import type { BuiltInAutomationSpec, LocalAppConfig } from "./app-config";
 import { assertSessionKey } from "./chat-store";
 import type { LocalChatStore } from "./chat-store";
 import type { LocalSession } from "./local-session";
+import type { AppToolsRegistry } from "./app-tools";
 import type { AutomationRunner } from "./automation-runner";
 import {
 	cadenceOf,
@@ -24,7 +28,11 @@ import {
 	toCadence
 } from "./automation-cadence";
 import type { AutomationCadence } from "./automation-cadence";
-import type { LocalAutomation, LocalAutomationRunState, LocalAutomationStore } from "./automation-store";
+import type {
+	LocalAutomation,
+	LocalAutomationRunState,
+	LocalAutomationStore
+} from "./automation-store";
 import { refuseConnectedFolder } from "./connected-folder-deny";
 import type { ConnectedFolderDenyDeps, ConnectedFolderVerdict } from "./connected-folder-deny";
 import { connectedFolderForRun } from "./connected-folder-run";
@@ -32,6 +40,7 @@ import type { ConnectedFolderStore } from "./connected-folders";
 import { resolveExistingFolder } from "../folder-grants";
 import { isValidProjectId, PROJECT_ID_PATTERN, workspaceWorkKey } from "./workspace-scope";
 import type { WorkspaceAutomationStores, WorkspaceTaskOverrideStores } from "./workspace-stores";
+import { isLoopbackMcpUrl, MCP_SERVER_NAME_PATTERN } from "./mcp-url";
 
 /** The first NDJSON frame of a chat stream: the started run's id (no run has emitted an event yet). */
 export interface RunStartedMsg {
@@ -52,15 +61,15 @@ export type LocalChatStreamFrame = RunStartedMsg | RunEventMsg | RunConversation
 export type LocalLifecycle = "app-scoped" | "background";
 
 /**
- * One connectable CLI as `GET /v1/tools/catalog` reports it, from a LIVE per-request probe (never a
+ * One desktop CLI as `GET /v1/tools/catalog` reports it, from a LIVE per-request probe (never a
  * boot-time cache): whether the binary is installed on this machine, whether it can authenticate right
  * now, and whether it already has a LOCAL-scope connection the desktop can run. The desktop Models tab
  * renders the full catalog from this so a CLI installed + signed in but not yet connected locally
  * (e.g. one connected only to a paired backend) is offered for a one-click in-app connect.
  */
 export interface CliCatalogEntry {
-	/** The connectable tool id (`claude-code` or `codex`). */
-	toolId: ConnectableToolId;
+	/** The desktop CLI's tool id (the host machine's catalog, which is wider than the cloud-dispatch set). */
+	toolId: DesktopCliId;
 	/** The tool's human display name (from its runtime adapter). */
 	displayName: string;
 	/** Whether the tool's binary resolved on this machine (a fresh `detect()` this request). */
@@ -71,6 +80,8 @@ export interface CliCatalogEntry {
 	connected: boolean;
 	/** Whether the tool can accept image attachments on a chat turn (from its adapter's capabilities). */
 	images: boolean;
+	/** Whether the tool can accept PDF attachments on a chat turn (from its adapter's capabilities). */
+	documents: boolean;
 }
 
 /**
@@ -84,6 +95,33 @@ export type CliConnectResult =
 	| { status: "needs-login" }
 	| { status: "not-installed" }
 	| { status: "failed"; reason: string };
+
+/**
+ * The terminal outcome of a `POST /v1/tools/<toolId>/install`, which is ONE operation for install and
+ * update alike (a managed install always fetches the latest version, so running it on an
+ * already-installed CLI updates it):
+ *
+ * - `installed` - the host installed (or re-installed at the latest version) the CLI into its OWN
+ *   managed data folder, and verified what landed.
+ * - `user-managed` - the CLI already resolves from the user's own PATH (or a curated install dir), so
+ *   nothing was touched. The app installs FOR a user who has no install of their own; a CLI the user
+ *   owns stays theirs, and `path` names the binary that answered so the UI can say where it lives.
+ * - `failed` - the install was attempted and refused, with the reason to show.
+ */
+export type InstallToolResult =
+	| { status: "installed" }
+	| { status: "user-managed"; path: string }
+	| { status: "failed"; reason: string };
+
+/**
+ * One line of a `POST /v1/tools/<toolId>/install` NDJSON stream: each progress phase as the install
+ * reports it, then EXACTLY ONE terminal `install.result`. The stream shape is the same one `/v1/chat`
+ * uses and for the same reason - the work takes minutes, so the response head and the phases have to
+ * reach the client while it is still running rather than after it.
+ */
+export type LocalInstallStreamFrame =
+	| { type: "install.progress"; line: string }
+	| { type: "install.result"; result: InstallToolResult };
 
 /**
  * The exact `Host` header every drive request must carry. There is no meaningful host over a unix
@@ -138,10 +176,26 @@ export interface LocalDriveDeps {
 	connectedFolderDeny: ConnectedFolderDenyDeps;
 	/** The automation runner powering `POST /v1/automations/<id>/run-now` (it shares the tick's single-flight + cap). */
 	automationRunner: Pick<AutomationRunner, "runNow">;
+	/**
+	 * The daemon's memory of the HOST's product-tools MCP server, written by `PUT/DELETE /v1/app-tools`
+	 * and read by the automation runner on every fire. It exists because an unattended fire has no request
+	 * to carry the server on: a chat turn passes it per turn (`mcpServers`), while a tick fires with
+	 * nobody there, so the host registers the address once and the daemon mounts it until the host
+	 * withdraws it or the registration goes stale.
+	 *
+	 * Optional: a host that serves no app tools (the CLI daemon, a test) passes none, and the routes then
+	 * answer 404 like any other route the build does not serve - the fires simply carry no app tools.
+	 */
+	appTools?: AppToolsRegistry;
 	/** Reads the on-device product config FRESH per request, so a live edit applies to the next call. */
 	config: () => LocalAppConfig;
-	/** Projects the LOCAL-scope CLI connections for `/v1/tools` (`{ toolId, authHealth, images }`). */
-	listConnections: () => { toolId: string; authHealth: string; images: boolean }[];
+	/** Projects the LOCAL-scope CLI connections for `/v1/tools` (with their attachment capabilities). */
+	listConnections: () => {
+		toolId: string;
+		authHealth: string;
+		images: boolean;
+		documents: boolean;
+	}[];
 	/**
 	 * Probes the FULL connectable-CLI catalog LIVE for `GET /v1/tools/catalog`: each tool's fresh
 	 * install + auth state plus whether it already has a LOCAL-scope connection. Runs the runtime adapters'
@@ -154,19 +208,40 @@ export interface LocalDriveDeps {
 	 * Connects ONE coding CLI under the LOCAL scope for `POST /v1/tools/<toolId>/connect`: detect + auth
 	 * probe + record when installed and signed in, NEVER spawning an interactive login (a signed-out CLI
 	 * reports `needs-login` and the user completes login in their terminal). This is the desktop's in-app
-	 * "add provider" for an already-authenticated CLI - no terminal needed. Expected never to throw.
+	 * "add provider" for an already-authenticated CLI - no terminal needed. The id is a
+	 * {@link DesktopCliId} - the HOST machine's catalog, wider than the cloud-dispatch set - because this
+	 * connect happens on the operator's own machine under their own account. Expected never to throw.
 	 */
-	connectCli: (toolId: ConnectableToolId) => Promise<CliConnectResult>;
+	connectCli: (toolId: DesktopCliId) => Promise<CliConnectResult>;
+	/**
+	 * Installs (or updates) ONE coding CLI into the host's own managed data folder for
+	 * `POST /v1/tools/<toolId>/install`, calling `onProgress` with each phase as it goes - the route
+	 * streams those lines, so this dep is what makes a multi-minute install observable rather than a
+	 * silent socket. Install and UPDATE are the same call: a managed install always fetches the latest
+	 * version, so running it on an already-managed CLI updates it in place.
+	 *
+	 * The dep decides whether to install at all: a CLI that already resolves from the USER's own PATH
+	 * (or a curated install dir) answers {@link InstallToolResult} `user-managed` and is left untouched -
+	 * the app never overwrites, updates or shadows an install the user owns. The id is a
+	 * {@link DesktopCliId}, the host machine's catalog, because this runs on the operator's own machine
+	 * under their own account. Expected never to throw (a refusal is a `failed` result); a throw is
+	 * still caught by the route and reported as one.
+	 */
+	installTool: (
+		toolId: DesktopCliId,
+		onProgress: (line: string) => void
+	) => Promise<InstallToolResult>;
 	/**
 	 * Resolves one CLI's model catalog for `GET /v1/tools/<toolId>/models` (the runtime adapter's
-	 * `listModels`, projected to the shared `{ id, name, recommended?, effortLevels?, defaultEffort? }`
+	 * `listModels`, projected to the shared `{ id, name, recommended?, effortLevels?, defaultEffort?, contextWindow? }`
 	 * picker wire shape). The desktop picker reads its per-CLI models from THIS daemon, so a desktop-only
 	 * product needs no backend catalog route. `effortLevels` is the model's OWN advertised ladder, in the
 	 * source's order, and is absent when nothing was discovered - which decodes to the shipped ladder,
 	 * i.e. exactly the behaviour before discovery existed. Expected never to throw (the adapter layer
-	 * degrades to its fallback catalog).
+	 * degrades to its fallback catalog). The id is a {@link DesktopCliId}, so a desktop-only CLI's picker
+	 * is served from the same route as every other one.
 	 */
-	listToolModels: (toolId: ConnectableToolId) => Promise<
+	listToolModels: (toolId: DesktopCliId) => Promise<
 		{
 			id: string;
 			name: string;
@@ -199,12 +274,15 @@ export interface LocalDriveDeps {
 
 /**
  * The chat body cap - applied AFTER auth passes; an oversized body is a clean 413, never a crash. Sized to
- * hold a full turn's attached photos: up to 5 images, each compressed client-side to a ~2MB ceiling
- * (~2.7MB as a base64 data URL), plus the prompt. Owner-only socket, so a large body is a local memory bound.
+ * hold a full turn's attachments: up to 5 images, each compressed client-side to a ~2MB ceiling (~2.7MB as
+ * a base64 data URL), or up to 3 PDFs at the composer's ~3MB ceiling (~4.1MB each), plus the prompt.
+ * Owner-only socket, so a large body is a local memory bound.
  */
 const CHAT_BODY_CAP = 20 * 1024 * 1024;
 /** The per-turn image cap, matching the composer's client-side limit. */
 const MAX_CHAT_IMAGES = 5;
+/** The per-turn document cap, matching the composer's client-side limit. */
+const MAX_CHAT_DOCUMENTS = 3;
 /** The PUT-session body cap (the local store has no ceiling; this is anti-foot-gun, not a quota). */
 const PUT_BODY_CAP = 2 * 1024 * 1024;
 /** The rename body cap (a title plus a namespace is tiny). */
@@ -226,6 +304,9 @@ const WORKSPACES_BODY_CAP = 64 * 1024;
 /** The connected-folder PUT body cap (one project id plus one filesystem path). */
 const CONNECTED_FOLDER_BODY_CAP = 16 * 1024;
 
+/** The app-tools registration body cap (one MCP server name plus one loopback url). */
+const APP_TOOLS_BODY_CAP = 4 * 1024;
+
 /**
  * The largest assistant reply the daemon holds in memory per chat turn for the DETACHED-run salvage, in
  * bytes. Matches the automated-run collector's ceiling; it bounds what this handler retains, never what it
@@ -233,8 +314,19 @@ const CONNECTED_FOLDER_BODY_CAP = 16 * 1024;
  */
 const MAX_SALVAGED_TEXT_BYTES = 64 * 1024;
 
-/** Maximum derived chat title length, mirroring ui's `MAX_TITLE` (chat-session-store.ts). */
-const MAX_CHAT_TITLE = 60;
+/**
+ * How much of the prompt a derived chat title excerpts, mirroring `MAX_TITLE`
+ * (`@repo/app-core/chat/session-store`, itself `MAX_STORED_TITLE` from `@repo/config/ai/title`). The
+ * value is duplicated rather than imported because this package carries no `@repo/config`.
+ *
+ * It must MATCH: the desktop's local lane decides whether AI naming may replace a stored title by
+ * comparing that title against its own derivation, so a bound that drifts from the app's silently
+ * turns local AI naming off - a failure that is invisible rather than loud.
+ *
+ * EXPORTED so `apps/electron` - the one package that can import both this and `@repo/config` - can pin
+ * the two equal against the VALUE rather than a regex over this file's source.
+ */
+export const MAX_CHAT_TITLE = 200;
 
 /**
  * The refusal a route gives when it needs the on-device config and cannot read one. 503, not 500: the
@@ -279,9 +371,9 @@ interface SalvagedChatMessage {
 }
 
 /**
- * Derives a chat title from the user prompt, mirroring ui's `deriveTitle` (chat-session-store.ts) so a
- * transcript the daemon had to write itself is labelled the way the app would have labelled it, instead of
- * showing as untitled in the switcher.
+ * Derives a chat title from the user prompt, mirroring `deriveTitle`
+ * (`@repo/app-core/chat/session-store`) so a transcript the daemon had to write itself is labelled the way
+ * the app would have labelled it, instead of showing as untitled in the switcher.
  *
  * @param prompt - The prompt the turn was fired with.
  * @returns The trimmed title, truncated to {@link MAX_CHAT_TITLE}.
@@ -311,6 +403,29 @@ const SafeKey = z
 	.string()
 	.refine((v) => isSafeKey(v), { message: "must be a safe single path segment" });
 
+/** An MCP server name a request may name, judged by the shared {@link MCP_SERVER_NAME_PATTERN}. */
+const McpServerName = z.string().regex(MCP_SERVER_NAME_PATTERN);
+
+/**
+ * The url an MCP server a REQUEST names may live at: `http(s)` on a LOOPBACK host, and nothing else.
+ * Anything remote belongs in the user's own `mcp add` store, added by the user's own hand; a request
+ * surface only ever mounts a server this machine is already serving. Shared by the chat turn's
+ * per-request servers and the host's app-tools registration, so the two can never drift on what a
+ * request may point a run at - and the host judging a url before it sends one reads the same
+ * {@link isLoopbackMcpUrl}.
+ */
+const LoopbackMcpUrl = z
+	.url({ protocol: /^https?$/ })
+	.refine((value) => isLoopbackMcpUrl(value), { message: "mcp server url must be loopback" });
+
+/**
+ * The `PUT /v1/app-tools` body: the ONE product-tools server the host is currently serving, which every
+ * unattended fire then mounts. Strict and singular by design - this is not a general MCP-server surface
+ * (that is `mcp add`, which the user drives), it is the host telling the daemon where its own app tools
+ * live right now.
+ */
+const AppToolsBody = z.object({ name: McpServerName, url: LoopbackMcpUrl }).strict();
+
 /** The `POST /v1/chat` body. `namespace`/`sessionId` use the store's key rule so a `..` is a clean 400. */
 const ChatBody = z
 	.object({
@@ -328,19 +443,51 @@ const ChatBody = z
 		 */
 		effort: z.string().min(1).optional(),
 		images: z.array(RunImageSchema).max(MAX_CHAT_IMAGES).optional(),
+		documents: z.array(RunDocumentSchema).max(MAX_CHAT_DOCUMENTS).optional(),
 		/**
 		 * The project workspace this turn belongs to; absent means the no-project bucket, whose
 		 * dispatch stays byte-identical to the pre-workspace one. Present, it must AGREE with `namespace`
 		 * (which is `<userId>-<project>` for a project workspace) and it is the ONLY thing the run's work key
 		 * is derived from - a request string never travels to the session as a work key.
 		 */
-		project: z.string().regex(PROJECT_ID_PATTERN).optional()
+		project: z.string().regex(PROJECT_ID_PATTERN).optional(),
+		/**
+		 * Extra MCP servers for THIS turn - the desktop app's product-tools loopback server, so a local
+		 * CLI chat gets the same app capabilities the in-app chat has. Deliberately the NARROWEST shape
+		 * that serves that: `http` only (a stdio spec is arbitrary code execution and stays refused on
+		 * every request surface), LOOPBACK only (anything remote belongs in the user's own `mcp add`
+		 * store, added by the user's own hand), and at most a handful of entries.
+		 */
+		mcpServers: z
+			.record(McpServerName, z.object({ type: z.literal("http"), url: LoopbackMcpUrl }))
+			.refine((servers) => Object.keys(servers).length <= 4, {
+				message: "too many mcp servers"
+			})
+			.optional()
 	})
-	// A turn needs SOMETHING to send: non-empty text, or at least one image (an image-only turn carries no
-	// caption). Rejecting an empty-and-imageless turn keeps the old `prompt.min(1)` guarantee.
-	.refine((body) => body.prompt.trim().length > 0 || (body.images?.length ?? 0) > 0, {
-		message: "a prompt or at least one image is required"
-	});
+	// A turn needs SOMETHING to send: non-empty text, or at least one attachment (an attachment-only turn
+	// carries no caption). Rejecting an empty one keeps the old `prompt.min(1)` guarantee.
+	.refine(
+		(body) =>
+			body.prompt.trim().length > 0 ||
+			(body.images?.length ?? 0) > 0 ||
+			(body.documents?.length ?? 0) > 0,
+		{ message: "a prompt or at least one attachment is required" }
+	);
+
+/**
+ * The `POST /v1/title` body: ONE-SHOT naming run for a local conversation, on the SAME CLI the
+ * conversation runs on (the user's own subscription - no backend, no credits). The caller composes the
+ * full prompt (instruction + fenced transcript) and normalizes the reply; this route only runs the
+ * completion and returns the raw text. No namespace/session: nothing is persisted, no sidecar is
+ * touched, and the run is audited like any other local dispatch.
+ */
+const TitleBody = z.object({
+	cli: z.string().min(1),
+	modelId: z.string().min(1).optional(),
+	effort: z.string().min(1).optional(),
+	prompt: z.string().min(1).max(20_000)
+});
 
 /** A persisted chat session, mirroring {@link import('./chat-store').LocalStoredChatSession} (opaque messages). */
 const StoredSessionSchema = z.object({
@@ -380,6 +527,10 @@ const TaskOverridesBody = z.object({ overrides: z.record(z.string(), TaskOverrid
  * (`builtIn: false`, its full editable fields), each with its {@link LocalAutomationRunState}. The desktop app
  * renders this shape directly. Its cadence is the flat {@link AutomationCadence} union, so a cron automation
  * travels as `cron` (plus an optional `timezone`) where an interval one travels as `intervalMinutes`.
+ *
+ * There is deliberately no `hidden` field. A `hidden` built-in is dropped where the list is BUILT, so it
+ * never travels as a row at all - and the runner reads the staged specs directly rather than this
+ * projection, so it keeps firing regardless.
  */
 export type MergedAutomation = {
 	/**
@@ -398,12 +549,24 @@ export type MergedAutomation = {
 	enabled: boolean;
 	/** Whether this is a product built-in (`true`) or a user automation (`false`). */
 	builtIn: boolean;
-	/** The connection/tool id a USER fire uses (built-ins carry none). */
+	/**
+	 * Whether the user may change {@link enabled}. ABSENT means they may - it is emitted only as `false`,
+	 * for a built-in the product forced on or off (`toggleable: false`), so a client can drop the switch
+	 * instead of offering one the `PUT` refuses. A user automation never carries it.
+	 */
+	toggleable?: boolean;
+	/** The connection/tool id a fire uses (a built-in carries one only when the product pinned it). */
 	cli?: string;
-	/** The model id a USER fire uses (built-ins carry none). */
+	/** The model id a fire uses (a built-in carries one only when the product pinned it). */
 	modelId?: string;
 	/** The reasoning effort a USER fire uses (built-ins carry none); any advertised level string. */
 	effort?: string;
+	/** The org-shared definition a USER automation was adopted from, when it mirrors one. */
+	sourceId?: string;
+	/** The definition version that mirror was adopted at. */
+	sourceVersion?: number;
+	/** Why the app paused this automation, when it did rather than the user. */
+	pausedReason?: string;
 	/**
 	 * The next fire instant to SHOW, as an ISO timestamp - a read-only projection computed from ONE clock
 	 * read per response, never a write. Absent when a cron cadence cannot be projected at all (an
@@ -445,7 +608,18 @@ const UserAutomationBody = z
 		cli: z.string().min(1).optional(),
 		modelId: z.string().min(1).optional(),
 		/** Any non-empty level string, for the same reason {@link ChatBody}'s `effort` is one. */
-		effort: z.string().min(1).optional()
+		effort: z.string().min(1).optional(),
+		/**
+		 * The org-shared definition this automation was adopted from, and the version it was adopted at.
+		 * The daemon stores and returns them without reading any meaning into either: it never contacts a
+		 * backend, so it cannot know what a definition currently says - the app compares the stamp.
+		 * Unconstrained beyond shape for the same reason: a backend id's format is not the daemon's to
+		 * police, and refusing an unfamiliar one would break adoption against a newer backend.
+		 */
+		sourceId: z.string().min(1).optional(),
+		sourceVersion: z.number().int().min(1).optional(),
+		/** Why the app paused this automation, when it did; opaque here for the same reason. */
+		pausedReason: z.string().min(1).optional()
 	})
 	.refine((body) => (body.intervalMinutes !== undefined) !== (body.cron !== undefined), {
 		message: "provide exactly one of intervalMinutes or cron"
@@ -463,8 +637,15 @@ const BuiltInEnabledBody = z.object({ enabled: z.boolean() }).strict();
  * whole answer, never intersected with what is on disk - so an unbounded list would be an unbounded
  * per-tick cost. An empty array clears it (no workspace ticks at all in a project-scoped product).
  */
+/**
+ * The most project ids one allowlist push may carry, matched by the renderer's own
+ * `MAX_ALLOWLIST_PROJECTS`: a higher cap there makes every over-cap push a 400, a lower one silently
+ * retires projects the daemon would accept.
+ */
+export const MAX_ALLOWLIST_WORKSPACES = 500;
+
 const WorkspacesBody = z.object({
-	projects: z.array(z.string().regex(PROJECT_ID_PATTERN)).max(500)
+	projects: z.array(z.string().regex(PROJECT_ID_PATTERN)).max(MAX_ALLOWLIST_WORKSPACES)
 });
 
 /**
@@ -572,18 +753,22 @@ function send404(res: ServerResponse): void {
  * @param cadence - The automation's cadence.
  * @param runState - Its stored run state (its last run, and any instant the runner armed).
  * @param nowMs - The response's single clock read.
+ * @param createdAtMs - When the automation was created, for a never-run interval row; omitted for a
+ *   built-in spec, which carries no creation instant.
  * @returns `{ nextRunAt }`, or `{}` when there is nothing to project.
  */
 function nextRunAtOf(
 	cadence: AutomationCadence,
 	runState: LocalAutomationRunState,
-	nowMs: number
+	nowMs: number,
+	createdAtMs?: number
 ): { nextRunAt?: string } {
 	const at = displayNextRunAtMs(
 		cadence,
 		{
 			...(runState.lastRunAt !== undefined ? { lastRunAtMs: runState.lastRunAt } : {}),
-			...(runState.nextRunAtMs !== undefined ? { armedNextRunAtMs: runState.nextRunAtMs } : {})
+			...(runState.nextRunAtMs !== undefined ? { armedNextRunAtMs: runState.nextRunAtMs } : {}),
+			...(createdAtMs !== undefined ? { createdAtMs } : {})
 		},
 		nowMs
 	);
@@ -613,7 +798,9 @@ function decodeSeg(seg: string): string | null {
  *
  * Routes: `GET /v1/health`, `GET /v1/tools`, `GET /v1/tools/catalog` (the FULL connectable-CLI catalog
  * with live install/auth/connected state the desktop Models tab reads), `POST /v1/tools/<toolId>/connect`
- * (an in-app headless connect under the local scope), `GET /v1/tools/<toolId>/models` (the per-CLI model
+ * (an in-app headless connect under the local scope), `POST /v1/tools/<toolId>/install` (an NDJSON
+ * progress stream that installs OR updates one managed CLI - the same operation either way, since a
+ * managed install always fetches the latest version), `GET /v1/tools/<toolId>/models` (the per-CLI model
  * catalog the desktop picker reads), `POST /v1/chat` (an NDJSON run stream), `POST
  * /v1/runs/<runId>/cancel`, the five `/v1/chats` CRUD ops, `GET`/`PUT /v1/task-overrides` (the per-device
  * task-override document, full-document replace), `PUT /v1/workspaces` (replaces the project allowlist the
@@ -734,19 +921,73 @@ export async function startLocalDriveServer(deps: LocalDriveDeps): Promise<Local
 	};
 
 	const connectTool = async (res: ServerResponse, toolId: string): Promise<void> => {
-		// A DOMAIN 404 (with an { error } body) for a non-connectable id, mirroring the models route: the
-		// client's restart recovery retries only BARE 404s, so an unknown tool is never read as a restart.
-		if (!isConnectableToolId(toolId)) return sendJson(res, 404, { error: "unknown tool" });
+		// A DOMAIN 404 (with an { error } body) for an id outside the DESKTOP catalog, mirroring the models
+		// route: the client's restart recovery retries only BARE 404s, so an unknown tool is never read as a
+		// restart. The gate is the host set, not the narrower cloud-dispatch one - this connect runs on the
+		// operator's own machine.
+		if (!isDesktopCliId(toolId)) return sendJson(res, 404, { error: "unknown tool" });
 		// Every outcome is a 200 with a `{ status }` body (including `failed`): the connect result is
 		// informational either way and the client branches on the status, so a signed-out or missing CLI is
 		// never a transport error the restart-recovery would retry.
 		sendJson(res, 200, await deps.connectCli(toolId));
 	};
 
+	/**
+	 * `POST /v1/tools/<toolId>/install`: installs or updates one managed coding CLI, as an NDJSON stream
+	 * of progress lines terminated by exactly one `install.result` frame.
+	 *
+	 * It STREAMS for the same reason `/v1/chat` does: the work is a download or an `npm install` that
+	 * runs for minutes, so the head goes out BEFORE the install starts and each phase reaches the client
+	 * while it is still working. A single JSON reply would leave the socket silent for the whole install,
+	 * with nothing for the UI to show and no evidence the daemon was still alive.
+	 *
+	 * EVERY outcome - including a refusal - is a 200 carrying a terminal result frame, mirroring the
+	 * connect route: the client branches on the status, and a failed install is never mistaken for the
+	 * bare 404 its restart recovery retries. An unknown id is the same DOMAIN 404 the connect and models
+	 * routes answer, gated on the DESKTOP catalog (this install runs on the operator's own machine).
+	 *
+	 * A client that walks away does NOT cancel the install: like a chat run, the work owns its own
+	 * lifetime, and abandoning a half-written install tree is worse than finishing it. Writes stop at
+	 * the moment the response closes. Two concurrent installs of one CLI are safe - the install queues
+	 * per managed binary and the second one re-verifies.
+	 *
+	 * @param res - The response the NDJSON frames are written to.
+	 * @param toolId - The raw tool id from the path (gated against the desktop CLI set here).
+	 */
+	const installTool = async (res: ServerResponse, toolId: string): Promise<void> => {
+		if (!isDesktopCliId(toolId)) return sendJson(res, 404, { error: "unknown tool" });
+		res.writeHead(200, NDJSON_HEADERS);
+		// The client is gone, so nothing further is written - the install itself keeps running to a clean
+		// end. Set by the socket close AND by a failed write, since a detached client is not always
+		// reported by the close alone (the same belt-and-braces the chat stream's `push` uses).
+		let clientGone = false;
+		res.on("close", () => {
+			clientGone = true;
+		});
+		const push = (frame: LocalInstallStreamFrame): void => {
+			if (clientGone) return;
+			try {
+				res.write(`${JSON.stringify(frame)}\n`);
+			} catch {
+				clientGone = true;
+			}
+		};
+		let result: InstallToolResult;
+		try {
+			result = await deps.installTool(toolId, (line) => push({ type: "install.progress", line }));
+		} catch (err) {
+			// The dep is expected never to throw; if it does, the client still gets a terminal frame rather
+			// than a stream that ends with no verdict at all.
+			result = { status: "failed", reason: err instanceof Error ? err.message : String(err) };
+		}
+		push({ type: "install.result", result });
+		res.end();
+	};
+
 	const toolModels = async (res: ServerResponse, toolId: string): Promise<void> => {
-		// A DOMAIN 404 (with an { error } body) for a non-connectable id: the desktop client's restart
-		// recovery retries only BARE 404s, so an unknown tool is never mistaken for a daemon restart.
-		if (!isConnectableToolId(toolId)) return sendJson(res, 404, { error: "unknown tool" });
+		// A DOMAIN 404 (with an { error } body) for an id outside the DESKTOP catalog: the desktop client's
+		// restart recovery retries only BARE 404s, so an unknown tool is never mistaken for a daemon restart.
+		if (!isDesktopCliId(toolId)) return sendJson(res, 404, { error: "unknown tool" });
 		sendJson(res, 200, { models: await deps.listToolModels(toolId) });
 	};
 
@@ -1099,6 +1340,40 @@ export async function startLocalDriveServer(deps: LocalDriveDeps): Promise<Local
 		sendJson(res, 200, { ok: true });
 	};
 
+	/**
+	 * Records the host's live product-tools MCP server, which every unattended fire then mounts until the
+	 * host withdraws it or the registration goes stale. The host RE-registers periodically: that refresh is
+	 * the only evidence the daemon has that the host - and the loopback port it named - is still there, which
+	 * matters most for a daemon that outlives the app (a background service ticking after the app quit).
+	 *
+	 * Replaces rather than merges: there is exactly one such server per host, and a re-mint under a new
+	 * bearer or organization moves it to a new port, so keeping the previous entry would leave an unattended
+	 * fire mounting a dead one beside the live one. A build that serves no app tools carries no registry, and
+	 * the route 404s.
+	 */
+	const putAppTools = async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
+		const raw = await readBody(req, APP_TOOLS_BODY_CAP);
+		if (raw === null) return sendJson(res, 413, { error: "request body too large" });
+		const registry = deps.appTools;
+		if (registry === undefined) return send404(res);
+		const parsed = AppToolsBody.safeParse(parseJson(raw));
+		if (!parsed.success) return sendJson(res, 400, { error: "invalid app tools registration" });
+		registry.set({ name: parsed.data.name, url: parsed.data.url });
+		sendJson(res, 200, { ok: true });
+	};
+
+	/**
+	 * Forgets the host's product-tools server, so the very next fire carries no app tools. The host sends
+	 * this the moment its serve stops being valid - a sign-out above all, where continuing to mount tools
+	 * minted for the person who just signed out is the one outcome nothing may do.
+	 */
+	const deleteAppTools = (res: ServerResponse): void => {
+		const registry = deps.appTools;
+		if (registry === undefined) return send404(res);
+		registry.set(null);
+		sendJson(res, 200, { ok: true });
+	};
+
 	/** Projects a user automation (plus its run state and next-run projection) to the wire shape. */
 	const mergedUser = (
 		automation: LocalAutomation,
@@ -1118,12 +1393,21 @@ export async function startLocalDriveServer(deps: LocalDriveDeps): Promise<Local
 			...(automation.cli !== undefined ? { cli: automation.cli } : {}),
 			...(automation.modelId !== undefined ? { modelId: automation.modelId } : {}),
 			...(automation.effort !== undefined ? { effort: automation.effort } : {}),
-			...nextRunAtOf(cadence, runState, nowMs),
+			...(automation.sourceId !== undefined ? { sourceId: automation.sourceId } : {}),
+			...(automation.sourceVersion !== undefined
+				? { sourceVersion: automation.sourceVersion }
+				: {}),
+			...(automation.pausedReason !== undefined ? { pausedReason: automation.pausedReason } : {}),
+			...nextRunAtOf(cadence, runState, nowMs, automation.createdAt),
 			runState
 		};
 	};
 
-	/** Projects a built-in spec (its effective enabled, run state and next-run projection) to the wire shape. */
+	/**
+	 * Projects a built-in spec (its effective enabled, run state and next-run projection) to the wire shape.
+	 * The enabled state resolves through {@link effectiveBuiltInEnabled}, the SAME clamp the runner fires on,
+	 * so a forced (`toggleable: false`) built-in can never be listed as off while it keeps running.
+	 */
 	const mergedBuiltIn = (
 		spec: BuiltInAutomationSpec,
 		enabledOverrides: ReadonlyMap<string, boolean>,
@@ -1138,8 +1422,14 @@ export async function startLocalDriveServer(deps: LocalDriveDeps): Promise<Local
 			name: spec.name,
 			prompt: spec.prompt,
 			...cadence,
-			enabled: enabledOverrides.get(spec.id) ?? spec.enabled,
+			enabled: effectiveBuiltInEnabled(spec, enabledOverrides.get(spec.id)),
 			builtIn: true,
+			// Emitted only when the product LOCKED the switch, so the common row is byte-identical to before.
+			...(spec.toggleable === false ? { toggleable: false } : {}),
+			// A pinned cli/model rides the row so the app can say what it runs on rather than implying the
+			// device default; absent leaves the row exactly as it was.
+			...(spec.cli !== undefined ? { cli: spec.cli } : {}),
+			...(spec.modelId !== undefined ? { modelId: spec.modelId } : {}),
 			...nextRunAtOf(cadence, runState, nowMs),
 			runState
 		};
@@ -1151,6 +1441,10 @@ export async function startLocalDriveServer(deps: LocalDriveDeps): Promise<Local
 	 * store read while resolving a built-in's override/run state omits built-ins for THIS response and is
 	 * logged, mirroring the runner's posture, so a broken config or store fault never fails the list - user
 	 * automations are still served.
+	 *
+	 * THIS is where a `hidden` built-in is dropped, and only here: hiding is a list decision, so the spec
+	 * still reaches the runner (which reads the staged config itself) and the id still resolves for a
+	 * `PUT`/`DELETE`/run-now. Filtering it out of the config read instead would stop it firing.
 	 */
 	const listBuiltInMerged = (
 		store: LocalAutomationStore,
@@ -1160,9 +1454,9 @@ export async function startLocalDriveServer(deps: LocalDriveDeps): Promise<Local
 	): MergedAutomation[] => {
 		try {
 			const enabledOverrides = store.readAllBuiltInEnabled();
-			return (readConfig().automations ?? []).map((spec) =>
-				mergedBuiltIn(spec, enabledOverrides, runStates, nowMs)
-			);
+			return (readConfig().automations ?? [])
+				.filter((spec) => spec.hidden !== true)
+				.map((spec) => mergedBuiltIn(spec, enabledOverrides, runStates, nowMs));
 		} catch (err) {
 			const detail = err instanceof Error ? err.message : String(err);
 			process.stderr.write(
@@ -1235,6 +1529,12 @@ export async function startLocalDriveServer(deps: LocalDriveDeps): Promise<Local
 			const parsed = BuiltInEnabledBody.safeParse(body);
 			if (!parsed.success)
 				return sendJson(res, 400, { error: "a built-in automation accepts only { enabled }" });
+			// A product-FORCED built-in refuses the override outright rather than storing one the runner
+			// would then ignore: a write accepted here and disregarded at fire time is the shape of a
+			// switch that looks like it worked. The runner's own clamp is the second half of the pair,
+			// covering an override an older build (or a hand edit) already left on disk.
+			if (classified.spec.toggleable === false)
+				return sendJson(res, 400, { error: "this built-in automation cannot be turned on or off" });
 			store.setBuiltInEnabled(id, parsed.data.enabled);
 			return sendJson(res, 200, {
 				automation: mergedBuiltIn(
@@ -1293,12 +1593,89 @@ export async function startLocalDriveServer(deps: LocalDriveDeps): Promise<Local
 		}
 	};
 
+	/**
+	 * How long a naming run may take before it is cancelled and answered `text: null`. Generous for a
+	 * CLI cold start, tight enough that a wedged CLI cannot hold the request open forever.
+	 */
+	const TITLE_RUN_TIMEOUT_MS = 120_000;
+
+	const titleRun = async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
+		const raw = await readBody(req, CHAT_BODY_CAP);
+		if (raw === null) return sendJson(res, 413, { error: "request body too large" });
+		const parsed = TitleBody.safeParse(parseJson(raw));
+		if (!parsed.success) return sendJson(res, 400, { error: "invalid title request" });
+		const { cli, modelId, effort, prompt } = parsed.data;
+
+		// The chat lane resolves its CLI through a LOCAL connection record; the terminal lane does not
+		// (it spawns the user's own login directly). So a terminal's first naming run on a fresh device
+		// can arrive before ANY connection exists and would die on "Unknown connection". Connect
+		// headlessly once - detect + auth probe + record, the same non-interactive connect the in-app
+		// "add provider" runs - and answer null when the CLI is not installed-and-signed-in, leaving the
+		// default tab name standing.
+		if (isDesktopCliId(cli) && !deps.listConnections().some((entry) => entry.toolId === cli)) {
+			const outcome = await deps.connectCli(cli);
+			if (outcome.status !== "connected") return sendJson(res, 200, { text: null });
+		}
+
+		const collected: string[] = [];
+		let answered = false;
+		let startedRunId: string | null = null;
+		/** Answers exactly once - the run may emit error AND close, and the timeout races both. */
+		const answer = (text: string | null): void => {
+			if (answered) return;
+			answered = true;
+			clearTimeout(timer);
+			sendJson(res, 200, { text });
+		};
+		const timer = setTimeout(() => {
+			if (startedRunId !== null) session.cancel(startedRunId);
+			answer(null);
+		}, TITLE_RUN_TIMEOUT_MS);
+
+		const started = session.startChat({
+			prompt,
+			cli,
+			...(modelId !== undefined ? { modelId } : {}),
+			...(effort !== undefined ? { effort } : {}),
+			hooks: {
+				onEvent: (msg) => {
+					if (msg.event.type === "delta") collected.push(msg.event.text);
+					if (msg.event.type === "error") answer(null);
+				},
+				onConversation: () => undefined,
+				onToolCall: async () => {
+					throw new Error("a naming run serves no web tools");
+				},
+				onClose: () => {
+					const text = collected.join("");
+					answer(text.trim().length > 0 ? text : null);
+				}
+			}
+		});
+		if ("refused" in started) {
+			answer(null);
+			return;
+		}
+		startedRunId = started.runId;
+	};
+
 	const chat = async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
 		const raw = await readBody(req, CHAT_BODY_CAP);
 		if (raw === null) return sendJson(res, 413, { error: "request body too large" });
 		const parsed = ChatBody.safeParse(parseJson(raw));
 		if (!parsed.success) return sendJson(res, 400, { error: "invalid chat request" });
-		const { namespace, sessionId, prompt, cli, modelId, effort, images, project } = parsed.data;
+		const {
+			namespace,
+			sessionId,
+			prompt,
+			cli,
+			modelId,
+			effort,
+			images,
+			documents,
+			project,
+			mcpServers
+		} = parsed.data;
 		// ONE parse of the config for this turn, shared by the workspace agreement check and the CLI default.
 		const readConfig = configOnce();
 		// The namespace picks the chat documents and the project picks the work tree, so BOTH directions of
@@ -1349,6 +1726,18 @@ export async function startLocalDriveServer(deps: LocalDriveDeps): Promise<Local
 				...(holdingRunId.length > 0 ? { runId: holdingRunId } : {})
 			});
 		inFlight.set(key, "");
+
+		// Seed the session's DERIVED title before the run starts, so the conversation is listable from
+		// the moment the turn is sent: a client that switches workspaces seconds later otherwise leaves
+		// a title-less shell every list hides, and the conversation looks lost while its run - and the
+		// salvage that will record it - is still going. A stored non-empty title always wins inside.
+		// BEST-EFFORT: the seed is a label, and a turn must not die because a label write failed - a
+		// failed seed only restores the hidden-shell behavior for this one conversation.
+		try {
+			chats.seedSession(namespace, sessionId, deriveChatTitle(prompt));
+		} catch {
+			// Unwritable sidecar: the salvage path will surface the real fault if it persists.
+		}
 
 		// The RESPONSE and the in-flight KEY have different lifetimes, and conflating them let one
 		// conversation grow a second CLI. A client that disconnects mid-stream RELEASES the turn - the run
@@ -1535,6 +1924,8 @@ export async function startLocalDriveServer(deps: LocalDriveDeps): Promise<Local
 						...(effort !== undefined ? { effort } : {}),
 						...(conversationId !== undefined ? { conversationId } : {}),
 						...(images !== undefined ? { images } : {}),
+						...(documents !== undefined ? { documents } : {}),
+						...(mcpServers !== undefined ? { mcpServers } : {}),
 						// DERIVED from the validated project, never relayed from the request: a project-less turn
 						// carries no work key at all, so its dispatch is byte-identical to the pre-workspace one.
 						...(project !== undefined ? { workKey: workspaceWorkKey(project) } : {}),
@@ -1588,6 +1979,7 @@ export async function startLocalDriveServer(deps: LocalDriveDeps): Promise<Local
 			if (method === "GET" && segs[1] === "tools") return tools(res);
 			if (method === "GET" && segs[1] === "chats") return listChats(res, url);
 			if (method === "POST" && segs[1] === "chat") return chat(req, res);
+			if (method === "POST" && segs[1] === "title") return titleRun(req, res);
 			if (method === "GET" && segs[1] === "task-overrides") return getTaskOverrides(res, url);
 			if (method === "PUT" && segs[1] === "task-overrides") return putTaskOverrides(req, res, url);
 			if (method === "GET" && segs[1] === "automations") return listAutomations(res, url);
@@ -1601,6 +1993,13 @@ export async function startLocalDriveServer(deps: LocalDriveDeps): Promise<Local
 				if (method === "GET") return getConnectedFolder(res, url);
 				if (method === "PUT") return putConnectedFolder(req, res);
 				if (method === "DELETE") return deleteConnectedFolder(res, url);
+			}
+			// Length-2 like the two above, on its own segment: the host registering (or withdrawing) the ONE
+			// product-tools server this device serves. Write-only on purpose - nothing reads the address back
+			// out over the socket, because only the host that opened the port has any business knowing it.
+			if (segs[1] === "app-tools") {
+				if (method === "PUT") return putAppTools(req, res);
+				if (method === "DELETE") return deleteAppTools(res);
 			}
 		}
 		if (
@@ -1633,6 +2032,17 @@ export async function startLocalDriveServer(deps: LocalDriveDeps): Promise<Local
 			const toolId = decodeSeg(segs[2]!);
 			if (toolId === null) return sendJson(res, 400, { error: "invalid tool id" });
 			return connectTool(res, toolId);
+		}
+		if (
+			method === "POST" &&
+			segs[0] === "v1" &&
+			segs[1] === "tools" &&
+			segs.length === 4 &&
+			segs[3] === "install"
+		) {
+			const toolId = decodeSeg(segs[2]!);
+			if (toolId === null) return sendJson(res, 400, { error: "invalid tool id" });
+			return installTool(res, toolId);
 		}
 		if (segs[0] === "v1" && segs[1] === "automations" && segs.length === 3) {
 			const id = decodeSeg(segs[2]!);
