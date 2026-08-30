@@ -323,7 +323,7 @@ const MAX_SALVAGED_TEXT_BYTES = 64 * 1024;
  * comparing that title against its own derivation, so a bound that drifts from the app's silently
  * turns local AI naming off - a failure that is invisible rather than loud.
  *
- * EXPORTED so `apps/electron` - the one package that can import both this and `@repo/config` - can pin
+ * EXPORTED so `apps/desktop` - the one package that can import both this and `@repo/config` - can pin
  * the two equal against the VALUE rather than a regex over this file's source.
  */
 export const MAX_CHAT_TITLE = 200;

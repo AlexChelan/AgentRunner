@@ -1,7 +1,7 @@
 {
 	"name": "agentrunner-workspace",
 	"private": true,
-	"version": "1.1.1",
+	"version": "1.1.2",
 	"scripts": {
 		"build": "pnpm --filter agentrunner build",
 		"standalone": "pnpm --filter agentrunner standalone",

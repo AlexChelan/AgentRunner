@@ -96,9 +96,9 @@ describe("dispatched-run isolation (already true, pinned)", () => {
 		// distribution still gets a real assertion rather than a silent pass: with no desktop app at all,
 		// nothing can import the backend leg from one. A missing entry inside an app that IS present is a
 		// genuine finding, so the two cases are told apart rather than both waved through.
-		const entry = join(repoRoot, "apps/electron/src/main/daemon-entry.ts");
+		const entry = join(repoRoot, "apps/desktop/src/main/daemon-entry.ts");
 		if (!existsSync(entry)) {
-			expect(existsSync(join(repoRoot, "apps/electron"))).toBe(false);
+			expect(existsSync(join(repoRoot, "apps/desktop"))).toBe(false);
 			return;
 		}
 		expect(readFileSync(entry, "utf8")).not.toContain("createBackendSession");
