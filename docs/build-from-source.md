@@ -10,11 +10,11 @@ For everyday use, see the [README](../README.md) and the guides alongside this o
 Pin these tools for a clean build:
 
 - Node.js `>=22.18` (the build vendors your current Node into the artifact).
-- pnpm, managed by Corepack from the `packageManager` field: `pnpm@11.1.2`.
+- pnpm, managed by Corepack from the `packageManager` field: `pnpm@11.25.0+sha512.5cde925b4f075f725eb71fbae18a42ffe784524789f19b61c731cb8721ec28aaee160e01a8d5af4fedb2a42cdbf300efe23db356b0d4a17b4d63e11f8ab7c956`.
 
 ```sh
 corepack enable
-corepack prepare pnpm@11.1.2 --activate
+corepack prepare pnpm@11.25.0+sha512.5cde925b4f075f725eb71fbae18a42ffe784524789f19b61c731cb8721ec28aaee160e01a8d5af4fedb2a42cdbf300efe23db356b0d4a17b4d63e11f8ab7c956 --activate
 node --version   # confirm it satisfies >=22.18
 ```
 
