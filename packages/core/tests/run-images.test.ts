@@ -1,6 +1,6 @@
 import { Buffer } from "node:buffer";
 import { existsSync, readFileSync } from "node:fs";
-import { dirname } from "node:path";
+import { basename, dirname } from "node:path";
 import { describe, expect, it } from "vitest";
 import type { RunImage } from "@agentrunner/protocol";
 import { buildCodexTurnStartParams } from "../src/adapters/mapping";
@@ -51,7 +51,7 @@ describe("stageRunImages", () => {
 			runImage({ mediaType: "application/x-not-an-image" })
 		]);
 		try {
-			expect(images.staged.map((image) => image.path.split("/").at(-1))).toEqual([
+			expect(images.staged.map((image) => basename(image.path))).toEqual([
 				"image-1.jpg",
 				"image-2.webp",
 				"image-3.png"

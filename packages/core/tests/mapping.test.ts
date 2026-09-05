@@ -807,6 +807,11 @@ describe("codexAppServerNotificationToMessages", () => {
 
 describe("buildCodexPermissionProfileOverrides (secrets read-deny)", () => {
 	const SECRETS = join(tmpdir(), "appdata", "secrets");
+	/**
+	 * The path as it appears in the emitted TOML: a filesystem key is encoded, not interpolated, so a
+	 * Windows path arrives with its separators escaped and the raw string never appears in the override.
+	 */
+	const SECRETS_KEY = JSON.stringify(SECRETS);
 
 	it("emits no overrides when nothing is denied (the interactive terminal path)", () => {
 		expect(
@@ -834,7 +839,7 @@ describe("buildCodexPermissionProfileOverrides (secrets read-deny)", () => {
 			"permissions.runner-confined.network={enabled = true}"
 		);
 		const fs = line("permissions.runner-confined.filesystem");
-		expect(fs).toContain(`"${SECRETS}" = "deny"`);
+		expect(fs).toContain(`${SECRETS_KEY} = "deny"`);
 		// The profile is actually SELECTED, else it would be defined but never applied.
 		expect(overrides).toContain('default_permissions="runner-confined"');
 	});
@@ -847,7 +852,7 @@ describe("buildCodexPermissionProfileOverrides (secrets read-deny)", () => {
 		});
 		expect(overrides).toContain('permissions.runner-confined.extends=":read-only"');
 		expect(overrides).toContain("permissions.runner-confined.network={enabled = false}");
-		expect(overrides.some((o) => o.includes(`"${SECRETS}" = "deny"`))).toBe(true);
+		expect(overrides.some((o) => o.includes(`${SECRETS_KEY} = "deny"`))).toBe(true);
 		expect(overrides).toContain('default_permissions="runner-confined"');
 	});
 
@@ -877,7 +882,7 @@ describe("buildCodexPermissionProfileOverrides (secrets read-deny)", () => {
 		// The tier is forced to read-only regardless of the posture the mode mapped to...
 		expect(overrides).toContain('permissions.runner-confined.extends=":read-only"');
 		// ...and the per-path list is dropped: a root deny already covers every one of them.
-		expect(overrides.some((o) => o.includes(SECRETS))).toBe(false);
+		expect(overrides.some((o) => o.includes(SECRETS_KEY))).toBe(false);
 		expect(overrides).toContain('default_permissions="runner-confined"');
 	});
 

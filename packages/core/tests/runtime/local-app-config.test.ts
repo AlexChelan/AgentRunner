@@ -180,7 +180,9 @@ describe("loadLocalAppConfig", () => {
 
 	it("throws a clear message naming the file when it is missing", () => {
 		const missing = join(dir, "does-not-exist.json");
-		expect(() => loadLocalAppConfig(missing)).toThrow(new RegExp(missing.replace(/\./g, "\\.")));
+		// Matched as a plain SUBSTRING, never a pattern: a path is not regex source, and a Windows one
+		// carries `\d`, `\U` and friends that a pattern would read as classes rather than as the file.
+		expect(() => loadLocalAppConfig(missing)).toThrow(missing);
 	});
 
 	it("throws when the file is not valid JSON", () => {

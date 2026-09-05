@@ -71,17 +71,35 @@ describe("state store", () => {
 	// `conf` writes 0o666 by default (0o644 under the usual umask), and on Linux the app-data root sits
 	// under a world-executable `~/.local/share`, so the document would be readable by every other local
 	// user. It holds no secret (that is the whole point of the split), but the pairing config it does hold
-	// is the user's, not the machine's.
-	it("writes the state document owner-only (0600)", () => {
-		const dir = freshDir();
-		createStateStore({ cwd: dir }).upsertPairedBackend(BACKEND, {
-			backendUrl: BACKEND,
-			deviceId: "d1",
-			userId: "u1"
+	// is the user's, not the machine's. Windows has no POSIX permission bits at all - `stat` reports 0o666
+	// for every ordinary file and the ACL is what governs the read - so the claim asserted there is the
+	// one that still means something: the document lands in the app-data root the ACL covers.
+	if (process.platform === "win32") {
+		it("writes the state document into the app-data root, where the ACL governs the read", () => {
+			const dir = freshDir();
+			createStateStore({ cwd: dir }).upsertPairedBackend(BACKEND, {
+				backendUrl: BACKEND,
+				deviceId: "d1",
+				userId: "u1"
+			});
+			const document = join(dir, `${brand().binary}-state.json`);
+			expect(existsSync(document)).toBe(true);
+			// A store that fell back to a default location would leave the pairing record outside the
+			// protected root - readable by anything, and invisible to the next boot.
+			expect(readFileSync(document, "utf8")).toContain(BACKEND);
 		});
-		const mode = statSync(join(dir, `${brand().binary}-state.json`)).mode & 0o777;
-		expect(mode).toBe(0o600);
-	});
+	} else {
+		it("writes the state document owner-only (0600)", () => {
+			const dir = freshDir();
+			createStateStore({ cwd: dir }).upsertPairedBackend(BACKEND, {
+				backendUrl: BACKEND,
+				deviceId: "d1",
+				userId: "u1"
+			});
+			const mode = statSync(join(dir, `${brand().binary}-state.json`)).mode & 0o777;
+			expect(mode).toBe(0o600);
+		});
+	}
 
 	it("upserts and reads a paired backend", () => {
 		const store = createStateStore({ cwd: freshDir() });

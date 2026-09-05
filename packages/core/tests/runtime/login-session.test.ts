@@ -194,6 +194,11 @@ function makeDeps(frames: Frame[], over: Partial<LoginSessionDeps> = {}): LoginS
 		}),
 		install: () => Promise.resolve(),
 		ttlMs: 60_000,
+		// The PTY itself is a fake here, so the probe that says whether this host HAS one is faked beside
+		// it: the real probe answers `false` on Windows (it needs `script(1)`), which would refuse every
+		// case below before the fake spawn was ever reached. The case that asserts that refusal overrides
+		// this back to `false`, so the platform behaviour still has its own case.
+		ptyAvailable: () => true,
 		...over
 	};
 }

@@ -12,7 +12,7 @@ import {
 	writeFileSync
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, sep } from "node:path";
 import {
 	disposeIsolatedGrokHome,
 	ensureIsolatedGrokHome,
@@ -112,7 +112,7 @@ describe("ensureIsolatedGrokHome", () => {
 		const home = ensureIsolatedGrokHome(root, { runId: "run-1" });
 		// The home is the run's OWN directory, nested under the shared tree every deny path names.
 		expect(home).toBe(join(grokRunHomesDir(root), "run-1"));
-		expect(home.startsWith(`${grokHomeDir(root)}/`)).toBe(true);
+		expect(home.startsWith(`${grokHomeDir(root)}${sep}`)).toBe(true);
 		const config = readFileSync(join(home, "config.toml"), "utf8");
 		// A home created ahead of a run must never be readable with a stale or foreign server table...
 		expect(config).not.toContain("[mcp_servers");

@@ -1,6 +1,6 @@
 import { mkdirSync, mkdtempSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join, relative, win32 } from "node:path";
+import { dirname, join, relative, resolve, sep, win32 } from "node:path";
 import { describe, expect, it } from "vitest";
 import {
 	connectedFolderDenyEntries,
@@ -26,8 +26,38 @@ import {
 	sensitiveHomeReadDenyPaths
 } from "../../src/runtime/read-deny";
 
-const HOME = "/Users/tester";
-const APP_DATA_ROOT = join(HOME, "Library", "Application Support", "Runner");
+const POSIX_HOME = "/Users/tester";
+const POSIX_APP_DATA_ROOT = "/Users/tester/Library/Application Support/Runner";
+const WIN32_HOME = "C:\\Users\\Tester";
+const WIN32_APP_DATA_ROOT = "C:\\Users\\Tester\\AppData\\Roaming\\Runner";
+
+/**
+ * Whether the HOST is Windows.
+ *
+ * The predicate reads `process.platform` for its string folding and drive-letter rules, but the paths it
+ * judges are also built by helpers that join with the HOST separator (`localDataDir`,
+ * `sensitiveHomeReadDenyPaths`, ...). A fixture must therefore be shaped like the host it runs on, or the
+ * two halves of one entry list disagree and the absolute-path guard fires before any rule under test.
+ * The cases that pin a platform keep their own shape; everything else takes the host's.
+ */
+const HOST_IS_WIN32 = process.platform === "win32";
+
+/** The home the platform-agnostic cases below judge against, in the host's own shape. */
+const HOME = HOST_IS_WIN32 ? WIN32_HOME : POSIX_HOME;
+
+/** The app-data root beside it, likewise. */
+const APP_DATA_ROOT = HOST_IS_WIN32 ? WIN32_APP_DATA_ROOT : POSIX_APP_DATA_ROOT;
+
+/**
+ * An absolute path OUTSIDE every fixture root, in the host's own shape - what a redirected `$CODEX_HOME`
+ * (or an ordinary folder well away from the protected set) looks like here.
+ *
+ * @param segments - Path segments below the root.
+ * @returns The absolute path.
+ */
+function elsewhere(...segments: string[]): string {
+	return resolve(sep, "opt", ...segments);
+}
 
 /**
  * A POSIX dep set with NO filesystem behind it: `realpath` is identity, so the comparison rules are
@@ -36,13 +66,13 @@ const APP_DATA_ROOT = join(HOME, "Library", "Application Support", "Runner");
  */
 function posixDeps(overrides: Partial<ConnectedFolderDenyDeps> = {}): ConnectedFolderDenyDeps {
 	return {
-		appDataRoot: APP_DATA_ROOT,
-		home: HOME,
-		codexHome: join(HOME, ".codex"),
-		grokHome: join(HOME, ".grok"),
-		opencodeDataHome: join(HOME, ".local", "share", "opencode"),
-		appData: join(HOME, "AppData", "Roaming"),
-		localAppData: join(HOME, "AppData", "Local"),
+		appDataRoot: POSIX_APP_DATA_ROOT,
+		home: POSIX_HOME,
+		codexHome: `${POSIX_HOME}/.codex`,
+		grokHome: `${POSIX_HOME}/.grok`,
+		opencodeDataHome: `${POSIX_HOME}/.local/share/opencode`,
+		appData: `${POSIX_HOME}/AppData/Roaming`,
+		localAppData: `${POSIX_HOME}/AppData/Local`,
 		platform: "darwin",
 		realpath: (path) => path,
 		...overrides
@@ -52,8 +82,8 @@ function posixDeps(overrides: Partial<ConnectedFolderDenyDeps> = {}): ConnectedF
 /** The same, shaped for Windows - so the win32 arms are testable from a POSIX host. */
 function win32Deps(overrides: Partial<ConnectedFolderDenyDeps> = {}): ConnectedFolderDenyDeps {
 	return {
-		appDataRoot: "C:\\Users\\Tester\\AppData\\Roaming\\Runner",
-		home: "C:\\Users\\Tester",
+		appDataRoot: WIN32_APP_DATA_ROOT,
+		home: WIN32_HOME,
 		codexHome: "C:\\Users\\Tester\\.codex",
 		grokHome: "C:\\Users\\Tester\\.grok",
 		opencodeDataHome: "C:\\Users\\Tester\\.local\\share\\opencode",
@@ -65,6 +95,13 @@ function win32Deps(overrides: Partial<ConnectedFolderDenyDeps> = {}): ConnectedF
 	};
 }
 
+/**
+ * The dep set the platform-agnostic cases judge with: the host's own, so every rule is exercised against
+ * paths the host's `path` module actually produces. On a POSIX host this is byte-for-byte
+ * {@link posixDeps}; on Windows it is {@link win32Deps}, which those cases then drive in full.
+ */
+const hostDeps = HOST_IS_WIN32 ? win32Deps : posixDeps;
+
 /** The verdict's answer alone, for the many cases that do not also assert the canonical path. */
 function refusalFor(
 	candidate: string,
@@ -75,7 +112,7 @@ function refusalFor(
 
 describe("connectedFolderDenyEntries", () => {
 	it("unions the daemon's own roots with every read-deny entry", () => {
-		const paths = connectedFolderDenyEntries(posixDeps()).map((entry) => entry.path);
+		const paths = connectedFolderDenyEntries(hostDeps()).map((entry) => entry.path);
 		expect(paths).toContain(APP_DATA_ROOT);
 		expect(paths).toContain(localDataDir(APP_DATA_ROOT));
 		expect(paths).toContain(secretsDir(APP_DATA_ROOT));
@@ -87,7 +124,7 @@ describe("connectedFolderDenyEntries", () => {
 		// The read helper reads `process.env.CODEX_HOME`; this module reads no environment and takes the
 		// resolved value from deps. Injecting the same expression the CALLERS owe closes the gap here and
 		// keeps the case green on a machine that has $CODEX_HOME set.
-		const deps = posixDeps({ codexHome: process.env.CODEX_HOME ?? join(HOME, ".codex") });
+		const deps = hostDeps({ codexHome: process.env.CODEX_HOME ?? join(HOME, ".codex") });
 		const paths = connectedFolderDenyEntries(deps).map((entry) => entry.path);
 		for (const denied of codexCredentialReadDenyPaths(APP_DATA_ROOT, HOME)) {
 			expect(paths).toContain(denied);
@@ -95,12 +132,12 @@ describe("connectedFolderDenyEntries", () => {
 		// The default location is covered whatever the environment says, so a caller on a differently
 		// configured host still cannot bind it.
 		expect(paths).toContain(join(HOME, ".codex"));
-		const redirected = connectedFolderDenyEntries(posixDeps({ codexHome: "/opt/codex-home" }));
-		expect(redirected.map((entry) => entry.path)).toContain("/opt/codex-home");
+		const redirected = connectedFolderDenyEntries(hostDeps({ codexHome: elsewhere("codex-home") }));
+		expect(redirected.map((entry) => entry.path)).toContain(elsewhere("codex-home"));
 	});
 
 	it("covers every grokCredentialReadDenyPaths entry, plus an injected $GROK_HOME that differs", () => {
-		const deps = posixDeps({ grokHome: process.env.GROK_HOME ?? join(HOME, ".grok") });
+		const deps = hostDeps({ grokHome: process.env.GROK_HOME ?? join(HOME, ".grok") });
 		const paths = connectedFolderDenyEntries(deps).map((entry) => entry.path);
 		for (const denied of grokCredentialReadDenyPaths(APP_DATA_ROOT, HOME)) {
 			expect(paths).toContain(denied);
@@ -108,26 +145,26 @@ describe("connectedFolderDenyEntries", () => {
 		// The default location is covered whatever the environment says.
 		expect(paths).toContain(join(HOME, ".grok"));
 		expect(paths).toContain(grokHomeDir(APP_DATA_ROOT));
-		const redirected = connectedFolderDenyEntries(posixDeps({ grokHome: "/opt/grok-home" }));
-		expect(redirected.map((entry) => entry.path)).toContain("/opt/grok-home");
+		const redirected = connectedFolderDenyEntries(hostDeps({ grokHome: elsewhere("grok-home") }));
+		expect(redirected.map((entry) => entry.path)).toContain(elsewhere("grok-home"));
 	});
 
 	it("covers the opencode DATA home, plus an injected $XDG_DATA_HOME that differs", () => {
-		const deps = posixDeps({ opencodeDataHome: opencodeCredentialReadDenyPaths(HOME)[0] ?? "" });
+		const deps = hostDeps({ opencodeDataHome: opencodeCredentialReadDenyPaths(HOME)[0] ?? "" });
 		const paths = connectedFolderDenyEntries(deps).map((entry) => entry.path);
 		for (const denied of opencodeCredentialReadDenyPaths(HOME)) expect(paths).toContain(denied);
 		// The default location is covered whatever the environment says.
 		expect(paths).toContain(join(HOME, ".local", "share", "opencode"));
 		const redirected = connectedFolderDenyEntries(
-			posixDeps({ opencodeDataHome: "/opt/data/opencode" })
+			hostDeps({ opencodeDataHome: elsewhere("data", "opencode") })
 		);
-		expect(redirected.map((entry) => entry.path)).toContain("/opt/data/opencode");
+		expect(redirected.map((entry) => entry.path)).toContain(elsewhere("data", "opencode"));
 	});
 
 	it("adds the curated write/persistence set the read list never covered, as a platform UNION", () => {
 		// Built with darwin deps, yet the Linux and Windows entries are present: an entry that does not
 		// exist on this OS is inert, exactly like the read list.
-		const deps = posixDeps();
+		const deps = hostDeps();
 		const paths = connectedFolderDenyEntries(deps).map((entry) => entry.path);
 		expect(paths).toContain(join(HOME, "Library", "LaunchAgents"));
 		expect(paths).toContain(join(HOME, "Library", "LaunchDaemons"));
@@ -154,7 +191,7 @@ describe("connectedFolderDenyEntries", () => {
 	});
 
 	it("is deduplicated and carries every refusal code", () => {
-		const entries = connectedFolderDenyEntries(posixDeps());
+		const entries = connectedFolderDenyEntries(hostDeps());
 		expect(new Set(entries.map((entry) => entry.path)).size).toBe(entries.length);
 		const codes = new Set(entries.map((entry) => entry.code));
 		expect([...codes].sort()).toEqual([
@@ -173,7 +210,7 @@ describe("connectedFolderDenyEntries", () => {
 
 	it("keeps the most specific code when one path would carry two", () => {
 		// `codexHome` is `~/.codex` by default, listed once - as CODEX_CREDENTIALS, not twice.
-		const entries = connectedFolderDenyEntries(posixDeps());
+		const entries = connectedFolderDenyEntries(hostDeps());
 		const codex = entries.filter((entry) => entry.path === join(HOME, ".codex"));
 		expect(codex).toEqual([{ code: "CODEX_CREDENTIALS", path: join(HOME, ".codex") }]);
 		const grok = entries.filter((entry) => entry.path === join(HOME, ".grok"));
@@ -196,13 +233,13 @@ describe("connectedFolderDenyEntries: fail-closed on a misconfigured root", () =
 		it(`throws rather than silently mis-classifying when ${root} is empty`, () => {
 			// An empty root fails OPEN in one direction and closed in the other, invisibly either way:
 			// home: "" would ALLOW ~/.ssh, appData: "" would refuse ordinary folders near the cwd.
-			expect(() => connectedFolderDenyEntries(posixDeps({ [root]: "" }))).toThrow(
+			expect(() => connectedFolderDenyEntries(hostDeps({ [root]: "" }))).toThrow(
 				new RegExp(`${root} must be an absolute path`)
 			);
 		});
 
 		it(`throws when ${root} is relative`, () => {
-			expect(() => refuseConnectedFolder(HOME, posixDeps({ [root]: "some/relative" }))).toThrow(
+			expect(() => refuseConnectedFolder(HOME, hostDeps({ [root]: "some/relative" }))).toThrow(
 				new RegExp(`${root} must be an absolute path`)
 			);
 		});
@@ -211,14 +248,14 @@ describe("connectedFolderDenyEntries: fail-closed on a misconfigured root", () =
 	it("throws on a relative CANDIDATE, which resolve would otherwise anchor to the process cwd", () => {
 		// The verdict now carries the path callers persist, so a cwd-anchored candidate is a persistence
 		// bug, not only a classification one.
-		expect(() => refuseConnectedFolder("relative/folder", posixDeps())).toThrow(
+		expect(() => refuseConnectedFolder("relative/folder", hostDeps())).toThrow(
 			/candidate must be an absolute path/
 		);
 	});
 });
 
 describe("refuseConnectedFolder: every class, equal / under / ancestor", () => {
-	const deps = posixDeps();
+	const deps = hostDeps();
 	const classes: { code: ConnectedFolderRefusalCode; entry: string }[] = [
 		{ code: "LOCAL_DATA", entry: localDataDir(APP_DATA_ROOT) },
 		{ code: "SECRETS", entry: secretsDir(APP_DATA_ROOT) },
@@ -278,7 +315,7 @@ describe("refuseConnectedFolder: every class, equal / under / ancestor", () => {
 });
 
 describe("refuseConnectedFolder: relation and order tie-breaks", () => {
-	const deps = posixDeps();
+	const deps = hostDeps();
 
 	it("prefers EQUAL over ANCESTOR: the app-data root reports APP_DATA, not its inner stores", () => {
 		expect(refusalFor(APP_DATA_ROOT, deps)).toEqual({ code: "APP_DATA", detail: APP_DATA_ROOT });
@@ -294,7 +331,7 @@ describe("refuseConnectedFolder: relation and order tie-breaks", () => {
 	it("prefers UNDER over ANCESTOR", () => {
 		// Constructed to make one candidate match both arms at once: a redirected codexHome nested inside
 		// the app-data root leaves room for a folder that is UNDER the root and CONTAINS the codex home.
-		const nested = posixDeps({ codexHome: join(APP_DATA_ROOT, "deep", "codex") });
+		const nested = hostDeps({ codexHome: join(APP_DATA_ROOT, "deep", "codex") });
 		expect(refusalFor(join(APP_DATA_ROOT, "deep"), nested)).toEqual({
 			code: "APP_DATA",
 			detail: APP_DATA_ROOT
@@ -308,9 +345,11 @@ describe("refuseConnectedFolder: relation and order tie-breaks", () => {
 		});
 	});
 
-	it("refuses $HOME and / through the ancestor arm", () => {
+	it("refuses $HOME and the filesystem root through the ancestor arm", () => {
 		expect(refusalFor(HOME, deps)).not.toBeNull();
-		expect(refusalFor("/", deps)).not.toBeNull();
+		// The root that HOLDS the protected set: `/` on POSIX, and the drive the fixture roots sit on when
+		// the host spells its paths with one.
+		expect(refusalFor(HOST_IS_WIN32 ? "C:\\" : "/", deps)).not.toBeNull();
 	});
 
 	it("reports the class whose entry the candidate uniquely contains", () => {
@@ -327,7 +366,7 @@ describe("refuseConnectedFolder: relation and order tie-breaks", () => {
 });
 
 describe("refuseConnectedFolder: file entries and segment relations", () => {
-	const deps = posixDeps();
+	const deps = hostDeps();
 
 	it("refuses an entry that is a FILE, not a directory", () => {
 		expect(refusalFor(join(HOME, ".netrc"), deps)).toEqual({
@@ -350,7 +389,10 @@ describe("refuseConnectedFolder: file entries and segment relations", () => {
 
 	it("normalizes the candidate before comparing, so a doubled slash or a `..` hop is no bypass", () => {
 		expect(refusalFor(`${join(HOME, ".ssh")}/`, deps)?.code).toBe("HOME_SENSITIVE");
-		expect(refusalFor(`/${join(HOME, ".ssh")}`, deps)?.code).toBe("HOME_SENSITIVE");
+		// A doubled LEADING separator collapses to one on POSIX; on win32 those same two bytes open a UNC
+		// NAME instead, so the doubling that must collapse there is an interior one.
+		const doubled = HOST_IS_WIN32 ? `${HOME}${sep}${sep}.ssh` : `/${join(HOME, ".ssh")}`;
+		expect(refusalFor(doubled, deps)?.code).toBe("HOME_SENSITIVE");
 		// Built as a raw string: `join` would collapse the `..` before the predicate ever saw it.
 		expect(refusalFor(`${HOME}/Projects/../.ssh`, deps)?.code).toBe("HOME_SENSITIVE");
 	});
@@ -358,12 +400,12 @@ describe("refuseConnectedFolder: file entries and segment relations", () => {
 	it("allows an ordinary project folder, however deep (the positive control)", () => {
 		expect(refusalFor(join(HOME, "Projects", "storefront"), deps)).toBeNull();
 		expect(refusalFor(join(HOME, "Code", "work", "repo", "packages", "api"), deps)).toBeNull();
-		expect(refusalFor("/opt/shared/builds", deps)).toBeNull();
+		expect(refusalFor(elsewhere("shared", "builds"), deps)).toBeNull();
 	});
 });
 
 describe("refuseConnectedFolder: the verdict carries the classified path", () => {
-	const deps = posixDeps();
+	const deps = hostDeps();
 
 	it("returns the canonical path on the allow side, so callers persist what was judged", () => {
 		const verdict = refuseConnectedFolder(`${HOME}/Projects/../Projects/storefront/`, deps);
@@ -385,14 +427,41 @@ describe("refuseConnectedFolder: the verdict carries the classified path", () =>
 });
 
 describe("refuseConnectedFolder: case and unicode folding", () => {
-	it("folds case on darwin, where realpath does NOT case-normalize", () => {
-		const deps = posixDeps();
-		expect(refusalFor(join(HOME, ".SSH"), deps)?.code).toBe("HOME_SENSITIVE");
-		expect(refusalFor(APP_DATA_ROOT.toUpperCase(), deps)?.code).toBe("APP_DATA");
-		expect(refusalFor(join(localDataDir(APP_DATA_ROOT).toUpperCase(), "x"), deps)?.code).toBe(
-			"LOCAL_DATA"
-		);
-	});
+	// The win32 arm below is judged from any host, because its fixture is written in Windows spelling
+	// outright. The darwin and linux arms cannot be: their fixture is POSIX-spelled, and the read-deny
+	// list a Windows host builds beside it joins with `\\`, so the two halves of one entry list would
+	// disagree. They are registered where their premise exists, and Windows keeps the folding case that
+	// is true THERE - a case-insensitive filesystem - rather than a skipped one.
+	if (!HOST_IS_WIN32) {
+		it("folds case on darwin, where realpath does NOT case-normalize", () => {
+			const deps = posixDeps();
+			expect(refusalFor(join(POSIX_HOME, ".SSH"), deps)?.code).toBe("HOME_SENSITIVE");
+			expect(refusalFor(POSIX_APP_DATA_ROOT.toUpperCase(), deps)?.code).toBe("APP_DATA");
+			expect(
+				refusalFor(join(localDataDir(POSIX_APP_DATA_ROOT).toUpperCase(), "x"), deps)?.code
+			).toBe("LOCAL_DATA");
+		});
+
+		it("does NOT fold case on linux, whose filesystems are byte-exact", () => {
+			const deps = posixDeps({ platform: "linux" });
+			expect(refusalFor(join(POSIX_HOME, ".SSH"), deps)).toBeNull();
+			expect(refusalFor(join(POSIX_HOME, ".ssh"), deps)?.code).toBe("HOME_SENSITIVE");
+		});
+
+		it("folds NFC on darwin, so a decomposed home matches a composed candidate", () => {
+			const decomposedHome = "/Users/jose\u0301";
+			const composed = "/Users/jos\u00E9/.ssh";
+			const deps = posixDeps({
+				home: decomposedHome,
+				appDataRoot: `${decomposedHome}/Library/Application Support/Runner`,
+				codexHome: `${decomposedHome}/.codex`,
+				appData: `${decomposedHome}/AppData/Roaming`,
+				localAppData: `${decomposedHome}/AppData/Local`
+			});
+			expect(refusalFor(composed, deps)?.code).toBe("HOME_SENSITIVE");
+			expect(refusalFor(composed, { ...deps, platform: "linux" })).toBeNull();
+		});
+	}
 
 	it("folds case on win32", () => {
 		const deps = win32Deps();
@@ -402,24 +471,14 @@ describe("refuseConnectedFolder: case and unicode folding", () => {
 		).toBe("CREDENTIAL_STORE");
 	});
 
-	it("does NOT fold case on linux, whose filesystems are byte-exact", () => {
-		const deps = posixDeps({ platform: "linux" });
-		expect(refusalFor(join(HOME, ".SSH"), deps)).toBeNull();
-		expect(refusalFor(join(HOME, ".ssh"), deps)?.code).toBe("HOME_SENSITIVE");
-	});
-
-	it("folds NFC on darwin, so a decomposed home matches a composed candidate", () => {
-		const decomposedHome = "/Users/jose\u0301";
-		const composed = "/Users/jos\u00E9/.ssh";
-		const deps = posixDeps({
-			home: decomposedHome,
-			appDataRoot: `${decomposedHome}/Library/Application Support/Runner`,
-			codexHome: `${decomposedHome}/.codex`,
-			appData: `${decomposedHome}/AppData/Roaming`,
-			localAppData: `${decomposedHome}/AppData/Local`
-		});
-		expect(refusalFor(composed, deps)?.code).toBe("HOME_SENSITIVE");
-		expect(refusalFor(composed, { ...deps, platform: "linux" })).toBeNull();
+	it("folds a case-varied nested store on win32 too, not only the injected roots", () => {
+		// The darwin arm's third assertion, restated where a Windows host can run it: the fold has to
+		// reach a store DERIVED from the app-data root, not just the roots the deps handed over.
+		const deps = win32Deps();
+		expect(
+			refusalFor(join(localDataDir(WIN32_APP_DATA_ROOT).toUpperCase(), "x"), win32Deps())?.code
+		).toBe("LOCAL_DATA");
+		expect(refusalFor(WIN32_APP_DATA_ROOT.toUpperCase(), deps)?.code).toBe("APP_DATA");
 	});
 });
 

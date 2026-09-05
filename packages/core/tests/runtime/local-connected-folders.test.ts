@@ -8,7 +8,7 @@ import {
 	writeFileSync
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { describe, expect, it } from "vitest";
 import {
 	createConnectedFolderStore,
@@ -32,8 +32,20 @@ const PROJECT_A = "AbC123xYz456AbC123xYz456AbC12345";
 /** A second project id, so an isolation case can prove one grant never answers for another. */
 const PROJECT_B = "Zz9Yy8Xx7Ww6Vv5Uu4Tt3Ss2Rr1Qq0Pp";
 
-/** An absolute folder a case can grant (nothing on disk has to exist - the store stores, it does not stat). */
-const FOLDER = "/Users/tester/code/app";
+/**
+ * An absolute folder a case can grant (nothing on disk has to exist - the store stores, it does not stat).
+ *
+ * Resolved rather than written literally: the store refuses anything that is not already its own canonical
+ * form, and a bare `/Users/...` is a ROOTED but drive-less path on Windows, which canonicalizes to a
+ * different string. `resolve` gives the same bytes on POSIX and a canonical path on every host.
+ */
+const FOLDER = resolve("/Users/tester/code/app");
+
+/** A second grantable folder, canonical the same way. */
+const OTHER_FOLDER = resolve("/Users/tester/code/other");
+
+/** A third, for the case that replaces a grant in place. */
+const MOVED_FOLDER = resolve("/Users/tester/code/moved");
 
 /** The grant document's path under a local-data root. */
 function documentIn(root: string): string {
@@ -74,10 +86,10 @@ describe("createConnectedFolderStore", () => {
 	it("replaces a project's grant without disturbing another project's", () => {
 		const store = createConnectedFolderStore(dataRoot());
 		store.set(PROJECT_A, FOLDER);
-		store.set(PROJECT_B, "/Users/tester/code/other");
-		store.set(PROJECT_A, "/Users/tester/code/moved");
-		expect(store.get(PROJECT_A)).toBe("/Users/tester/code/moved");
-		expect(store.get(PROJECT_B)).toBe("/Users/tester/code/other");
+		store.set(PROJECT_B, OTHER_FOLDER);
+		store.set(PROJECT_A, MOVED_FOLDER);
+		expect(store.get(PROJECT_A)).toBe(MOVED_FOLDER);
+		expect(store.get(PROJECT_B)).toBe(OTHER_FOLDER);
 	});
 
 	it("survives a restart: a second store over the same root reads the first's grants", () => {
@@ -207,7 +219,7 @@ describe("createConnectedFolderStore", () => {
 		// the verdict just produced, so a legitimate grant fails on a device that did nothing wrong.
 		const real = realpathSync(mkdtempSync(join(tmpdir(), "runner-grants-real-")));
 		const link = join(realpathSync(mkdtempSync(join(tmpdir(), "runner-grants-link-"))), "alias");
-		symlinkSync(real, link);
+		symlinkSync(real, link, "dir");
 		const deny: ConnectedFolderDenyDeps = {
 			appDataRoot: join(real, "app-data"),
 			home: join(real, "home"),
@@ -244,7 +256,7 @@ describe("createConnectedFolderStore", () => {
 		const root = dataRoot();
 		const real = mkdtempSync(join(tmpdir(), "runner-grants-real-"));
 		const link = join(mkdtempSync(join(tmpdir(), "runner-grants-link-")), "alias");
-		symlinkSync(real, link);
+		symlinkSync(real, link, "dir");
 		const store = createConnectedFolderStore(root);
 		store.set(PROJECT_A, FOLDER);
 

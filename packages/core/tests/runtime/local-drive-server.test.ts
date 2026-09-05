@@ -13,7 +13,7 @@ import {
 	writeFileSync
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { RunHooks } from "../../src/runtime/executor";
 import { createLocalChatStore } from "../../src/runtime/local/chat-store";
@@ -43,6 +43,7 @@ import { realpathDeepest } from "../../src/path-containment";
 import type { AutomationRunner } from "../../src/runtime/local/automation-runner";
 import type { BuiltInAutomationSpec, LocalAppConfig } from "../../src/runtime/local/app-config";
 import type { LocalSession, StartLocalChatOpts } from "../../src/runtime/local/local-session";
+import { DRIVE_SOCKET_IS_FILE, driveSocketNamer } from "./support/drive-socket";
 
 /** Handles opened by a test, closed in `afterEach` so no listener leaks between cases. */
 const open: LocalDriveHandle[] = [];
@@ -50,14 +51,8 @@ afterEach(async () => {
 	while (open.length > 0) await open.pop()?.close();
 });
 
-/**
- * A unique socket path for one case, kept SHORT: a unix socket path is capped at ~104 bytes on macOS, so
- * it lives directly under the temp root rather than inside a per-case `mkdtemp` directory.
- */
-let sockets = 0;
-function socketFor(): string {
-	return join(tmpdir(), `gsd-${process.pid}-${++sockets}.sock`);
-}
+/** A unique listen address for one case, in the shape the running platform binds. */
+const socketFor = driveSocketNamer("gsd");
 
 /** One `startChat` the fake session recorded, with the server-built hooks the test can drive. */
 interface StartedRun {
@@ -415,34 +410,107 @@ const chatBody = (over: Record<string, unknown> = {}): string =>
 	JSON.stringify({ namespace: "ns", sessionId: "sess", prompt: "go", cli: "codex", ...over });
 
 describe("startLocalDriveServer - socket ownership", () => {
-	it("rEFUSES to bind over a socket another runtime is still serving", async () => {
-		// The local boot lost its single-instance lock, so this unlink is the only thing standing between one
-		// app-data root and TWO runtimes on it - same automation store, same chat store, same secret store. Both
-		// would fire every automation and interleave writes to the same JSON, and the displaced one would be
-		// unreachable (its inode gone) and unkillable (its pid record overwritten).
-		const socketPath = socketFor();
-		const first = await start({ socketPath });
-		await expect(start({ socketPath })).rejects.toThrow(/already listening/i);
-		// The first runtime is untouched: same socket, still answering.
-		expect(
-			(await send(socketPath, { method: "GET", path: "/v1/health", token: first.handle.token }))
-				.status
-		).toBe(200);
-	});
+	// The three cases below assert the INODE half of the ownership contract, which exists only where the
+	// listen address is a file. `startLocalDriveServer` says so itself (`isPosixSocket`): on Windows the
+	// address is a kernel pipe object with nothing to stat, unlink or reuse, so each case is registered
+	// against the premise its platform actually has - never skipped on either.
+	if (DRIVE_SOCKET_IS_FILE) {
+		it("rEFUSES to bind over a socket another runtime is still serving", async () => {
+			// The local boot lost its single-instance lock, so this unlink is the only thing standing between one
+			// app-data root and TWO runtimes on it - same automation store, same chat store, same secret store. Both
+			// would fire every automation and interleave writes to the same JSON, and the displaced one would be
+			// unreachable (its inode gone) and unkillable (its pid record overwritten).
+			const socketPath = socketFor();
+			const first = await start({ socketPath });
+			await expect(start({ socketPath })).rejects.toThrow(/already listening/i);
+			// The first runtime is untouched: same socket, still answering.
+			expect(
+				(await send(socketPath, { method: "GET", path: "/v1/health", token: first.handle.token }))
+					.status
+			).toBe(200);
+		});
 
-	it("reclaims the STALE inode a crashed runtime left behind", async () => {
-		// The negative control for the refusal above: an inode with no listener is exactly what a crash leaves,
-		// and `listen` fails EADDRINUSE on it - so it must still be unlinked, or the app never restarts.
-		const socketPath = socketFor();
-		const first = await start({ socketPath });
-		await first.handle.close();
-		writeFileSync(socketPath, "");
-		const second = await start({ socketPath });
-		expect(
-			(await send(socketPath, { method: "GET", path: "/v1/health", token: second.handle.token }))
-				.status
-		).toBe(200);
-	});
+		it("reclaims the STALE inode a crashed runtime left behind", async () => {
+			// The negative control for the refusal above: an inode with no listener is exactly what a crash leaves,
+			// and `listen` fails EADDRINUSE on it - so it must still be unlinked, or the app never restarts.
+			const socketPath = socketFor();
+			const first = await start({ socketPath });
+			await first.handle.close();
+			writeFileSync(socketPath, "");
+			const second = await start({ socketPath });
+			expect(
+				(await send(socketPath, { method: "GET", path: "/v1/health", token: second.handle.token }))
+					.status
+			).toBe(200);
+		});
+
+		it("a draining runtime does not unlink a replacement that REUSED its inode number", async () => {
+			// The case below only bites when the replacement is handed the SAME dev+ino the drained server
+			// recorded - an inode number is reused once freed, and ext4 does so readily while the overlayfs and
+			// tmpfs a container gets do not. That is why this reproduced only on CI. A hard link pins the
+			// condition on any filesystem: it keeps the original inode alive under a second name, so relinking
+			// it at the path after the first close puts the ORIGINAL inode back where the replacement's would
+			// be - byte for byte what `sameInode` sees during a real reuse.
+			const socketPath = socketFor();
+			const backup = `${socketPath}.bak`;
+			const first = await start({ socketPath });
+			linkSync(socketPath, backup);
+			await first.handle.close();
+			linkSync(backup, socketPath);
+			rmSync(backup, { force: true });
+
+			// The LATE drain now sees its own inode number at the path. It must still not unlink: it already
+			// handed that responsibility over when it closed the first time.
+			await first.handle.close();
+			expect(existsSync(socketPath), "the late drain deleted a path it no longer owns").toBe(true);
+		});
+	} else {
+		it("rEFUSES to bind over a PIPE another runtime is still serving", async () => {
+			// The same displacement the POSIX refusal above prevents, refused one layer down: a pipe name is
+			// bound with FILE_FLAG_FIRST_PIPE_INSTANCE, so the kernel itself fails the second bind EADDRINUSE
+			// and the server's own `error` handler surfaces it. Two runtimes on one app-data root is the
+			// outcome that must not happen, whichever layer refuses it.
+			const socketPath = socketFor();
+			const first = await start({ socketPath });
+			await expect(start({ socketPath })).rejects.toThrow(/EADDRINUSE/);
+			// The first runtime is untouched: same pipe, still answering.
+			expect(
+				(await send(socketPath, { method: "GET", path: "/v1/health", token: first.handle.token }))
+					.status
+			).toBe(200);
+		});
+
+		it("leaves NOTHING to reclaim when a runtime dies, so the next boot binds a free name", async () => {
+			// The counterpart premise of the stale-inode reclaim: a pipe lives only as long as its owner, so a
+			// crashed runtime leaves no entry at the address and the boot has nothing to unlink. A guard that
+			// tried to would be reaching for a path that never existed.
+			const socketPath = socketFor();
+			const first = await start({ socketPath });
+			await first.handle.close();
+			expect(existsSync(socketPath), "a closed pipe left an entry behind").toBe(false);
+			const second = await start({ socketPath });
+			expect(
+				(await send(socketPath, { method: "GET", path: "/v1/health", token: second.handle.token }))
+					.status
+			).toBe(200);
+		});
+
+		it("a draining runtime cannot take back a pipe name the REPLACEMENT now owns", async () => {
+			// The counterpart of the inode-reuse case: there is no inode to be handed back, so a late drain
+			// has nothing it could mistake for its own. The proof that the name is still the replacement's -
+			// not merely reachable - is that a third bind is still refused while it lives.
+			const socketPath = socketFor();
+			const first = await start({ socketPath });
+			await first.handle.close();
+			const second = await start({ socketPath });
+			await first.handle.close();
+			await expect(start({ socketPath })).rejects.toThrow(/EADDRINUSE/);
+			expect(
+				(await send(socketPath, { method: "GET", path: "/v1/health", token: second.handle.token }))
+					.status
+			).toBe(200);
+		});
+	}
 
 	it("a draining runtime does not unlink a REPLACEMENT bound to the same path", async () => {
 		// Stop-then-start reuses the derived path, so the old server can finish draining after the new one has
@@ -467,27 +535,6 @@ describe("startLocalDriveServer - socket ownership", () => {
 			);
 		});
 		expect(res.status).toBe(200);
-	});
-
-	it("a draining runtime does not unlink a replacement that REUSED its inode number", async () => {
-		// The case above only bites when the replacement is handed the SAME dev+ino the drained server
-		// recorded - an inode number is reused once freed, and ext4 does so readily while the overlayfs and
-		// tmpfs a container gets do not. That is why this reproduced only on CI. A hard link pins the
-		// condition on any filesystem: it keeps the original inode alive under a second name, so relinking
-		// it at the path after the first close puts the ORIGINAL inode back where the replacement's would
-		// be - byte for byte what `sameInode` sees during a real reuse.
-		const socketPath = socketFor();
-		const backup = `${socketPath}.bak`;
-		const first = await start({ socketPath });
-		linkSync(socketPath, backup);
-		await first.handle.close();
-		linkSync(backup, socketPath);
-		rmSync(backup, { force: true });
-
-		// The LATE drain now sees its own inode number at the path. It must still not unlink: it already
-		// handed that responsibility over when it closed the first time.
-		await first.handle.close();
-		expect(existsSync(socketPath), "the late drain deleted a path it no longer owns").toBe(true);
 	});
 });
 
@@ -3589,6 +3636,13 @@ function folderIn(dir: string, ...segments: string[]): string {
 	return realpathSync(path);
 }
 
+/**
+ * A granted folder a store case can seed directly. Resolved rather than written literally: the grant
+ * store refuses to hold anything that is not already its own canonical path, and a rooted but
+ * drive-less `/Users/...` canonicalizes to a different string where paths carry a drive.
+ */
+const GRANTED_FOLDER = resolve("/Users/tester/code/app");
+
 /** A `PUT /v1/connected-folders` body (override only what a case cares about). */
 const folderBody = (over: Record<string, unknown> = {}): string =>
 	JSON.stringify({ project: PROJECT, path: "/nowhere", ...over });
@@ -3604,18 +3658,18 @@ describe("connected folders", () => {
 		expect(before.status).toBe(200);
 		expect(JSON.parse(before.text)).toEqual({ path: null });
 
-		connectedFolders.set(PROJECT, "/Users/tester/code/app");
+		connectedFolders.set(PROJECT, GRANTED_FOLDER);
 		const after = await send(handle.socketPath, {
 			method: "GET",
 			path: `/v1/connected-folders?project=${PROJECT}`,
 			token: handle.token
 		});
-		expect(JSON.parse(after.text)).toEqual({ path: "/Users/tester/code/app" });
+		expect(JSON.parse(after.text)).toEqual({ path: GRANTED_FOLDER });
 	});
 
 	it("never answers another workspace's grant", async () => {
 		const { handle, connectedFolders } = await start({ config: projectScopedConfig() });
-		connectedFolders.set(PROJECT, "/Users/tester/code/app");
+		connectedFolders.set(PROJECT, GRANTED_FOLDER);
 		const res = await send(handle.socketPath, {
 			method: "GET",
 			path: `/v1/connected-folders?project=${OTHER_PROJECT}`,
@@ -3626,14 +3680,14 @@ describe("connected folders", () => {
 
 	it("keeps the read open when the projects FEATURE is off, so an inert grant is still displayable", async () => {
 		const { handle, connectedFolders } = await start({ config: projectScopedConfig() });
-		connectedFolders.set(PROJECT, "/Users/tester/code/app");
+		connectedFolders.set(PROJECT, GRANTED_FOLDER);
 		const res = await send(handle.socketPath, {
 			method: "GET",
 			path: `/v1/connected-folders?project=${PROJECT}`,
 			token: handle.token
 		});
 		expect(res.status).toBe(200);
-		expect(JSON.parse(res.text)).toEqual({ path: "/Users/tester/code/app" });
+		expect(JSON.parse(res.text)).toEqual({ path: GRANTED_FOLDER });
 	});
 
 	it("400s a missing or unusable project on every method - a grant has no no-project bucket", async () => {
@@ -3867,7 +3921,7 @@ describe("connected folders", () => {
 
 	it("allows the DELETE while the projects feature is off - revocation never waits on a flag", async () => {
 		const { handle, connectedFolders } = await start({ config: projectScopedConfig() });
-		connectedFolders.set(PROJECT, "/Users/tester/code/app");
+		connectedFolders.set(PROJECT, GRANTED_FOLDER);
 		const res = await send(handle.socketPath, {
 			method: "DELETE",
 			path: `/v1/connected-folders?project=${PROJECT}`,
@@ -3880,8 +3934,8 @@ describe("connected folders", () => {
 
 	it("revokes only the named workspace on DELETE, idempotently", async () => {
 		const { handle, connectedFolders } = await start({ config: projectsEnabledConfig() });
-		connectedFolders.set(PROJECT, "/Users/tester/code/app");
-		connectedFolders.set(OTHER_PROJECT, "/Users/tester/code/app");
+		connectedFolders.set(PROJECT, GRANTED_FOLDER);
+		connectedFolders.set(OTHER_PROJECT, GRANTED_FOLDER);
 		for (const _ of [1, 2]) {
 			const res = await send(handle.socketPath, {
 				method: "DELETE",
@@ -3891,7 +3945,7 @@ describe("connected folders", () => {
 			expect(res.status).toBe(200);
 		}
 		expect(connectedFolders.get(PROJECT)).toBeNull();
-		expect(connectedFolders.get(OTHER_PROJECT)).toBe("/Users/tester/code/app");
+		expect(connectedFolders.get(OTHER_PROJECT)).toBe(GRANTED_FOLDER);
 	});
 
 	it("the route shadows nothing and is shadowed by nothing", async () => {

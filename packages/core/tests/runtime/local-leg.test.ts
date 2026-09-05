@@ -24,6 +24,7 @@ import { auditDir, localDataDir, managedCliDir } from "../../src/runtime/paths";
 import { createFileSecretStore } from "../../src/runtime/storage/secret-store";
 import { createStateStore } from "../../src/runtime/storage/state-store";
 import type { StateStore } from "../../src/runtime/storage/state-store";
+import { DRIVE_SOCKET_IS_FILE, driveSocketNamer } from "./support/drive-socket";
 
 /** Legs a test booted, drained in `afterEach` so no bound socket leaks between cases. */
 const running: LocalLeg[] = [];
@@ -31,14 +32,8 @@ afterEach(async () => {
 	while (running.length > 0) await running.pop()?.stop();
 });
 
-/**
- * A unique socket path for one case, kept SHORT: a unix socket path is capped at ~104 bytes on macOS, so
- * it lives directly under the temp root rather than inside the case's app-data root.
- */
-let sockets = 0;
-function socketFor(): string {
-	return join(tmpdir(), `gsl-${process.pid}-${++sockets}.sock`);
-}
+/** A unique listen address for one case, in the shape the running platform binds. */
+const socketFor = driveSocketNamer("gsl");
 
 /** A registry with no adapters (a construction test never drives a real CLI run). */
 const emptyRegistry: AgentRuntimeRegistry = {
@@ -215,7 +210,10 @@ describe("startLocalLeg (composable local executor leg)", () => {
 		const leg = await startLocalLeg(d);
 		running.push(leg);
 		expect(leg.socketPath).toBe(d.socketPath);
-		expect(existsSync(d.socketPath)).toBe(true);
+		// A unix socket is a file the boot created; a Windows pipe is a kernel object with no filesystem
+		// entry, so what is asserted there is that the address ANSWERS - see the reachability check below.
+		if (DRIVE_SOCKET_IS_FILE) expect(existsSync(d.socketPath)).toBe(true);
+		else expect((await drive(leg, "GET", "/v1/health")).status).toBe(200);
 		expect(typeof leg.token).toBe("string");
 		expect(leg.token.length).toBeGreaterThan(0);
 		// The token is the HOST's to publish - it must never appear on stdout.
@@ -239,20 +237,39 @@ describe("startLocalLeg (composable local executor leg)", () => {
 		await leg.stop();
 		// The socket refuses (no new turns)...
 		expect(await refused(socketPath)).toBe(true);
-		// ...and the inode is gone, so the next boot's `listen` cannot trip over it.
+		// ...and nothing is left at the address, so the next boot's `listen` cannot trip over it. A unix
+		// socket's inode has to be unlinked for that to hold; a Windows pipe dies with its owner.
 		expect(existsSync(socketPath)).toBe(false);
 	});
 
-	it("boots on a socket path a crashed previous run left behind (the stale-inode unlink)", async () => {
-		// A SIGKILLed run leaves the socket FILE (only its listener died), and `listen` fails EADDRINUSE on
-		// it - so the boot unlinks first. Modelled with a plain file at the path, which fails `listen` the
-		// same way an orphaned socket does.
-		const d = deps();
-		writeFileSync(d.socketPath, "stale");
-		const leg = await startLocalLeg(d);
-		running.push(leg);
-		expect((await drive(leg, "GET", "/v1/health")).status).toBe(200);
-	});
+	// A crashed run leaves the address in a state the next boot must survive, and WHAT it leaves differs by
+	// address kind - a file whose listener died, or nothing at all. Each platform is given the premise it
+	// actually has rather than one of them being skipped.
+	if (DRIVE_SOCKET_IS_FILE) {
+		it("boots on a socket path a crashed previous run left behind (the stale-inode unlink)", async () => {
+			// A SIGKILLed run leaves the socket FILE (only its listener died), and `listen` fails EADDRINUSE on
+			// it - so the boot unlinks first. Modelled with a plain file at the path, which fails `listen` the
+			// same way an orphaned socket does.
+			const d = deps();
+			writeFileSync(d.socketPath, "stale");
+			const leg = await startLocalLeg(d);
+			running.push(leg);
+			expect((await drive(leg, "GET", "/v1/health")).status).toBe(200);
+		});
+	} else {
+		it("boots on a pipe name a crashed previous run held, which died with it", async () => {
+			// A pipe is a kernel object owned by its process: a SIGKILLed run leaves NO entry at the address,
+			// so the boot has nothing to unlink and the name must simply be free again. A guard that insisted
+			// on clearing something first would strand every restart.
+			const d = deps();
+			const crashed = await startLocalLeg(d);
+			await crashed.stop();
+			const leg = await startLocalLeg(d);
+			running.push(leg);
+			expect(leg.socketPath).toBe(d.socketPath);
+			expect((await drive(leg, "GET", "/v1/health")).status).toBe(200);
+		});
+	}
 
 	it("refuses to install over a CLI the USER already has, and touches nothing", async () => {
 		// The app installs FOR a user who has no install of their own. A CLI on the user's PATH is theirs to

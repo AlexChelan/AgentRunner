@@ -1,6 +1,6 @@
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, realpathSync, statSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, sep } from "node:path";
 import type { ConnectionRef } from "../../src/index";
 import { RunStartSchema } from "@agentrunner/protocol";
 import type { RunDocument, RunImage, RunStart } from "@agentrunner/protocol";
@@ -506,7 +506,7 @@ describe("buildRun", () => {
 					...(configHome ? { configHome } : {})
 				});
 				expect(
-					req.denyReadPaths?.some((p) => tokenFile === p || tokenFile.startsWith(`${p}/`))
+					req.denyReadPaths?.some((p) => tokenFile === p || tokenFile.startsWith(`${p}${sep}`))
 				).toBe(true);
 			}
 		}

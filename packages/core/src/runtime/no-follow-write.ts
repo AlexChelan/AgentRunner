@@ -3,10 +3,42 @@ import {
 	fchmodSync,
 	fchownSync,
 	constants as fsConstants,
+	lstatSync,
 	openSync,
 	rmSync,
 	writeFileSync
 } from "node:fs";
+
+/**
+ * The kernel's own refusal, where there is one.
+ *
+ * `O_NOFOLLOW` is POSIX-only: Windows leaves it `undefined`, and `undefined` in a bitwise OR is zero, so
+ * the flag word silently carried NO refusal there and a planted link was followed and its target
+ * truncated - the exact confused-deputy write this module exists to stop, on a platform the desktop
+ * ships to.
+ */
+const O_NOFOLLOW = fsConstants.O_NOFOLLOW ?? 0;
+
+/**
+ * Refuses a symlink at `path` in userland, for the platforms {@link O_NOFOLLOW} cannot cover.
+ *
+ * `lstat` reports the LINK, never what it points at, so a link is distinguishable without opening
+ * anything. It is a check-then-open rather than one atomic operation, which leaves a window a POSIX
+ * open does not have; Windows exposes no open flag that closes it, and refusing the link that is there
+ * is strictly better than following it. A missing path is not a refusal - that is the ordinary create.
+ *
+ * @param path - The file about to be written.
+ * @throws When a symlink sits at the path (the caller then clears it and retries, as `ELOOP` does).
+ */
+function refuseSymlinkAt(path: string): void {
+	if (O_NOFOLLOW !== 0) return;
+	try {
+		if (!lstatSync(path).isSymbolicLink()) return;
+	} catch {
+		return;
+	}
+	throw new Error(`refusing to write through the symlink at ${path}`);
+}
 
 /**
  * Writes `contents` to `path` WITHOUT ever following a symlink, replacing a hostile or corrupt entry.
@@ -39,9 +71,9 @@ export function writeNoFollow(
 	mode: number,
 	group?: number
 ): void {
-	const flags =
-		fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_TRUNC | fsConstants.O_NOFOLLOW;
+	const flags = fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_TRUNC | O_NOFOLLOW;
 	const write = (): void => {
+		refuseSymlinkAt(path);
 		const fd = openSync(path, flags, mode);
 		try {
 			if (group !== undefined) {

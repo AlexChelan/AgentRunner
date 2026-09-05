@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { join } from "node:path";
+import { join, resolve, sep } from "node:path";
 import {
 	codexCredentialReadDenyPaths,
 	grokCredentialReadDenyPaths,
@@ -10,7 +10,9 @@ import { codexHomeDir, grokHomeDir } from "../../src/runtime/paths";
 
 // A fixed, fake home: the helpers are PURE string joins (no filesystem), so a synthetic root keeps the
 // assertions deterministic across machines and platforms (the list is a platform-union, inert-if-absent set).
-const HOME = "/home/tester";
+// Resolved, so the root is absolute in the HOST's own spelling - the helpers join with the host separator,
+// and a rooted-but-drive-less `/home/tester` is not the prefix of what they return on Windows.
+const HOME = resolve("/home/tester");
 
 describe("sensitiveHomeReadDenyPaths", () => {
 	it("denies the shell / cloud / infra credential stores under the home dir", () => {
@@ -40,7 +42,7 @@ describe("sensitiveHomeReadDenyPaths", () => {
 		const paths = sensitiveHomeReadDenyPaths(HOME);
 		expect(paths).not.toContain(HOME);
 		// Every entry is strictly BELOW the home dir.
-		for (const p of paths) expect(p.startsWith(`${HOME}/`)).toBe(true);
+		for (const p of paths) expect(p.startsWith(`${HOME}${sep}`)).toBe(true);
 	});
 
 	it("is deterministic and free of the CLI login homes (those are added per non-owning run)", () => {
