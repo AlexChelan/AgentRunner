@@ -1,7 +1,7 @@
 {
   "name": "agentrunner",
   "type": "module",
-  "version": "1.1.4",
+  "version": "1.2.0",
   "private": true,
   "main": "dist/cli.js",
   "bin": {
